@@ -1,0 +1,56 @@
+#!/bin/bash
+# systemd-sleep hook (install to /usr/lib/systemd/system-sleep/): send "dark wakes" straight back to sleep.
+# With the EC driver's suspend support (qcom_hamoa_ec.allow_suspend=1) the ASUS EC still wakes the machine about
+# every 5 minutes in standby (it wants a fresh SoC temperature, its Tj watchdog keeps running). Those wakes come
+# without a Linux wakeup IRQ; lid, keyboard, touchpad and power button always record one (/sys/power/pm_wakeup_irq).
+# After such a wake the EC driver has already restarted the Tj feed and sent "modern standby exit"; suspending
+# again sends a fresh Tj report and "modern standby enter".
+#
+# The suspend fires a few seconds later. With the lid closed it always does (nobody can be typing; once an app
+# blocked the idle timer and the laptop stayed awake in the bag for 7 hours). With the lid open it is skipped if a key
+# or button is pressed within 3 s (s15-input-wait reads the input events; interrupt counts were not enough, the
+# touchpad raises interrupts by itself after a resume) or if the lid was opened since the wake.
+# A failed suspend is not retried. Loop guard: three dark wakes within two minutes stretch the delay to 60 s.
+# (Both for the loop seen on 2026-11-01: the USB-C xHCI had died, every suspend failed at once, the hook suspended
+# again every few seconds and the screen flickered on and off.)
+# Low battery: a dark wake on battery at or below 5 % shuts the machine down cleanly instead (there is no
+# hibernation; the EC wakes the machine roughly hourly, so the check runs often enough at ~0.15 W standby).
+B=/sys/class/power_supply/qcom-battmgr-bat; LOW=${S15_DARKWAKE_LOW_PCT:-5}
+battery_low() { [ "$(cat $B/status)" = Discharging ] && [ $(( $(cat $B/energy_now) * 100 / $(cat $B/energy_full) )) -le "$LOW" ]; }
+lid() { busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager LidClosed 2>/dev/null; }
+L=/var/log/s15-sleep.log; H=/run/s15-darkwake.times; S=/run/s15-darkwake.lid; F=/run/s15-darkwake.fails
+fails() { cat /sys/power/suspend_stats/fail 2>/dev/null || echo 0; }
+# s15-sleep-radios keeps Bluetooth off after a dark wake; switch it back on whenever we stay awake.
+bt_restore() { [ -e /run/s15-sleep-radios.blocked ] && rfkill unblock bluetooth && rm -f /run/s15-sleep-radios.blocked; }
+case "$1" in
+  pre) fails > $F; exit 0 ;;
+  post)
+    # A suspend that failed (a driver refused, e.g. a dead xHCI returns -EINVAL) is not a wake: suspending
+    # again would fail the same way, in a loop.
+    if [ "$(fails)" != "$(cat $F 2>/dev/null)" ]; then
+      echo "$(date -Is) suspend failed (device: $(cat /sys/power/suspend_stats/last_failed_dev 2>/dev/null)), not retrying" >> $L
+      bt_restore; exit 0
+    fi ;;
+  resuspend)   # run by the delayed unit
+    read -r lid0 < $S 2>/dev/null
+    if [ "$(lid)" = "b true" ]; then
+      if battery_low; then echo "$(date -Is) dark wake: battery at or below $LOW % -> power off" >> $L; systemctl poweroff
+      else systemctl suspend; fi
+    elif [ "$lid0" = "b true" ]; then echo "$(date -Is) dark wake: lid opened, staying awake" >> $L; bt_restore
+    elif /usr/local/bin/s15-input-wait 3; then echo "$(date -Is) dark wake: key pressed, staying awake" >> $L; bt_restore
+    elif battery_low; then echo "$(date -Is) dark wake: battery at or below $LOW % -> power off" >> $L; systemctl poweroff
+    else systemctl suspend; fi
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null)
+[ -n "$irq" ] && exit 0
+[ -e /run/s15-no-darkwake ] && { bt_restore; exit 0; }   # touch this to keep the machine awake for debugging
+now=$(date +%s); echo "$now" >> $H
+recent=$(awk -v t=$((now - 120)) '$1 >= t' $H | wc -l); tail -5 $H > $H.new && mv $H.new $H
+d=${S15_DARKWAKE_DELAY:-2}; [ "$recent" -ge 3 ] && d=60
+lid > $S
+echo "$(date -Is) dark wake (no wake IRQ) -> suspend again in ${d}s" >> $L
+systemd-run --quiet --collect --timer-property=AccuracySec=100ms --unit="s15-resuspend-$now" --on-active="$d" \
+  "$(realpath "$0")" resuspend
+exit 0

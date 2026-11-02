@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Power key in Desktop Mode, as on Windows: a short press puts the laptop to sleep, and the press that woke it is
+ignored. The PMIC power key delivers the waking press to userspace after resume; Plasma's default action ("show the
+logout screen") then popped up on every wake. Plasma's own power-button action is set to "do nothing"
+(powerdevilrc PowerButtonAction=0) and this service acts instead. In Game Mode Steam handles the key; the service
+only acts while Plasma runs and gamescope does not.
+The sleep hook s15-power-key-mark creates MARK before every suspend and removes it 3 s after resume; a press seen
+while MARK exists is the waking press.
+"""
+import os
+import struct
+import subprocess
+import sys
+import time
+
+EV_KEY, KEY_POWER = 1, 116
+MARK = "/run/s15-power-key.suspended"
+FMT = "llHHi"  # struct input_event on 64-bit: timeval, type, code, value
+SIZE = struct.calcsize(FMT)
+
+
+def find_device():
+    for block in open("/proc/bus/input/devices").read().split("\n\n"):
+        if 'Name="pmic_pwrkey"' not in block:
+            continue
+        for line in block.splitlines():
+            if line.startswith("H: Handlers="):
+                for h in line.split("=", 1)[1].split():
+                    if h.startswith("event"):
+                        return "/dev/input/" + h
+    return None
+
+
+def running(name):
+    return subprocess.run(["pgrep", "-x", name], capture_output=True).returncode == 0
+
+
+def main():
+    dev = None
+    for _ in range(30):
+        dev = find_device()
+        if dev:
+            break
+        time.sleep(1)
+    if not dev:
+        sys.exit("pmic_pwrkey input device not found")
+    with open(dev, "rb", buffering=0) as f:
+        while True:
+            data = f.read(SIZE)
+            if len(data) < SIZE:
+                continue
+            _, _, typ, code, value = struct.unpack(FMT, data)
+            if typ != EV_KEY or code != KEY_POWER or value != 1:
+                continue
+            if os.path.exists(MARK):
+                os.unlink(MARK)  # the press that woke the machine
+                print("power key: waking press ignored", flush=True)
+                continue
+            if running("plasmashell") and not running("gamescope"):
+                print("power key: suspend", flush=True)
+                subprocess.run(["systemctl", "suspend"])
+
+
+if __name__ == "__main__":
+    main()

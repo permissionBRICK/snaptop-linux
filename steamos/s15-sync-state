@@ -1,0 +1,21 @@
+#!/bin/bash
+# systemd-sleep hook (/usr/lib/systemd/system-sleep/): force sync_state() of the clock controllers, power domains
+# and interconnects right before the first suspend of a boot, instead of fw_devlink.sync_state=timeout at boot.
+#
+# Why: some consumers (GPU GMU, video codec, crypto) never bind a driver, so the providers never reach sync_state()
+# and keep the bootloader's maximum votes; DDR and the CX rail then never collapse in standby (0.9 W instead of
+# 0.15 W). fw_devlink.sync_state=timeout forces it ~30 s into boot, but in about 1 of 5 boots that cut-off broke
+# the QUP serial engines at the same instant (I2C bus 7 with the EC and the keyboard: "geni_i2c: Timeout
+# cancel_m_cmd", the EC Tj feed failing with -110; the Bluetooth UART timing out). Without the Tj feed the EC
+# runs the fan at full speed and cuts the power after about a minute.
+# Forcing it here, right before suspend, keeps the savings: whatever the cut-off disturbs is re-initialised on
+# resume, and the EC does not expect the Tj feed in standby. Writing 1 to state_synced calls sync_state().
+[ "$1" = pre ] || exit 0
+L=/var/log/s15-sleep.log; n=0; names=
+for f in /sys/bus/platform/devices/*/state_synced; do
+  [ "$(cat "$f" 2>/dev/null)" = 0 ] || continue
+  d=$(basename "$(dirname "$f")")
+  printf 1 > "$f" 2>/dev/null && { n=$((n + 1)); names="$names $d"; }   # exactly "1", no newline (else EINVAL)
+done
+[ $n -gt 0 ] && echo "$(date -Is) sync-state: forced sync_state() for $n providers:$names" >> $L
+exit 0

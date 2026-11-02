@@ -1,0 +1,15 @@
+#!/bin/bash
+# Keyboard RGB per session: s15-kbd-mode game|desktop|resume
+# Colours from /etc/s15-kbd-mode.conf (GAME=..., DESKTOP=... as s15-kbd-color arguments). "resume" re-applies the
+# last mode (the EC may reset the effect in standby). Brightness stays on the Fn key.
+GAME="ffffff rainbow 3"; DESKTOP="ffffff solid"
+[ -f /etc/s15-kbd-mode.conf ] && . /etc/s15-kbd-mode.conf
+case "$1" in
+  game) args=$GAME ;;
+  desktop) args=$DESKTOP ;;
+  resume) m=$(cat /run/s15-kbd-mode 2>/dev/null); [ -n "$m" ] || exit 0; exec "$0" "$m" ;;
+  *) echo "usage: s15-kbd-mode game|desktop|resume"; exit 2 ;;
+esac
+for i in $(seq 1 30); do ls /sys/bus/i2c/devices/*-0076/driver >/dev/null 2>&1 && break; sleep 1; done
+# shellcheck disable=SC2086
+/usr/local/bin/s15-kbd-color $args >/dev/null && echo "$1" > /run/s15-kbd-mode

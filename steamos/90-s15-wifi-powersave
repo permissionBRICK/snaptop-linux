@@ -1,0 +1,5 @@
+#!/bin/sh
+# NetworkManager dispatcher hook (/etc/NetworkManager/dispatcher.d/): Wi-Fi power save per network on every connect.
+[ "$2" = up ] || exit 0
+case "$1" in wlan*) exec /usr/local/sbin/s15-wifi-powersave apply "$1" ;; esac
+exit 0

@@ -1,0 +1,39 @@
+#!/bin/bash
+# Wi-Fi power save per network. On by default: it saves power while the laptop is awake (in suspend the Wi-Fi
+# part of the chip is shut down by the driver anyway). Some access points drop the WCN7850 with DISASSOC_LOW_ACK
+# about 30 s after every connect while power save is on; networks listed in /etc/s15-wifi-nopowersave (one SSID per
+# line) get it off.
+#   apply [iface]  set power save for the current network (NetworkManager dispatcher, on "up")
+#   check [iface]  two DISASSOC_LOW_ACK drops from one network within 15 min -> add it to the list, apply
+#                  (run by s15-wifi-watchdog every minute)
+# With the iwd backend NetworkManager's wifi.powersave setting is not applied, so the kernel default (on) holds
+# unless this script changes it.
+# The interface is usually wlan0, but after a driver reload it can come back as wlan1.
+F=/etc/s15-wifi-nopowersave; IF=${2:-$(iw dev 2>/dev/null | awk '$1 == "Interface" {print $2; exit}')}; L=/var/log/s15-wifi-watchdog.log
+[ -n "$IF" ] || exit 0
+ssid() { iw dev "$IF" link 2>/dev/null | sed -n 's/^\tSSID: //p'; }
+apply() {
+  local s; s=$(ssid); [ -n "$s" ] || return 0
+  if grep -Fxq -- "$s" "$F" 2>/dev/null; then iw dev "$IF" set power_save off; else iw dev "$IF" set power_save on; fi
+}
+check() {
+  local drops s
+  drops=$(journalctl -k -o cat --since -15min --no-pager 2>/dev/null |
+          sed -n 's/.*disassociated from \([0-9a-f:]\{17\}\) (Reason: 34=.*/\1/p')
+  [ -n "$drops" ] || return 0
+  # iwd logs "event: connect-info, ssid: <ssid>, bss: <bssid>, ..." for every connect
+  journalctl -u iwd -o cat --since -60min --no-pager 2>/dev/null |
+    sed -n 's/.*connect-info, ssid: \(.*\), bss: \([0-9a-f:]\{17\}\),.*/\2 \1/p' | sort -u |
+    awk -v drops="$drops" 'BEGIN { n = split(drops, d, "\n"); for (i = 1; i <= n; i++) c[d[i]]++ }
+                           { b = $1; sub(/^[^ ]+ /, ""); cnt[$0] += c[b] } END { for (s in cnt) if (cnt[s] >= 2) print s }' |
+    while IFS= read -r s; do
+      grep -Fxq -- "$s" "$F" 2>/dev/null && continue
+      echo "$s" >> "$F"; echo "$(date -Is) wifi-powersave: '$s' dropped us with DISASSOC_LOW_ACK -> power save off for it" >> $L
+    done
+  apply
+}
+case "$1" in
+  apply) apply ;;
+  check) check ;;
+  *) echo "usage: $0 apply|check [iface]"; exit 2 ;;
+esac

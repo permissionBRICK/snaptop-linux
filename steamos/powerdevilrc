@@ -1,0 +1,13 @@
+[AC][SuspendAndShutdown]
+AutoSuspendAction=0
+PowerButtonAction=0
+
+[Battery][SuspendAndShutdown]
+AutoSuspendAction=1
+AutoSuspendIdleTimeoutSec=900
+PowerButtonAction=0
+
+[LowBattery][SuspendAndShutdown]
+AutoSuspendAction=1
+AutoSuspendIdleTimeoutSec=300
+PowerButtonAction=0

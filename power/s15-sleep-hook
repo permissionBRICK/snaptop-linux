@@ -1,0 +1,26 @@
+#!/bin/bash
+# systemd-sleep hook: battery energy before and after every suspend -> /var/log/s15-sleep.log (average drain in mW),
+# plus the share of the sleep the SoC spent in each AOSS low-power mode (qcom_stats: cxsd = CX collapse, aosd = XO
+# shutdown, ddr = DDR low power) and the battery voltage, so results do not rest on the gauge's energy estimate alone
+# (energy_now moves in 10 mWh steps and comes from the gauge's model).
+# Install as /usr/lib/systemd/system-sleep/s15-sleep-hook.
+B=/sys/class/power_supply/qcom-battmgr-bat; L=/var/log/s15-sleep.log; S=/run/s15-sleep.state; Q=/sys/kernel/debug/qcom_stats
+sysidle() { awk 'NR>1{t+=$2; s+=$NF} END{printf "%d %d", t, s}' /sys/kernel/debug/pm_genpd/power-domain-system/idle_states 2>/dev/null; }
+# accumulated residency in ms (counter runs at 19.2 MHz)
+res() { awk '/Accumulated Duration/ {printf "%d", $3 / 19200}' $Q/$1 2>/dev/null || echo 0; }
+mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+now=$(date +%s); e=$(cat $B/energy_now); c=$(( e * 100 / $(cat $B/energy_full) )); ac=$(cat $B/status)
+v=$(( $(cat $B/voltage_now 2>/dev/null || echo 0) / 1000 ))
+case "$1" in
+  pre)
+    echo "$now $e $c $ac $(sysidle) $(res cxsd) $(res aosd) $(res ddr) $v" > $S
+    echo "$(date -Is) suspend ($2, mem_sleep: $(cat /sys/power/mem_sleep)) energy=$((e / 1000)) mWh cap=$c% battery=$ac ${v} mV" >> $L ;;
+  post)
+    read -r t0 e0 c0 ac0 si_ms0 si_n0 cx0 ao0 dd0 v0 < $S
+    read -r si_ms si_n <<< "$(sysidle)"
+    dt=$((now - t0)); de=$((e0 - e))
+    mw=$(( dt > 0 ? de * 3600 / dt / 1000 : 0 ))
+    pct() { echo $(( dt > 0 ? ($1 - ${2:-0}) / 10 / dt : 0 )); }   # ms delta -> % of the sleep
+    echo "$(date -Is) resume after ${dt}s: -$((de / 1000)) mWh (avg ${mw} mW, ${c0}->${c}%, battery ${ac0}->${ac}, ${v0:-?}->${v} mV), cxsd $(pct $(res cxsd) $cx0)% aosd $(pct $(res aosd) $ao0)% ddr $(pct $(res ddr) $dd0)%, SoC idle entries during sleep: $((si_n - si_n0)), wake irq: $(cat /sys/power/pm_wakeup_irq 2>/dev/null || echo ?)" >> $L ;;
+esac
+exit 0

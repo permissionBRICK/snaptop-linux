@@ -1,0 +1,14 @@
+# Standby is meant to be plain suspend-to-RAM: only the user (lid, keyboard, touchpad, power key, USB input), the
+# EC and the battery management (ADSP: low battery, charger) may wake the machine.
+#
+# The battery, charger and USB-C power supplies of pmic_glink are wakeup sources by default (power supply core).
+# While charging they report a change every few seconds; during suspend each report aborted the suspend, so a laptop
+# sleeping on the charger "woke" every 2-3 s (and the dark-wake hook put it back, the screen flickering). Without
+# the flag the reports no longer abort a suspend; if the ADSP's interrupt itself wakes the machine, that is a dark
+# wake and s15-ec-darkwake sends it back to sleep.
+ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="qcom-battmgr-*|ucsi-source-psy-*", TEST=="power/wakeup", ATTR{power/wakeup}="disabled"
+# Wi-Fi (MHI and its PCIe root port) and the compute DSP: nothing to wake for. "bind"/"change" as well: the drivers
+# set the wakeup flag again when they bind (after the "add" event), the battery driver after registering.
+ACTION=="add|bind", SUBSYSTEM=="mhi", KERNEL=="mhi0", TEST=="power/wakeup", ATTR{power/wakeup}="disabled"
+ACTION=="add|bind", SUBSYSTEM=="pci", KERNEL=="0004:00:00.0", TEST=="power/wakeup", ATTR{power/wakeup}="disabled"
+ACTION=="add|bind", SUBSYSTEM=="platform", KERNEL=="32300000.remoteproc", TEST=="power/wakeup", ATTR{power/wakeup}="disabled"

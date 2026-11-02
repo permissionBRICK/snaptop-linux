@@ -1,0 +1,149 @@
+# SteamOS on the Vivobook S 15
+
+Valve has no SteamOS for ARM laptops, but the **Steam Frame** headset runs an aarch64 SteamOS (`deckard` image,
+SteamOS 0.5.3) with a native ARM64 Steam client, Proton 11 (ARM64) and FEX. Its rootfs is published on Valve's
+public update CDN. We put that rootfs onto the laptop's NVMe, swapped in our kernel and firmware, and turned the
+headset session into a normal Steam Deck-style Game Mode on the laptop panel. The image download and casync
+extraction use the extractor from [SteamOS-ARM-Port](https://github.com/hashtagbasit/SteamOS-ARM-Port), which ports
+the same image to Snapdragon handhelds.
+
+Windows stays installed (dual boot); see [Boot](#boot-bitlocker-safe).
+
+## What `install.sh` does
+
+The quick start is in the [README](../README.md). `install.sh` runs in a live ARM64 Linux on the laptop, after
+`windows/Prepare-S15.ps1` has shrunk C: and created the 1 GB FAT32 partition `S15BOOT` with the firmware export:
+
+1. Checks: the laptop model, `S15BOOT` on the internal NVMe with the firmware export, enough free space, internet.
+   It shows the plan and asks for `YES` before writing anything.
+2. Installs its tools in the live system (apt: btrfs/GPT/EFI tools, casync helpers, a native kernel toolchain).
+3. Creates the partition `SNAPSTEAM-NVME` (Linux, btrfs) in the largest free block, and turns `S15BOOT` into an
+   EFI system partition. Windows' own partitions, its ESP and the Qualcomm firmware partitions at the start of the
+   disk (entries 1-11: ToolsFv, LogFs, NHLOS, ...) are never written to.
+4. `steamos/fetch-deps.sh`: pinned linux-firmware files (Wi-Fi, Bluetooth, GPU microcode, the S15 audio topology),
+   alsa-ucm-conf 1.2.16 with the community S15 profile, plus the ASUS files from `S15BOOT\s15-firmware`.
+5. `steamos/frame-rootfs.sh`: downloads the Steam Frame image (about 3 GB of casync chunks from Valve's public
+   CDN, checked against the sha256 in the RAUC manifest), assembles it on the new partition, copies its files.
+6. `kernel/build.sh`: builds the kernel natively (30-40 min) unless `--kernel-payload` gives one.
+7. `steamos/steamos-s15-setup.sh`: adapts the image (next section).
+8. `desktop-net/build.sh`: builds the Plasma Wi-Fi and Bluetooth applets natively against the image (a few minutes).
+9. `steamos/install-esp.sh`: systemd-boot, kernel, initramfs and DTB on `S15BOOT`, the firmware entry
+   "SteamOS (S15)" after Windows Boot Manager, BootNext for the first start.
+
+Later kernels: build a payload with `kernel/build.sh` (on the laptop in SteamOS or on any Linux PC) and run
+`steamos/install-kernel.sh <payload>` in SteamOS.
+
+## What `steamos-s15-setup.sh` changes in the Frame image
+
+| Change | Why |
+|---|---|
+| Our kernel modules, `vmlinuz`, DTBs in `/boot` | The Frame kernel is for the headset's SoC. |
+| Firmware: ASUS blobs, `ath12k/WCN7850`, `qca`, `qcom/gen70500_*` | The image only has the headset's firmware. |
+| ALSA UCM: S15 profile | Without it, no speaker/mic routing. |
+| `scmi-cpufreq` in `modules-load.d` | It does not autoload; without it no idle downclocking. |
+| Masks headset units (SteamVR, `deckard-*` fan/LED/FPGA/charger, adbd/USB gadget, `steamos-boot`, `systemd-repart`, Bluetooth/Wi-Fi MAC setters, A/B partition mounts) | They fail or fight with the laptop hardware. **Not** `iwd`: NetworkManager uses it as the Wi-Fi backend (masking it leaves Wi-Fi "enabled" with no networks). |
+| fstab: A/B partition-set mounts commented out | Everything lives on one btrfs. |
+| `gamescope-session`: `--backend drm --prefer-output '*,eDP-1'` plus `-w/-h/-W/-H` from the panel's native mode, `--keep-alive --mangoapp --steam` | The Frame runs gamescope with the OpenVR backend for the headset. |
+| `RUNSTEAM.sh`: drop `-vrgamepadui`, `-deckard` → `-steampal` | Steam Deck UI instead of the headset UI. |
+| `steam.service` affinity `0xfff` | The Frame pins games to 5 cores; the X1E has 12 equal cores. |
+| WirePlumber: `node.stream.enable-spatial-audio = false` | The Frame spatializer needs SteamVR's `vraudiocompositor.so`. Without it, streams never link and there is no sound at all. |
+| Desktop Mode (`steamos-s15-desktop.sh`) | See below. |
+| Speaker UCM without the WSA macro compander | Short sounds started loud and faded ([games](games.md#audio-in-steams-menus)). |
+| Reboot to Windows (`steamos-s15-dualboot.sh`) | See [Switching between Windows and SteamOS](#switching-between-windows-and-steamos). |
+| USB NTFS/exFAT automount (`s15-media-mount`, udev rule on `ID_PATH=*usb*`, ntfs3 with `windows_names`) | Play from an existing Windows game drive. Match on `ID_PATH`: some USB-SATA bridges report `ID_BUS=ata`. |
+| mkinitcpio preset `/etc/mkinitcpio-s15.conf` with hook `s15` | Clock, PHY, PCIe/NVMe, USB storage drivers and btrfs in the initramfs. |
+
+Initramfs gotchas on this image:
+- `add_all_modules` takes one pattern per call; passing several silently adds nothing.
+- The Frame's `deckard-uimage` post hook wraps the image in a 64-byte U-Boot header and deletes the plain image.
+  The scripts strip the header again with `dd bs=64 skip=1`.
+- No `cpio` in the image; use `bsdtar`.
+
+## Desktop Mode
+
+The Frame's `plasma.desktop` starts a nested "Gamescope VR Session" for the headset. Switching to desktop mode
+on the laptop just bounced back to Game Mode, and later showed a black screen with a cursor. `steamos-s15-desktop.sh`
+(adapted from SteamOS-ARM-Port) replaces it with a real Plasma Wayland session:
+
+- `s15-startplasma` clears the Game Mode environment and starts `startplasma-wayland`.
+- `s15-prepare-plasma --switch` runs from `steamos-session-select` before the switch and also unsets
+  `DISPLAY`/`WAYLAND_DISPLAY`; inside the Plasma start (user unit `s15-plasma-env.service`) it must **not** unset
+  them. Doing so was the cause of the black screen.
+- Plasma user units get `QT_QPA_PLATFORM=wayland` and friends.
+- A "Return to Gaming Mode" desktop icon (the image has none).
+- **60 Hz on battery, 120 Hz on AC**, like Windows (user service `s15-refresh-on-battery`, about 0.7 W less at idle):
+  it follows UPower's power-supply events, so it switches as soon as the charger is plugged in or out, and right
+  after a resume if that happened during sleep. A rate set by hand in the display settings stays until the next
+  plug/unplug. Game Mode is not covered: Steam/gamescope own the display there.
+- **Boots into Desktop Mode by default** (`DEFAULT_MODE=game` keeps Game Mode). steamos-manager keeps the default
+  login session in `/etc/sddm.conf.d/zz-steamos-autologin.conf` and one-off switches in
+  `zzt-steamos-temp-login.conf`; our `steamos-session-select` no longer makes "Return to Gaming Mode" the new
+  default, so Game Mode lasts until the next reboot. `steamosctl set-default-login-mode game|desktop` (as the
+  user) changes the default.
+- **Wi-Fi and Bluetooth in the tray:** the image ships neither `plasma-nm` nor `bluedevil`, so Desktop Mode has
+  no network or Bluetooth applet, no settings pages for them and no secret agent (no password prompt). `desktop-net/`
+  builds them, with NetworkManagerQt, ModemManagerQt and BluezQt, against the image's own Qt 6.8, KF6 6.14 and
+  Plasma 6.2.5, in a chroot of the image under an overlay; `install.sh` runs it natively on the laptop (a few
+  minutes). bluedevil is built without its handbook (KF6DocTools is not in the image); VPN editor plugins are
+  included, OpenConnect is not. The package holds no file that the image already has. To rebuild or remove it
+  in a running SteamOS:
+
+  ```sh
+  sudo mkdir -p /run/dn && sudo mount -t tmpfs -o size=6G tmpfs /run/dn   # the build overlay needs its own fs
+  sudo desktop-net/build.sh / /run/dn                     # native; an x86 host with qemu-user can build from a
+                                                          # Frame rootfs.img instead (hours instead of minutes)
+  sudo desktop-net/install.sh /run/dn/s15-desktop-net-<date>.tar.zst   # restarts kded and plasmashell
+  sudo desktop-net/uninstall.sh                           # removes exactly the installed files
+  ```
+
+## Keyboard colour
+
+`steamos-s15-keyboard.sh` sets the keyboard RGB per session: rainbow in Game Mode (the EC's own effect), solid
+white in Desktop Mode, and the last one again after standby. Colours are `s15-kbd-color` arguments in
+`/etc/s15-kbd-mode.conf` (`GAME=...`, `DESKTOP=...`). The session targets (`gamescope-session.target`,
+`plasma-workspace.target`) start a user unit that starts the root unit `s15-kbd-mode@<mode>.service`, which a polkit
+rule allows the desktop user to start. Brightness stays on the Fn key.
+
+## Display
+
+- 2880x1620 @ 120 Hz, 8 bpc with our kernel patch ([kernel](kernel.md)).
+- Open: Steam's Game Mode treats the eDP panel as an external display (`IsExternalDisplay=1`), which caps the
+  "Native" resolution offered to games at 1920x1080. gamescope now renders at the panel's native mode
+  (`-w/-h/-W/-H`), but whether Steam then offers the full resolution is not verified yet.
+
+## Boot (BitLocker-safe)
+
+Windows Boot Manager stays first and unmodified, and nothing chainloads Windows; otherwise BitLocker's TPM
+measurements change and Windows asks for the recovery key.
+
+- `S15BOOT` (1 GB FAT32, created by `Prepare-S15.ps1`, made an EFI system partition by `install.sh`) holds
+  `\EFI\S15\` with kernel, initramfs, DTB and **systemd-boot** (from the SteamOS image), and `\loader\` with entries
+  for the current and the previous kernel (`*.old`). The Windows ESP is not touched.
+- `/usr/local/sbin/s15-update-esp` in SteamOS copies `/boot` to `S15BOOT` and keeps the previous set
+  (`install-kernel.sh` calls it).
+- Firmware entry **"SteamOS (S15)"** sits *behind* Windows Boot Manager in `BootOrder`. Power on: Windows. ESC at
+  power-on: firmware menu, "SteamOS (S15)" starts SteamOS without a menu wait (hold Space for systemd-boot's menu:
+  previous kernel, firmware setup). The reboot shortcuts use BootNext.
+- Boot time (2026-11-01, restart to the login screen): firmware 6.9 s, systemd-boot 0.7 s, kernel 4.9 s, userspace
+  10.2 s, so about 23 s; the desktop is ready ~3 s later. Most of the kernel phase is PCIe link-up and NVMe
+  initialisation. An earlier GRUB setup took about 7 s longer (3 s menu, slow reading of the 52 MB kernel).
+- The initramfs written during the install carries all boot drivers; kernels installed later in SteamOS get one
+  with only the drivers for present hardware (mkinitcpio autodetect, about 75 modules).
+- EFI variables on X1E go through the TrustZone app `uefisecapp` (the S15 is on the kernel's allowlist). Linux
+  registers them some seconds after boot, after systemd has mounted `efivarfs`; remount it before `efibootmgr`.
+
+## Switching between Windows and SteamOS
+
+Both directions only set the firmware's one-time boot entry (UEFI `BootNext`) and restart, so Windows stays the
+default and BitLocker is not involved.
+
+- **SteamOS → Windows:** `steamos-s15-dualboot.sh` installs `s15-reboot-to-windows.service` (sets BootNext to
+  Windows Boot Manager, then reboots), a polkit rule that lets the desktop user start exactly that service
+  without a password, a "Reboot to Windows" desktop icon and a "Reboot to Windows" entry in the Game Mode library.
+- **Reboots stay in the same OS:** a plain reboot from SteamOS comes back to SteamOS (systemd-shutdown hook
+  `s15-reboot-same-os` sets BootNext to the entry it booted from, unless one was already chosen). Windows
+  restarts stay in Windows because it is first in BootOrder. Power-off and cold boots use the firmware default.
+- **Windows → SteamOS:** run `windows\Install-RebootShortcut.ps1` once elevated. It creates a scheduled task
+  (current user, highest privileges, on demand) that runs `Reboot-ToSteamOS.ps1` (`bcdedit /set {fwbootmgr}
+  bootsequence <SteamOS entry>`, then restart), and a desktop shortcut that starts the task, so there is no UAC
+  prompt per click.

@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Set the keyboard RGB colour/effect through the ASUS EC (Vivobook S15, X1E80100).
+
+Usage (root): s15-kbd-color <rrggbb> [solid|breathe|rainbow|strobe] [speed 1-127, default 3]
+Sends the EC's keyboard-RGB command (0x51) as one raw I2C write to the EC's command address (0x76), in the
+format used by the EC driver of github.com/justririll/x1e-sleep. The qcom-hamoa-ec driver keeps the EC bound;
+the I2C core serialises this transfer against its own traffic. Brightness stays with the Fn key.
+"""
+import ctypes, fcntl, glob, os, subprocess, sys
+
+MODES = {"solid": 1, "breathe": 2, "rainbow": 3, "strobe": 4}
+I2C_RDWR = 0x0707
+
+class Msg(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint16), ("flags", ctypes.c_uint16), ("len", ctypes.c_uint16),
+                ("buf", ctypes.POINTER(ctypes.c_uint8))]
+
+class RdWr(ctypes.Structure):
+    _fields_ = [("msgs", ctypes.POINTER(Msg)), ("nmsgs", ctypes.c_uint32)]
+
+def ec_bus():
+    for d in glob.glob("/sys/bus/i2c/devices/*-0076"):
+        name = os.path.basename(d)
+        drv = os.path.realpath(os.path.join(d, "driver")) if os.path.exists(os.path.join(d, "driver")) else ""
+        if "hamoa" in drv or "ec" in os.path.basename(drv):
+            return int(name.split("-")[0])
+    sys.exit("EC (i2c address 0x76) not found")
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    rgb = bytes.fromhex(sys.argv[1])
+    mode = MODES[sys.argv[2]] if len(sys.argv) > 2 else 1
+    speed = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+    if len(rgb) != 3 or not 1 <= speed <= 127:
+        sys.exit(__doc__)
+    payload = bytes([0x51, 0x07, 0x66, 0x00, 0x10, 0x00, 0xb3, mode, *rgb, 0x55, speed * 2]).ljust(22, b"\0")
+    bus = ec_bus()
+    if not os.path.exists(f"/dev/i2c-{bus}"):
+        subprocess.run(["modprobe", "i2c-dev"], check=False)
+    buf = (ctypes.c_uint8 * len(payload))(*payload)
+    msg = Msg(0x76, 0, len(payload), ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)))
+    data = RdWr(ctypes.pointer(msg), 1)
+    fd = os.open(f"/dev/i2c-{bus}", os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, I2C_RDWR, data)
+    finally:
+        os.close(fd)
+    print(f"sent to i2c-{bus}@0x76: {payload[:13].hex(' ')}")
+
+if __name__ == "__main__":
+    main()

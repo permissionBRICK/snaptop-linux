@@ -1,0 +1,24 @@
+#!/bin/bash
+# systemd-sleep hook (/usr/lib/systemd/system-sleep/): Bluetooth off for the duration of a suspend, so nothing radio
+# related runs or wakes the machine in standby (the goal is plain suspend-to-RAM, not Modern Standby), and paired
+# headphones do not connect to the laptop in a bag.
+# The Wi-Fi half of the WCN7850 is already shut down by ath12k on every suspend (its firmware is reloaded on
+# resume). Create /etc/s15-sleep-keep-bt to leave Bluetooth on (e.g. to wake from a Bluetooth keyboard).
+# Bluetooth comes back only on a real wake (one with a wakeup IRQ: lid, keys, touchpad, power key). After a dark
+# wake (the EC, no wakeup IRQ) it stays off; s15-ec-darkwake switches it back on if it decides to stay awake.
+# Each switch is logged to /var/log/s15-sleep.log, so standby results can be told apart.
+L=/var/log/s15-sleep.log; S=/run/s15-sleep-radios.blocked
+case "$1" in
+  pre)
+    [ -e /etc/s15-sleep-keep-bt ] && exit 0
+    if rfkill list bluetooth | grep -q "Soft blocked: no"; then
+      rfkill block bluetooth && touch $S && echo "$(date -Is) sleep-radios: Bluetooth off for this sleep" >> $L
+    fi ;;
+  post)
+    [ -e $S ] || exit 0
+    if [ -z "$(cat /sys/power/pm_wakeup_irq 2>/dev/null)" ] && [ ! -e /run/s15-no-darkwake ]; then
+      exit 0   # dark wake (or a failed suspend): s15-ec-darkwake decides, and restores Bluetooth if staying awake
+    fi
+    rfkill unblock bluetooth && rm -f $S ;;
+esac
+exit 0

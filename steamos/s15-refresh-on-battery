@@ -1,0 +1,22 @@
+#!/bin/bash
+# Desktop Mode: internal panel at 60 Hz on battery, 120 Hz on AC, like Windows (about -0.7 W on the OLED at idle).
+# Runs as a user service in the Plasma session. It reacts to UPower's events, so it switches the moment the charger
+# is plugged in or out, and right after a resume if that happened during sleep. A check every 60 s covers a missed
+# event. A rate set by hand stays until the next plug/unplug.
+B=/sys/class/power_supply/qcom-battmgr-bat; last=
+want() { case "$(cat $B/status 2>/dev/null)" in Discharging) echo 60 ;; *) echo 120 ;; esac; }
+check() {
+  local w id; w=$(want)
+  [ "$w" = "$last" ] && return 0
+  id=$(kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | sed -n '/eDP-1/,/Geometry/p' \
+       | grep -o "[0-9]*:[0-9]*x[0-9]*@${w}[^ ]*" | head -1 | cut -d: -f1)
+  # retried on the next event if KWin is not ready (session start, lock screen)
+  if [ -n "$id" ] && kscreen-doctor "output.eDP-1.mode.$id" >/dev/null 2>&1; then last=$w; echo "$w Hz"; fi
+}
+# events: UPower prints a line for every power-supply change (plug/unplug, also the state it finds after a resume);
+# the 60 s timeout of read is the fallback. stdbuf: upower's output would otherwise sit in a pipe buffer.
+check
+{ stdbuf -oL upower --monitor 2>/dev/null || sleep infinity; } | while :; do
+  read -r -t 60 _ || [ $? -gt 128 ] || exit 1   # timeout (>128) is fine; EOF means upower died: restart via systemd
+  check
+done

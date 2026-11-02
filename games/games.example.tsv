@@ -1,0 +1,9 @@
+# name	exe (relative to the game drive)	launch options	d3dx9 version (or "auto")
+FlatOut 2	FlatOut 2/FlatOut2.exe		
+Call of Duty 4: Modern Warfare	Call of Duty 4/iw3sp.exe		34
+Call of Duty 4: Modern Warfare (Multiplayer)	Call of Duty 4/iw3mp.exe		34
+Call of Duty: World at War	Call of Duty World at War/CoDWaW.exe		37
+Call of Duty: World at War (Multiplayer)	Call of Duty World at War/CoDWaWmp.exe		37
+Gothic	Gothic/system/GOTHIC.EXE		
+Gothic II	Gothic II/system/Gothic2.exe		
+Battlefield 2	Battlefield 2/BF2.exe	+menu 1 +fullscreen 1	auto

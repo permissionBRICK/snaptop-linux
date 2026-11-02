@@ -1,0 +1,9 @@
+#!/bin/bash
+# systemd-sleep hook (/usr/lib/systemd/system-sleep/) for s15-power-key: mark "suspended" before a suspend and
+# clear the mark 3 s after resume, so the service can tell the press that woke the laptop from a later press.
+M=/run/s15-power-key.suspended
+case "$1" in
+  pre) touch $M ;;
+  post) systemd-run --quiet --collect --timer-property=AccuracySec=100ms --on-active=3 rm -f $M ;;
+esac
+exit 0

@@ -1,0 +1,36 @@
+From c341c6d5d214db5a53a896a9166439e8bec5f194 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 01:37:01 +0000
+Subject: [PATCH] drm/msm/dp: use 8 bpc instead of 6 bpc when the link rate is
+ not yet known
+
+On the ASUS Vivobook S 15 (X1E80100, Samsung ATNA56AC03 OLED, EDID 10 bpc)
+the eDP mode was programmed with 18 bpp although the link trains at
+HBR3 x4: msm_dp_panel_get_supported_bpp() ran with link_info rate/lanes 0
+and fell through to the 18 bpp minimum, causing visible banding.
+---
+ drivers/gpu/drm/msm/dp/dp_panel.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index e76dad0f6..1e09ee635 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -223,6 +223,14 @@ static u32 msm_dp_panel_get_supported_bpp(struct msm_dp_panel *msm_dp_panel,
+ 	link_info = &msm_dp_panel->link_info;
+ 	data_rate_khz = link_info->num_lanes * link_info->rate * 8;
+ 
++	/*
++	 * eDP: the mode can be set before the link capabilities are known. A zero data
++	 * rate would fall through to 18 bpp (6 bpc, visible banding on OLED panels);
++	 * use 24 bpp (8 bpc) instead, which every DP/eDP sink supports.
++	 */
++	if (!data_rate_khz)
++		return min(bpp, 24U);
++
+ 	do {
+ 		if (mode_pclk_khz * bpp <= data_rate_khz)
+ 			return bpp;
+-- 
+2.43.0
+

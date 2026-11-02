@@ -1,0 +1,27 @@
+#!/bin/bash
+# Wi-Fi watchdog (timer, every 60 s; installed by steamos-s15-setup.sh). The WCN7850 firmware sometimes stalls: NetworkManager stays "connecting"
+# forever, or scans return nothing. A driver reload does not cure that, a reboot (chip power cycle) does.
+#  - stuck "connecting" or an empty scan list for 3 checks -> reload the driver once (s15-wifi-reset)
+#  - still stuck after 2 resets and /run/s15-remote-test exists -> reboot (remote-test mode only; the flag is
+#    in /run, so it is gone after that reboot). Plain "disconnected, no known network around" is left alone.
+S=/run/s15-wifi-watchdog.state; L=/var/log/s15-wifi-watchdog.log
+log() { echo "$(date -Is) wifi-watchdog: $*" >> $L; }
+[ "$(nmcli -t -f WIFI radio 2>/dev/null)" = enabled ] || { rm -f $S; exit 0; }
+/usr/local/sbin/s15-wifi-powersave check   # per-network power save (DISASSOC_LOW_ACK drops)
+IF=$(nmcli -t -f DEVICE,TYPE dev 2>/dev/null | awk -F: '$2 == "wifi" {print $1; exit}')   # wlan0, or wlan1 after a driver reload
+st=$(nmcli -t -f DEVICE,STATE dev 2>/dev/null | sed -n "s/^$IF://p")
+bad=
+case "$st" in
+  connected) rm -f $S; exit 0 ;;
+  connecting*) bad="stuck: $st" ;;
+  *) [ -z "$(nmcli -t -f SSID dev wifi list --rescan auto 2>/dev/null | grep -v '^$' | head -1)" ] && bad="no networks in scan ($st)" ;;
+esac
+[ -n "$bad" ] || { rm -f $S; exit 0; }
+read -r n resets < $S 2>/dev/null; n=$(( ${n:-0} + 1 )); resets=${resets:-0}
+if [ $n -ge 3 ]; then
+  if [ $resets -ge 2 ] && [ -e /run/s15-remote-test ]; then
+    log "$bad after $resets resets -> reboot (remote-test mode)"; sync; systemctl reboot; exit 0
+  fi
+  log "$bad for 3 checks -> s15-wifi-reset"; /usr/local/sbin/s15-wifi-reset; n=0; resets=$((resets + 1))
+fi
+echo "$n $resets" > $S

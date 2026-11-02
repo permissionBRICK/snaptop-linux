@@ -1,0 +1,19 @@
+#!/bin/bash
+# systemd-sleep hook (/usr/lib/systemd/system-sleep/): after a wake, ask NetworkManager for a Wi-Fi scan if the
+# connection is not back. iwd's own autoconnect scans after resume often fail ("received scan start failure event")
+# and back off, so the laptop stayed offline until someone opened the Wi-Fi applet (whose scan request works).
+# Checks 5, 15 and 30 s after the wake; does nothing when Wi-Fi is off or already connected.
+case "$1" in
+  post)
+    systemd-run --quiet --collect --unit="s15-wifi-resume-$(date +%s)" bash -c '
+      for d in 5 10 15; do
+        sleep $d
+        [ "$(nmcli -t -f WIFI radio 2>/dev/null)" = enabled ] || exit 0
+        IF=$(nmcli -t -f DEVICE,TYPE dev 2>/dev/null | awk -F: "\$2 == \"wifi\" {print \$1; exit}")
+        st=$(nmcli -t -f DEVICE,STATE dev 2>/dev/null | sed -n "s/^$IF://p")
+        case "$st" in connected|connecting*) exit 0 ;; esac
+        echo "$(date -Is) wifi-resume: $IF $st -> rescan" >> /var/log/s15-wifi-watchdog.log
+        nmcli device wifi rescan ifname "$IF" 2>/dev/null
+      done' ;;
+esac
+exit 0

@@ -1,0 +1,15 @@
+#!/bin/bash
+# Lid watchdog (timer, every 60 s): if the laptop is awake with the lid closed and no external display for two checks
+# in a row, suspend it, whatever an application requested. Plasma and logind only act on the lid-close *event*; after
+# a wake with the lid already closed (EC dark wake, a failed suspend) only the idle timer is left, and applications
+# can block that (once the laptop stayed awake in the bag for 7 hours). Windows sleeps with the lid closed, too.
+# Not with an external display connected (clamshell use). Touch /run/s15-keepawake to disable it (remote tests).
+S=/run/s15-lid-watchdog.count; L=/var/log/s15-sleep.log
+lid=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager LidClosed 2>/dev/null)
+ext=$(cat /sys/class/drm/card*-DP-*/status /sys/class/drm/card*-HDMI-*/status 2>/dev/null | grep -c '^connected')
+if [ "$lid" != "b true" ] || [ "$ext" -gt 0 ] || [ -e /run/s15-keepawake ]; then rm -f $S; exit 0; fi
+n=$(( $(cat $S 2>/dev/null || echo 0) + 1 )); echo $n > $S
+[ $n -ge 2 ] || exit 0
+rm -f $S
+echo "$(date -Is) lid-watchdog: awake with the lid closed for 2 checks -> suspend" >> $L
+systemctl suspend

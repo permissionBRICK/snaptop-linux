@@ -1,0 +1,10 @@
+games/dsoal/
+*.efi
+*.dtb
+*.dtbo
+payload/
+*.cpio
+*.cpio.zst
+*.mbn
+*.elf
+*.jsn

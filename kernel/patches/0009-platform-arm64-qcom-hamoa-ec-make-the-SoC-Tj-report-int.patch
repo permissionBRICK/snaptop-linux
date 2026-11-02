@@ -1,0 +1,30 @@
+From ff09cf63b4c3eddd106700931f30f0b9bf204790 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:24:00 +0000
+Subject: [PATCH] platform: arm64: qcom-hamoa-ec: make the SoC Tj report
+ interval a module parameter
+
+The driver reports the SoC junction temperature to the EC every 125 ms, computed from 33 thermal zones each time: about 15 I2C interrupts per second and 264 sensor reads per second at idle. The ASUS Vivobook S15 EC is known to accept a 2 s period (x1e-sleep's EC driver uses 2000 ms). Add tj_period_ms (50-5000 ms, default unchanged at 125), writable at runtime.
+---
+ drivers/platform/arm64/qcom-hamoa-ec.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/platform/arm64/qcom-hamoa-ec.c b/drivers/platform/arm64/qcom-hamoa-ec.c
+index f41bbc4fe..d9dfc46b9 100644
+--- a/drivers/platform/arm64/qcom-hamoa-ec.c
++++ b/drivers/platform/arm64/qcom-hamoa-ec.c
+@@ -84,7 +84,10 @@ static bool thermistor_kelvin;
+ module_param(thermistor_kelvin, bool, 0644);
+ MODULE_PARM_DESC(thermistor_kelvin, "EC thermistor readings are in 0.1 K instead of 0.1 degC");
+ 
+-#define EC_SOC_TJ_TEMP_POLL_JIFFIES	msecs_to_jiffies(125)
++static unsigned int tj_period_ms = 125;
++module_param(tj_period_ms, uint, 0644);
++MODULE_PARM_DESC(tj_period_ms, "Interval of the SoC Tj report to the EC in ms (50-5000, default 125)");
++#define EC_SOC_TJ_TEMP_POLL_JIFFIES	msecs_to_jiffies(clamp_t(unsigned int, READ_ONCE(tj_period_ms), 50, 5000))
+ 
+ /*
+  * The EC firmware NACKs the bus instead of clock-stretching while it is
+-- 
+2.43.0
+

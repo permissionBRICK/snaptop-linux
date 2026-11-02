@@ -1,0 +1,148 @@
+From 02a6430ed7c14660fd442a9fc4265c28c265c432 Mon Sep 17 00:00:00 2001
+From: justririll <justririll@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:36:50 +0000
+Subject: [PATCH 1/7] lpass tx/rx macro: drop the LPASS macro/dcodec votes in
+ runtime suspend
+
+The tx and rx macro drivers enable the "macro" and "dcodec" clocks (q6prm
+LPASS_HW_MACRO/DCODEC votes to the ADSP) in probe and release them only in
+remove, so the ADSP keeps AUD_CORE_CLOCK voted forever and AOP never collapses
+CX or turns off XO in system sleep (cxsd/aosd stay 0). The va and wsa macros
+already handle them through pm_clk. Take the votes in runtime resume and drop
+them in runtime suspend.
+
+Source: https://github.com/justririll/x1e-sleep (sleep/lpass-macro-release-votes-in-runtime-suspend.patch, commit 4e84b60)
+---
+ sound/soc/codecs/lpass-rx-macro.c | 28 ++++++++++++++++++++++------
+ sound/soc/codecs/lpass-tx-macro.c | 28 ++++++++++++++++++++++------
+ 2 files changed, 44 insertions(+), 12 deletions(-)
+
+diff --git a/sound/soc/codecs/lpass-rx-macro.c b/sound/soc/codecs/lpass-rx-macro.c
+index 6233aa9f5..9afebf63a 100644
+--- a/sound/soc/codecs/lpass-rx-macro.c
++++ b/sound/soc/codecs/lpass-rx-macro.c
+@@ -3935,11 +3935,13 @@ static void rx_macro_remove(struct platform_device *pdev)
+ {
+ 	struct rx_macro *rx = dev_get_drvdata(&pdev->dev);
+ 
+-	clk_disable_unprepare(rx->mclk);
+-	clk_disable_unprepare(rx->npl);
+-	clk_disable_unprepare(rx->fsgen);
+-	clk_disable_unprepare(rx->macro);
+-	clk_disable_unprepare(rx->dcodec);
++	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		clk_disable_unprepare(rx->mclk);
++		clk_disable_unprepare(rx->npl);
++		clk_disable_unprepare(rx->fsgen);
++		clk_disable_unprepare(rx->macro);
++		clk_disable_unprepare(rx->dcodec);
++	}
+ }
+ 
+ static const struct of_device_id rx_macro_dt_match[] = {
+@@ -3976,6 +3978,8 @@ static int rx_macro_runtime_suspend(struct device *dev)
+ 	clk_disable_unprepare(rx->fsgen);
+ 	clk_disable_unprepare(rx->npl);
+ 	clk_disable_unprepare(rx->mclk);
++	clk_disable_unprepare(rx->dcodec);
++	clk_disable_unprepare(rx->macro);
+ 
+ 	return 0;
+ }
+@@ -3985,10 +3989,18 @@ static int rx_macro_runtime_resume(struct device *dev)
+ 	struct rx_macro *rx = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	ret = clk_prepare_enable(rx->macro);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(rx->dcodec);
++	if (ret)
++		goto err_dcodec;
++
+ 	ret = clk_prepare_enable(rx->mclk);
+ 	if (ret) {
+ 		dev_err(dev, "unable to prepare mclk\n");
+-		return ret;
++		goto err_mclk;
+ 	}
+ 
+ 	ret = clk_prepare_enable(rx->npl);
+@@ -4010,6 +4022,10 @@ static int rx_macro_runtime_resume(struct device *dev)
+ 	clk_disable_unprepare(rx->npl);
+ err_npl:
+ 	clk_disable_unprepare(rx->mclk);
++err_mclk:
++	clk_disable_unprepare(rx->dcodec);
++err_dcodec:
++	clk_disable_unprepare(rx->macro);
+ 
+ 	return ret;
+ }
+diff --git a/sound/soc/codecs/lpass-tx-macro.c b/sound/soc/codecs/lpass-tx-macro.c
+index 0cbf50647..fc4630cf5 100644
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -2390,11 +2390,13 @@ static void tx_macro_remove(struct platform_device *pdev)
+ {
+ 	struct tx_macro *tx = dev_get_drvdata(&pdev->dev);
+ 
+-	clk_disable_unprepare(tx->macro);
+-	clk_disable_unprepare(tx->dcodec);
+-	clk_disable_unprepare(tx->mclk);
+-	clk_disable_unprepare(tx->npl);
+-	clk_disable_unprepare(tx->fsgen);
++	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		clk_disable_unprepare(tx->macro);
++		clk_disable_unprepare(tx->dcodec);
++		clk_disable_unprepare(tx->mclk);
++		clk_disable_unprepare(tx->npl);
++		clk_disable_unprepare(tx->fsgen);
++	}
+ 
+ 	lpass_macro_pds_exit(tx->pds);
+ }
+@@ -2409,6 +2411,8 @@ static int tx_macro_runtime_suspend(struct device *dev)
+ 	clk_disable_unprepare(tx->fsgen);
+ 	clk_disable_unprepare(tx->npl);
+ 	clk_disable_unprepare(tx->mclk);
++	clk_disable_unprepare(tx->dcodec);
++	clk_disable_unprepare(tx->macro);
+ 
+ 	return 0;
+ }
+@@ -2418,10 +2422,18 @@ static int tx_macro_runtime_resume(struct device *dev)
+ 	struct tx_macro *tx = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	ret = clk_prepare_enable(tx->macro);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(tx->dcodec);
++	if (ret)
++		goto err_dcodec;
++
+ 	ret = clk_prepare_enable(tx->mclk);
+ 	if (ret) {
+ 		dev_err(dev, "unable to prepare mclk\n");
+-		return ret;
++		goto err_mclk;
+ 	}
+ 
+ 	ret = clk_prepare_enable(tx->npl);
+@@ -2444,6 +2456,10 @@ static int tx_macro_runtime_resume(struct device *dev)
+ 	clk_disable_unprepare(tx->npl);
+ err_npl:
+ 	clk_disable_unprepare(tx->mclk);
++err_mclk:
++	clk_disable_unprepare(tx->dcodec);
++err_dcodec:
++	clk_disable_unprepare(tx->macro);
+ 
+ 	return ret;
+ }
+-- 
+2.43.0
+

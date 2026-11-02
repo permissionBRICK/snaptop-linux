@@ -1,0 +1,37 @@
+From 24d3804164f045521d5e2d296b27721ed6ccaafb Mon Sep 17 00:00:00 2001
+From: justririll <justririll@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:37:09 +0000
+Subject: [PATCH 3/7] PCI: qcom: keep the boot-time Gen1 x1 interconnect vote
+ after link up
+
+Voting the full link bandwidth after link up pinned DDR at 2092 MHz for as long as the link was up, even while it idled in L1ss. Keep the boot-time Gen1 x1 vote. Debatable: real DMA traffic relies on the LLCC to DDR BWMON.
+
+Source: https://github.com/justririll/x1e-sleep (commit 4e84b60), not upstream.
+---
+ drivers/pci/controller/dwc/pcie-qcom.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index b58a607b7..e94d318d2 100644
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -1708,8 +1708,14 @@ static void qcom_pcie_icc_opp_update(struct qcom_pcie *pcie)
+ 	width = FIELD_GET(PCI_EXP_LNKSTA_NLW, status);
+ 
+ 	if (pcie->icc_mem) {
+-		ret = icc_set_bw(pcie->icc_mem, 0,
+-				 width * QCOM_PCIE_LINK_SPEED_TO_BW(speed));
++		/*
++		 * Don't vote the full link bandwidth: as peak or as average it
++		 * pins DDR at 2092 MHz for as long as the link is up, even when
++		 * it idles in L1ss (AOP DDR stats, 2026-10-01). Keep the boot-time
++		 * Gen1 x1 vote; real DMA traffic is seen by the LLCC->DDR BWMON,
++		 * which scales DDR up.
++		 */
++		ret = icc_set_bw(pcie->icc_mem, 0, QCOM_PCIE_LINK_SPEED_TO_BW(1));
+ 		if (ret) {
+ 			dev_err(pci->dev, "Failed to set bandwidth for PCIe-MEM interconnect path: %d\n",
+ 				ret);
+-- 
+2.43.0
+

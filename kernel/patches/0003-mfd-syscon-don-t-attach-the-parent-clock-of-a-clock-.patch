@@ -1,0 +1,38 @@
+From 5bb34aa87bc350c701c850c5773cc5338353cfdb Mon Sep 17 00:00:00 2001
+From: justririll <justririll@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:37:09 +0000
+Subject: [PATCH 2/7] mfd: syscon: don't attach the parent clock of a clock
+ provider
+
+syscon attached the parent clock of the TCSR clock provider (bi_tcxo) as its register clock and kept it prepared, which pinned an RPMh XO vote and kept the SoC from turning the crystal off in suspend. Skip 'clocks' for nodes with #clock-cells.
+
+Source: https://github.com/justririll/x1e-sleep (commit 4e84b60), not upstream.
+---
+ drivers/mfd/syscon.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mfd/syscon.c b/drivers/mfd/syscon.c
+index 21a7fcdd2..ee9ceca17 100644
+--- a/drivers/mfd/syscon.c
++++ b/drivers/mfd/syscon.c
+@@ -123,7 +123,16 @@ static struct syscon *of_syscon_register(struct device_node *np, bool check_res)
+ 	}
+ 
+ 	if (check_res) {
+-		clk = of_clk_get(np, 0);
++		/*
++		 * The "clocks" of a clock provider (e.g. the X1E TCSR block) are
++		 * its parent clocks, not a register clock. Attaching one keeps it
++		 * prepared forever, which pins an RPMh XO vote and blocks the SoC
++		 * from turning the crystal off in suspend.
++		 */
++		if (of_property_present(np, "#clock-cells"))
++			clk = ERR_PTR(-ENOENT);
++		else
++			clk = of_clk_get(np, 0);
+ 		if (IS_ERR(clk)) {
+ 			ret = PTR_ERR(clk);
+ 			/* clock is optional */
+-- 
+2.43.0
+
