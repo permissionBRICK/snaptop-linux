@@ -30,14 +30,19 @@ chain. It does not protect against someone who can change the firmware.
 - LUKS2, `aes-xts-plain64`, 512-bit key, 4096-byte sectors, label `SNAPSTEAM`, data offset 16 MiB. The GPT
   partition label stays `SNAPSTEAM-NVME`. Opened as `/dev/mapper/root` with `discard` (TRIM passes through).
 - Key slots: the passphrase (argon2id, about 2 s), the re-seal key (`/var/lib/s15-luks/reseal.key`, 64 random
-  bytes, root only, inside the encrypted file system), one systemd-tpm2 token per boot entry and firmware variant.
+  bytes, root only, inside the encrypted file system; slot priority "prefer", so unlocking with it does not first run
+  the passphrase slot's argon2id), one systemd-tpm2 token per boot entry and firmware variant.
+- When testing which slot a key opens, add `--disable-external-tokens`: cryptsetup otherwise tries the TPM tokens
+  first and reports the slot of a token that matches the running boot.
 - Boot entries (`S15BOOT/loader/entries/s15*.conf`):
   `root=/dev/mapper/root rd.luks.name=<UUID>=root rd.luks.options=<UUID>=discard,tpm2-device=auto`.
   `install-esp.sh` writes these options itself when the partition is LUKS. The old GRUB entry cannot open it.
 - The initramfs ([steamos.md](steamos.md#initramfs)) has `sd-encrypt`, the TPM driver, keyboard, console keymap
   and font, and the display (the DSPs start in the initramfs), so the prompt is visible and typed with the right layout.
 
-Boot (2026-11-03): the TPM unlocks at about 4.2 s; the whole boot takes 0.3 s longer than unencrypted.
+Boot (2026-11-03): the TPM unlocks at about 4.2 s; the whole boot takes 0.3 s longer than unencrypted. With a
+passphrase (tested 2026-11-04): the TPM tokens are refused at about 7 s, the Caps Lock light starts blinking and the
+prompt appears at the same moment; after the passphrase the volume is open about 2.3 s later.
 
 ## Encrypting
 
@@ -63,7 +68,8 @@ From a live ARM64 system (docs/live-system.md), SteamOS not running, about 50 mi
 
 ## Automatic re-sealing (`s15-luks-reseal`)
 
-Runs at every boot (`s15-luks-reseal.service`) and after every `s15-update-esp` (so after `install-kernel.sh`).
+Runs at every boot (`s15-luks-reseal.service`, in the background at low priority, so the desktop does not wait for
+it) and after every `s15-update-esp` (so after `install-kernel.sh`).
 For every boot entry that opens this partition and every firmware variant seen at boot within 180 days, it
 predicts PCR 4 and 9 from the files on `S15BOOT`, computes the policy digest of each prediction (`TPM2_PolicyPCR`,
 the token's `tpm2-policy-hash`), enrolls the missing ones (`systemd-cryptenroll --tpm2-pcrs=4:sha256=...+9:sha256=...`,
@@ -91,9 +97,9 @@ fails safely and the boot asks for the passphrase; `s15-luks-reseal` then seals 
 
 - **Passphrase prompt at boot:** something measured changed (see above). Type the passphrase; the TPM is re-sealed
   during that boot. The display driver is only started for the prompt, and its takeover from the firmware failed in
-  a third of the boots where it started that early ([known-issues.md](known-issues.md), "Display takeover"). If the
-  screen stays plain blue instead of showing the prompt, typing does not help (tested: the prompt only starts after
-  the display check, which hangs with the display): hold the power button and boot again until the prompt appears.
+  a third of the boots where it started that early ([known-issues.md](known-issues.md), "Display takeover"). The
+  **Caps Lock light blinks while the passphrase is requested**; the prompt does not wait for the display, so when it
+  blinks, type the passphrase and press Enter even if the screen stays black or plain blue.
 - **From a live system** (e.g. a btrfs problem):
   `cryptsetup open /dev/disk/by-partlabel/SNAPSTEAM-NVME root` (passphrase), then work on `/dev/mapper/root`
   (`btrfs check --readonly`, `btrfs rescue zero-log`, mount).

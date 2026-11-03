@@ -282,9 +282,11 @@ say "initramfs for $KV (systemd; boot drivers, DSPs and display, keyboard, TPM, 
 # (s15_etc_overlay) is replaced by sd-s15-etc-overlay.
 mkdir -p "$R/etc/initcpio/install"
 for h in s15 s15-dsp s15-display sd-s15-etc-overlay; do install -m0644 "$HERE/initcpio/$h" "$R/etc/initcpio/install/$h"; done
-# Display takeover check (docs/known-issues.md): in the initramfs only before a passphrase prompt (hook s15-display),
-# in SteamOS when the display driver's framebuffer appears; the driver's state snapshot after a failure is kept.
+# Display takeover (docs/known-issues.md): in the initramfs the display driver starts only next to a passphrase
+# prompt, which meanwhile blinks the Caps Lock light (hook s15-display); in SteamOS the check logs a failed takeover
+# and the driver's state snapshot is kept.
 install -D -m0755 "$HERE/s15-display-check" "$R/usr/local/sbin/s15-display-check"
+install -D -m0755 "$HERE/s15-prompt-signal" "$R/usr/local/sbin/s15-prompt-signal"
 install -D -m0755 "$HERE/s15-save-devcoredump" "$R/usr/local/sbin/s15-save-devcoredump"
 install -D -m0644 "$HERE/s15-display-check.service" "$R/etc/systemd/system/s15-display-check.service"
 install -D -m0644 "$HERE/93-s15-display.rules" "$R/etc/udev/rules.d/93-s15-display.rules"

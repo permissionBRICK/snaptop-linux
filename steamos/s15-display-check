@@ -1,11 +1,11 @@
 #!/bin/sh
 # Start or check the internal display (docs/known-issues.md, "Display takeover").
 # In about 1 boot in 10 the first frame after the display driver (msm) takes over from the firmware fails on the
-# eDP path ("[dpu error]enc42 intf5 ctl 1 reset failure", frame done and vblank timeouts). Further frames then fail
-# too: the console waits a second per frame, the screen keeps its last image (blue), and the system crawls until a
-# full mode set (the desktop's) restarts the display. Here the console's framebuffer is blanked and unblanked once,
-# which disables and re-enables the display path.
-#   s15-display-check load   (initramfs, before a passphrase prompt) load msm first, then check
+# eDP path ("[dpu error]enc42 intf5 ctl 1 reset failure", frame done and vblank timeouts); in the initramfs about 1
+# in 3. Every later frame fails too and the screen keeps its last image (plain blue). In SteamOS the desktop's first
+# mode set restarts the display. Nothing here tries to repair it: blanking the console (or changing its font) holds
+# the console lock through the failing frames, which blocked the passphrase prompt's output.
+#   s15-display-check load   (initramfs, next to a passphrase prompt, never blocking it) load msm, then check
 #   s15-display-check        (SteamOS, udev when fb0 appears) check only
 FB=/sys/class/graphics/fb0
 DONE=/run/s15-display-checked   # /run survives the switch to SteamOS: check once per boot
@@ -20,15 +20,8 @@ while [ ! -e "$FB" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
 sleep 1
 : > "$DONE"
 if dmesg | grep -q -E "ctl [0-9]+ reset failure|frame done timeout"; then
-  log "display start failed - blanking and unblanking the console to restart the display path"
-  echo 1 > "$FB/blank"; sleep 0.5; echo 0 > "$FB/blank"
-  sleep 1
-  n=$(dmesg | grep -c -E "ctl [0-9]+ reset failure|frame done timeout")
-  sleep 2
-  if [ "$(dmesg | grep -c -E "ctl [0-9]+ reset failure|frame done timeout")" = "$n" ]; then
-    log "display restarted"
-  else
-    log "display still failing"
-  fi
+  log "display takeover failed (screen keeps its last image); the desktop's mode set restarts it"
+else
+  log "display started"
 fi
 exit 0

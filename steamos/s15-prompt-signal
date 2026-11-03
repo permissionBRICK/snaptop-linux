@@ -1,0 +1,21 @@
+#!/bin/sh
+# Initramfs: blink the Caps Lock light while a disk passphrase is requested, so the prompt is recognisable without
+# the display (docs/encryption.md). Started next to systemd-ask-password-console.service; ends when the volume is
+# open. "s15-prompt-signal restore" gives the lights back to the keyboard.
+restore() {
+  for l in /sys/class/leds/*::capslock; do [ -e "$l/trigger" ] && echo kbd-capslock > "$l/trigger"; done
+}
+if [ "$1" = restore ]; then restore; exit 0; fi
+trap 'restore; exit 0' TERM INT
+for l in /sys/class/leds/*::capslock; do [ -e "$l/trigger" ] && echo none > "$l/trigger"; done
+set_leds() { for l in /sys/class/leds/*::capslock; do [ -e "$l/brightness" ] && echo "$1" > "$l/brightness"; done; }
+opened() { for m in /dev/mapper/*; do [ "${m##*/}" != control ] && [ -e "$m" ] && return 0; done; return 1; }
+asked() { for a in /run/systemd/ask-password/ask.*; do [ -e "$a" ] && return 0; done; return 1; }
+while ! opened; do
+  if asked; then
+    set_leds 1; sleep 0.4; set_leds 0; sleep 0.4
+  else
+    set_leds 0; sleep 0.5   # e.g. while a typed passphrase is being checked
+  fi
+done
+restore

@@ -94,7 +94,7 @@ IR illuminator is a separate component.
 |---|---|
 | `s15` | Clock, interconnect, PHY, PCIe/NVMe, USB and USB storage drivers for the root filesystem. |
 | `s15-dsp` | Starts the ADSP and CDSP with their firmware from the initramfs. The display driver waits for the USB-C/DisplayPort chain behind the ADSP (`pmic_glink`); without the DSPs it could only start after the root filesystem. |
-| `kms`, `s15-display` | The display driver (msm) is in the image but only loaded for a passphrase prompt (`s15-display-check load` before `systemd-ask-password-console`); see below. |
+| `kms`, `s15-display` | The display driver (msm) is in the image but only loaded when a passphrase is requested, next to the prompt and without delaying it (`s15-prompt-display.service`); meanwhile the Caps Lock light blinks (`s15-prompt-signal.service`). See below. |
 | `keyboard`, `sd-vconsole`, `i2c_hid_of`, `hid_asus_ec` | Internal keyboard, console keymap and font (`/etc/vconsole.conf`) for a passphrase prompt. The keymap is global for all consoles, so SteamOS's own `systemd-vconsole-setup` is masked. |
 | `tpm_qcom_crb`, `sd-encrypt` | Firmware TPM and LUKS, for an encrypted root ([tpm.md](tpm.md)); idle without `crypttab`/`rd.luks`. |
 | `sd-s15-etc-overlay` | Mounts SteamOS's `/etc` overlay before switch-root, so units enabled at runtime start at boot. |
@@ -110,8 +110,12 @@ Why the display driver is still only loaded for a prompt: its takeover from the 
 ([known-issues.md](known-issues.md), "Display takeover"). In SteamOS the desktop's first mode set repairs that within
 seconds. In the initramfs nothing does, and the console setup's font redraws each wait a second for a frame that never
 comes: a boot on 2026-11-03 sat on a blue screen for over two minutes. So a normal boot (TPM unlock, or no
-encryption) leaves the display to SteamOS, and `s15-display-check` blanks and unblanks the console once if the first
-frame failed (in the initramfs before a prompt, and in SteamOS from a udev rule when `fb0` appears).
+encryption) leaves the display to SteamOS. When a passphrase is requested, the prompt starts at once and the display
+driver loads beside it; the Caps Lock light blinks until the volume is open, so the prompt is recognisable even if the
+display start fails (plain blue or black screen: type the passphrase, Enter). In the initramfs nothing reloads the
+console font when the driver's console appears (`90-vconsole.rules` is overridden), and nothing blanks the console:
+both hold the console lock through every failing frame, which kept the prompt from printing and reading.
+`s15-display-check` only logs whether the takeover worked (in SteamOS from a udev rule when `fb0` appears).
 
 Boot (2026-11-03, display in the initramfs): display at 3.4 s, switch-root at 3.8 s, `graphical.target` at 6.6 s
 after the kernel started (15-16 s with the earlier busybox initramfs, which started the DSPs from the root filesystem);

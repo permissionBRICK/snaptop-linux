@@ -5,7 +5,10 @@ ConditionPathExists=/var/lib/s15-luks/reseal.key
 After=local-fs.target tpm2.target
 
 [Service]
-Type=oneshot
+# In the background: enrolling a token takes a few seconds of CPU; the desktop must not wait for it.
+Type=exec
+Nice=19
+IOSchedulingClass=idle
 ExecStart=/usr/local/sbin/s15-luks-reseal
 
 [Install]

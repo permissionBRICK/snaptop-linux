@@ -139,6 +139,10 @@ step_finish() {
   if [ "$slots" -lt 3 ]; then
     cryptsetup luksAddKey --key-file "$D/rk-plain" --pbkdf pbkdf2 --pbkdf-force-iterations 1000 "$p" "$D/reseal.key"
   fi
+  # Try the re-seal key's slot first: otherwise every unlock with it (s15-luks-reseal) first runs the passphrase
+  # slot's argon2id (2 s, 1 GiB). The slot number comes from a test unlock without tokens (a TPM token would answer).
+  rs=$(cryptsetup open --test-passphrase --disable-external-tokens --key-file "$D/reseal.key" -v "$p" 2>&1 | sed -n 's/^Key slot \([0-9]*\) unlocked.*/\1/p')
+  [ -n "$rs" ] && cryptsetup config "$p" --key-slot "$rs" --priority prefer
   cryptsetup luksDump "$p" | grep -E '^  [0-9]+: luks2|PBKDF:'
   echo "== root filesystem"
   m=$D/mnt; mkdir -p "$m"; mountpoint -q "$m" || mount -t btrfs /dev/mapper/$NAME "$m"

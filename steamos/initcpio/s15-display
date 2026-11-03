@@ -1,15 +1,30 @@
 #!/bin/bash
-# mkinitcpio install hook: the display driver (msm, from the kms hook) is not loaded automatically in the initramfs,
-# only when a passphrase prompt is needed (systemd-ask-password-console.service), by s15-display-check. A normal
-# boot (TPM unlock, or no encryption) starts the display in SteamOS, where a failed takeover (about 1 boot in 10,
-# docs/known-issues.md) is repaired before anything waits for it.
+# mkinitcpio install hook: the display driver (msm, from the kms hook) is not loaded automatically in the initramfs.
+# Its takeover from the firmware fails in about 1 in 3 boots there (docs/known-issues.md, "Display takeover"). Only
+# when a passphrase is requested, two units start next to systemd-ask-password-console.service without delaying it:
+# s15-prompt-display loads msm (s15-display-check load), s15-prompt-signal blinks the Caps Lock light until the
+# volume is open. The prompt itself never waits for the display, so it also works when the display start fails.
 build() {
-    printf '%s\n' '# s15-display: msm is loaded by s15-display-check when a passphrase prompt is needed' 'blacklist msm' \
+    printf '%s\n' '# s15-display: msm is loaded by s15-prompt-display.service when a passphrase is requested' 'blacklist msm' \
         | add_file - /etc/modprobe.d/s15-display.conf 0644
     add_file /usr/local/sbin/s15-display-check /usr/lib/s15/s15-display-check 0755
+    add_file /usr/local/sbin/s15-prompt-signal /usr/lib/s15/s15-prompt-signal 0755
     add_binary dmesg
     add_binary grep
-    printf '%s\n' '[Service]' 'ExecStartPre=-/usr/lib/s15/s15-display-check load' \
+    printf '%s\n' '[Unit]' 'Description=Start the display for a passphrase prompt' 'DefaultDependencies=no' \
+        '[Service]' 'Type=oneshot' 'ExecStart=/usr/lib/s15/s15-display-check load' \
+        | add_file - /usr/lib/systemd/system/s15-prompt-display.service 0644
+    printf '%s\n' '[Unit]' 'Description=Blink the Caps Lock light while a disk passphrase is requested' \
+        'DefaultDependencies=no' '[Service]' 'ExecStart=/usr/lib/s15/s15-prompt-signal' \
+        'ExecStopPost=/usr/lib/s15/s15-prompt-signal restore' \
+        | add_file - /usr/lib/systemd/system/s15-prompt-signal.service 0644
+    printf '%s\n' '[Unit]' 'Wants=s15-prompt-display.service s15-prompt-signal.service' \
         | add_file - /etc/systemd/system/systemd-ask-password-console.service.d/s15-display.conf 0644
+    # Console setup (keymap, font) once at the start instead of on every new console (90-vconsole.rules, the only
+    # trigger sd-vconsole installs): a font reload when the display driver's console appears holds the console lock
+    # through every failing frame. The keymap is global; the kernel's own font at this resolution is 16x32 anyway.
+    printf '%s\n' '# s15-display: console setup runs once at sysinit (see the s15-display hook)' \
+        | add_file - /etc/udev/rules.d/90-vconsole.rules 0644
+    add_symlink /usr/lib/systemd/system/sysinit.target.wants/systemd-vconsole-setup.service ../systemd-vconsole-setup.service
 }
-help() { echo "Vivobook S15: load the display driver in the initramfs only for a passphrase prompt"; }
+help() { echo "Vivobook S15: display driver in the initramfs only for a passphrase prompt, Caps Lock blinks meanwhile"; }

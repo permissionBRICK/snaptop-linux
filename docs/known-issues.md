@@ -46,9 +46,10 @@
   3.5 s after power-on handover, firmware image still on screen) and in 3 of 37 where it happened in SteamOS
   (15-21 s). The one test of the prompt path after the change also ended on a blue screen (its log was lost): the
   blank/unblank repair did not help, and typing the passphrase blind did not work either (the password agent only
-  starts after `s15-display-check`, which hangs with the display). Workaround: power off and boot again until the
-  prompt appears. To do: start the agent independently of the display, give a signal without the display (e.g. the
-  Caps Lock LED), find the cause with the saved snapshots. Whether a charger on a USB-C hub plays a part is open (the
+  started after `s15-display-check`, which hung with the display). Now the prompt starts without waiting for the
+  display, nothing blanks the console or reloads its font in the initramfs (both hold the console lock through the
+  failing frames), and the Caps Lock light blinks while the passphrase is requested. Cause still to be found with
+  the saved snapshots. Whether a charger on a USB-C hub plays a part is open (the
   hung boots had one; boots with the hub but no charger were fine).
 - **Boot time:** about 14.5 s from a restart to the login screen (23 s with the busybox initramfs, ~30 s with GRUB):
   firmware ~7 s, systemd-boot 0.8 s, kernel and initramfs ~4 s, userspace ~3 s ([steamos.md](steamos.md#initramfs)).
