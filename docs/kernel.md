@@ -35,7 +35,8 @@ Install a new payload in SteamOS: `sudo steamos/install-kernel.sh <payload>` (ke
      notification (`allow_suspend`)
    - `ps883x` USB-C retimer DP pin F fix
    - reverts of the LPASS macro PM-clock conversion (audio)
-3. **Our patch** `kernel/patches/0001-drm-msm-dp-use-8-bpc-...patch` (below).
+3. **Our patches** in `kernel/patches/`, among them 8 bpc on the panel (`0001`, below) and the firmware TPM driver
+   (`0011`, [tpm](tpm.md)).
 4. **DT overlay** from the same community repo (`overlay/build-overlay.sh --dtbo-only`): audio (WSA8845 speakers,
    SoundWire, mics), RGB and IR cameras, and optionally the EC node. `build.sh` merges it into the mainline DTB
    with `fdtoverlay`, and also sets `rotation = <180>` on the HM1092 node (`camera@24`), which the overlay misses.

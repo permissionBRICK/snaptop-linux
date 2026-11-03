@@ -97,6 +97,8 @@ fi
 say "modules to load at boot"
 mkdir -p "$R/etc/modules-load.d"
 printf 'scmi-cpufreq\n' > "$R/etc/modules-load.d/vivobook-s15-cpufreq.conf"
+# Firmware TPM (kernel patch 0011, docs/tpm.md): there is no devicetree node for it, so it does not autoload.
+printf 'tpm_qcom_crb\n' > "$R/etc/modules-load.d/s15-tpm.conf"
 
 say "mask Frame-only system and user units"
 mkdir -p "$R/etc/systemd/system" "$R/etc/systemd/user"

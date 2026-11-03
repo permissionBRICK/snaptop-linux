@@ -55,7 +55,7 @@
 - **Power:** standby (0.15 W) and idle are measured ([power](power.md)). Screen-off idle is still about 1.5 W,
   Windows reaches about 0.5 W.
 - Headphone jack, DP alt mode, Iris video decode, face login with the IR camera: untested.
-- NPU (an experimental llama.cpp path exists, not tried), TPM, ambient light sensor: no Linux support yet.
+- NPU (an experimental llama.cpp path exists, not tried), ambient light sensor: no Linux support yet.
 
 ## Resolved (for reference)
 

@@ -12,9 +12,10 @@ FEX for Windows games, a Plasma desktop and a Steam Deck-style Game Mode:
 - speakers and microphones, both cameras, keyboard with backlight and RGB colour, touchpad, Fn keys
 - Wi-Fi and Bluetooth (with tray applets in Desktop Mode), USB-A, the right USB-C port with docks
 - dual boot next to BitLocker-protected Windows, one-click reboot in both directions
+- the firmware TPM 2.0 (own driver, [docs/tpm.md](docs/tpm.md))
 - old 32-bit DirectX 9 games (FlatOut 2 tested) running smoothly under Proton ARM64
 
-Not yet: NPU, USB4/Thunderbolt, USB devices on the left USB-C port, TPM, light sensor; Secure Boot must be off.
+Not yet: NPU, USB4/Thunderbolt, USB devices on the left USB-C port, light sensor; Secure Boot must be off.
 Details: [docs/status.md](docs/status.md), [docs/known-issues.md](docs/known-issues.md).
 
 > **State 2026-11-02.** Tested on one laptop. Every step was tested there, but the combined one-shot flow below

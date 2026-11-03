@@ -1,0 +1,382 @@
+From 9a27c904f10653649df6147ef413f49231038b94 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 13:58:00 +0000
+Subject: [PATCH] tpm: add a driver for the Qualcomm X1E firmware TPM
+ (qcom.tz.tpm)
+
+Snapdragon X Elite (X1E80100) laptops ship a firmware TPM 2.0 that runs as
+the QSEE application "qcom.tz.tpm" in TrustZone. On Windows the ACPI TPM2
+table describes it with the vendor start method 9: TPM commands go through
+a TCG Command Response Buffer (CRB) in memory shared with TrustZone, and a
+QSEECOM request to the application runs a pending command. Linux boots
+these machines with a devicetree, so there is no TPM2 table and no TPM.
+
+The application protocol (as used by the TPM service of Qualcomm's Windows
+TrEE driver): every request starts with a little-endian command id.
+  0x1000   application version, must be 1.0
+  0x80000  TPM type, 0x6654504d ("fTPM")
+  0x4012   CRB location: { word, address low, address high }
+  0x4008   run the command in the CRB: request { 0x4008, 0x400 } padded
+           to 0x408 bytes, response 0x404 bytes; the application clears
+           the CRB start bit when the response is in place.
+
+The driver looks the application up over QSEECOM, checks version and type,
+maps the CRB the application reports and registers a synchronous TPM 2.0
+chip. The application's QSEECOM interface is the legacy one; the QCOMTEE
+object service "qcom.tz.tpm" (UID 81) used by newer platforms is not
+exposed by the X1E80100 firmware (QTEE 5.2.0).
+
+Tested on an ASUS Vivobook S 15 (S5507QA): QCOM "xCGfTPM" TPM 2.0 rev 1.62,
+firmware 4.0.0.1; PCRs 0-7 match the replay of the firmware event log;
+works across suspend/resume.
+---
+ drivers/char/tpm/Kconfig        |  15 ++
+ drivers/char/tpm/Makefile       |   1 +
+ drivers/char/tpm/tpm_qcom_crb.c | 298 ++++++++++++++++++++++++++++++++
+ 3 files changed, 314 insertions(+)
+ create mode 100644 drivers/char/tpm/tpm_qcom_crb.c
+
+diff --git a/drivers/char/tpm/Kconfig b/drivers/char/tpm/Kconfig
+index 5f672f2c0..48aadc618 100644
+--- a/drivers/char/tpm/Kconfig
++++ b/drivers/char/tpm/Kconfig
+@@ -243,6 +243,21 @@ config TCG_FTPM_TEE
+ 	help
+ 	  This driver proxies for firmware TPM running in TEE.
+ 
++config TCG_QCOM_CRB
++	tristate "Qualcomm X1E firmware TPM (qcom.tz.tpm, CRB interface)"
++	depends on ARCH_QCOM || COMPILE_TEST
++	depends on QCOM_QSEECOM
++	help
++	  Driver for the firmware TPM of Snapdragon X Elite (X1E80100) laptops.
++	  The TPM runs as the QSEE application "qcom.tz.tpm" in TrustZone and
++	  is reached through a TCG Command Response Buffer shared with the
++	  secure world (ACPI TPM2 start method 9 on Windows). The kernel boots
++	  these machines with a devicetree, so the driver locates the buffer
++	  through the application and needs no firmware description.
++
++	  To compile this driver as a module, choose M here; the module will
++	  be called tpm_qcom_crb.
++
+ config TCG_SVSM
+ 	tristate "SNP SVSM vTPM interface"
+ 	depends on AMD_MEM_ENCRYPT
+diff --git a/drivers/char/tpm/Makefile b/drivers/char/tpm/Makefile
+index 5b5cdc0d3..9af9a65d5 100644
+--- a/drivers/char/tpm/Makefile
++++ b/drivers/char/tpm/Makefile
+@@ -45,5 +45,6 @@ obj-$(CONFIG_TCG_CRB) += tpm_crb.o
+ obj-$(CONFIG_TCG_ARM_CRB_FFA) += tpm_crb_ffa.o
+ obj-$(CONFIG_TCG_VTPM_PROXY) += tpm_vtpm_proxy.o
+ obj-$(CONFIG_TCG_FTPM_TEE) += tpm_ftpm_tee.o
++obj-$(CONFIG_TCG_QCOM_CRB) += tpm_qcom_crb.o
+ obj-$(CONFIG_TCG_SVSM) += tpm_svsm.o
+ obj-$(CONFIG_TCG_LOONGSON) += tpm_loongson.o
+diff --git a/drivers/char/tpm/tpm_qcom_crb.c b/drivers/char/tpm/tpm_qcom_crb.c
+new file mode 100644
+index 000000000..dde6b3580
+--- /dev/null
++++ b/drivers/char/tpm/tpm_qcom_crb.c
+@@ -0,0 +1,298 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * TPM driver for the Qualcomm firmware TPM on Snapdragon X Elite (X1E80100) laptops.
++ *
++ * The fTPM runs as the QSEE app "qcom.tz.tpm" in TrustZone. Windows reaches it through the
++ * TCG ACPI TPM2 table with the vendor start method 9: TPM commands go through a TCG Command
++ * Response Buffer (CRB) in memory shared with TrustZone, and a QSEECOM request to the app
++ * processes a pending command. This mirrors the TPM service of Qualcomm's Windows TrEE driver:
++ *   0x1000   app version          -> { status, cmd, version }, version must be 1.0
++ *   0x80000  TPM type             -> { cmd, status, type }, 'fTPM' = 0x6654504d
++ *   0x4012   CRB location         -> { word, crb_pa_lo, crb_pa_hi }; 0x3000 bytes there
++ *   0x4008   process CRB command  -> request { 0x4008, 0x400 } padded to 0x408 bytes,
++ *                                    response 0x404 bytes
++ * The kernel boots these laptops with a devicetree, so there is no ACPI TPM2 table; the CRB
++ * location comes from the app itself.
++ */
++
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/firmware/qcom/qcom_scm.h>
++#include <linux/firmware/qcom/qcom_tzmem.h>
++#include <linux/sizes.h>
++#include <linux/tpm.h>
++
++#include "tpm.h"
++
++#define QTPM_APP_NAME		"qcom.tz.tpm"
++#define QTPM_CMD_VERSION	0x1000
++#define QTPM_CMD_TYPE		0x80000
++#define QTPM_CMD_CRB_INFO	0x4012
++#define QTPM_CMD_PROCESS	0x4008
++#define QTPM_PROCESS_REQ_LEN	0x408
++#define QTPM_PROCESS_RSP_LEN	0x404
++#define QTPM_VERSION_1_0	0x10000
++#define QTPM_TYPE_FTPM		0x6654504d
++#define QTPM_CRB_MAP_LEN	0x3000
++
++/* TCG CRB control area (as struct crb_regs_tail in tpm_crb.c) */
++#define CRB_CTRL_REQ		0x00
++#define CRB_CTRL_STS		0x04
++#define CRB_CTRL_CANCEL		0x08
++#define CRB_CTRL_START		0x0c
++#define CRB_CTRL_CMD_SIZE	0x18
++#define CRB_CTRL_CMD_LO		0x1c
++#define CRB_CTRL_CMD_HI		0x20
++#define CRB_CTRL_RSP_SIZE	0x24
++#define CRB_CTRL_RSP_PA		0x28
++#define CRB_START_INVOKE	BIT(0)
++#define CRB_STS_ERROR		BIT(0)
++
++static bool hwrng;
++module_param(hwrng, bool, 0444);
++MODULE_PARM_DESC(hwrng, "register the TPM as a kernel hardware RNG (default off)");
++
++static unsigned int timeout_ms = 5000;
++module_param(timeout_ms, uint, 0644);
++MODULE_PARM_DESC(timeout_ms, "how long to wait for the app to clear CRB start after the doorbell");
++
++struct qtpm {
++	struct platform_device *pdev;
++	struct tpm_chip *chip;
++	struct qcom_tzmem_pool *pool;
++	u32 *req;
++	u32 *rsp;
++	u32 app_id;
++	phys_addr_t crb_pa;
++	void __iomem *crb;
++	void __iomem *cmd;
++	void __iomem *rspbuf;
++	u32 cmd_size;
++	u32 rsp_size;
++};
++
++static struct qtpm *qtpm;
++
++static int qtpm_app_send(struct qtpm *q, size_t req_len, size_t rsp_len)
++{
++	return qcom_scm_qseecom_app_send(q->app_id, q->req, req_len, q->rsp, rsp_len);
++}
++
++static int qtpm_simple_cmd(struct qtpm *q, u32 cmd, size_t rsp_len)
++{
++	memset(q->req, 0, SZ_4K);
++	memset(q->rsp, 0, SZ_4K);
++	q->req[0] = cmd;
++	return qtpm_app_send(q, sizeof(u32), rsp_len);
++}
++
++static int qtpm_send(struct tpm_chip *chip, u8 *buf, size_t bufsiz, size_t cmd_len)
++{
++	struct qtpm *q = dev_get_drvdata(chip->dev.parent);
++	unsigned long stop;
++	u32 len;
++	int ret;
++
++	if (cmd_len > q->cmd_size)
++		return -E2BIG;
++	if (ioread32(q->crb + CRB_CTRL_START) & CRB_START_INVOKE) {
++		dev_err(&chip->dev, "CRB busy before send\n");
++		return -EBUSY;
++	}
++
++	memcpy_toio(q->cmd, buf, cmd_len);
++	memset_io(q->rspbuf, 0, TPM_HEADER_SIZE);
++	/* the command must be in the shared buffer before start is set */
++	wmb();
++	iowrite32(CRB_START_INVOKE, q->crb + CRB_CTRL_START);
++
++	memset(q->req, 0, QTPM_PROCESS_REQ_LEN);
++	memset(q->rsp, 0, QTPM_PROCESS_RSP_LEN);
++	q->req[0] = QTPM_CMD_PROCESS;
++	q->req[1] = 0x400;
++	ret = qtpm_app_send(q, QTPM_PROCESS_REQ_LEN, QTPM_PROCESS_RSP_LEN);
++	if (ret) {
++		dev_err(&chip->dev, "doorbell failed: %d\n", ret);
++		iowrite32(0, q->crb + CRB_CTRL_START);
++		return ret;
++	}
++
++	stop = jiffies + msecs_to_jiffies(timeout_ms);
++	while (ioread32(q->crb + CRB_CTRL_START) & CRB_START_INVOKE) {
++		if (time_after(jiffies, stop)) {
++			dev_err(&chip->dev, "app did not complete command %#x\n",
++				be32_to_cpup((__be32 *)(buf + 6)));
++			iowrite32(0, q->crb + CRB_CTRL_START);
++			return -ETIME;
++		}
++		usleep_range(500, 1000);
++	}
++	/* read the response only after start was seen clear */
++	rmb();
++	if (ioread32(q->crb + CRB_CTRL_STS) & CRB_STS_ERROR) {
++		dev_err(&chip->dev, "CRB reports a fatal TPM error\n");
++		return -EIO;
++	}
++
++	memcpy_fromio(buf, q->rspbuf, TPM_HEADER_SIZE);
++	len = be32_to_cpup((__be32 *)(buf + 2));
++	if (len < TPM_HEADER_SIZE || len > q->rsp_size || len > bufsiz) {
++		dev_err(&chip->dev, "invalid response length %u\n", len);
++		return -EIO;
++	}
++	memcpy_fromio(buf + TPM_HEADER_SIZE, q->rspbuf + TPM_HEADER_SIZE,
++		      len - TPM_HEADER_SIZE);
++	return len;
++}
++
++static const struct tpm_class_ops qtpm_ops = {
++	.flags = TPM_OPS_AUTO_STARTUP,
++	.send = qtpm_send,
++};
++
++static int qtpm_setup(struct qtpm *q)
++{
++	struct qcom_tzmem_pool_config cfg = {
++		.initial_size = SZ_16K, .policy = QCOM_TZMEM_POLICY_STATIC, .max_size = SZ_16K,
++	};
++	struct device *dev = &q->pdev->dev;
++	u64 cmd_pa, rsp_pa;
++	int ret;
++
++	ret = qcom_scm_qseecom_app_get_id(QTPM_APP_NAME, &q->app_id);
++	if (ret)
++		return dev_err_probe(dev, -ENODEV, "app %s not found (%d)\n",
++				     QTPM_APP_NAME, ret);
++
++	q->pool = qcom_tzmem_pool_new(&cfg);
++	if (IS_ERR(q->pool))
++		return PTR_ERR(q->pool);
++	q->req = qcom_tzmem_alloc(q->pool, SZ_4K, GFP_KERNEL);
++	q->rsp = qcom_tzmem_alloc(q->pool, SZ_4K, GFP_KERNEL);
++	if (!q->req || !q->rsp)
++		return -ENOMEM;
++
++	ret = qtpm_simple_cmd(q, QTPM_CMD_VERSION, 12);
++	if (ret || q->rsp[0] || q->rsp[2] != QTPM_VERSION_1_0)
++		return dev_err_probe(dev, -ENODEV,
++				     "unsupported app version (ret %d, status %u, version %#x)\n",
++				     ret, q->rsp[0], q->rsp[2]);
++
++	ret = qtpm_simple_cmd(q, QTPM_CMD_TYPE, 12);
++	if (ret || q->rsp[1] || q->rsp[2] != QTPM_TYPE_FTPM)
++		return dev_err_probe(dev, -ENODEV,
++				     "not an fTPM (ret %d, status %u, type %#x)\n",
++				     ret, q->rsp[1], q->rsp[2]);
++
++	ret = qtpm_simple_cmd(q, QTPM_CMD_CRB_INFO, 12);
++	q->crb_pa = ((u64)q->rsp[2] << 32) | q->rsp[1];
++	if (ret || !q->crb_pa || !IS_ALIGNED(q->crb_pa, SZ_4K))
++		return dev_err_probe(dev, -ENODEV, "no CRB location (ret %d, pa %pa)\n",
++				     ret, &q->crb_pa);
++
++	q->crb = ioremap(q->crb_pa, QTPM_CRB_MAP_LEN);
++	if (!q->crb)
++		return -ENOMEM;
++
++	q->cmd_size = ioread32(q->crb + CRB_CTRL_CMD_SIZE);
++	q->rsp_size = ioread32(q->crb + CRB_CTRL_RSP_SIZE);
++	cmd_pa = ((u64)ioread32(q->crb + CRB_CTRL_CMD_HI) << 32) |
++		 ioread32(q->crb + CRB_CTRL_CMD_LO);
++	rsp_pa = ((u64)ioread32(q->crb + CRB_CTRL_RSP_PA + 4) << 32) |
++		 ioread32(q->crb + CRB_CTRL_RSP_PA);
++	if (cmd_pa < q->crb_pa || rsp_pa < q->crb_pa ||
++	    q->cmd_size < SZ_1K || q->rsp_size < SZ_1K ||
++	    cmd_pa - q->crb_pa + q->cmd_size > QTPM_CRB_MAP_LEN ||
++	    rsp_pa - q->crb_pa + q->rsp_size > QTPM_CRB_MAP_LEN)
++		return dev_err_probe(dev, -ENODEV,
++				     "unexpected CRB layout (cmd %#llx+%#x, rsp %#llx+%#x)\n",
++				     cmd_pa, q->cmd_size, rsp_pa, q->rsp_size);
++	q->cmd = q->crb + (cmd_pa - q->crb_pa);
++	q->rspbuf = q->crb + (rsp_pa - q->crb_pa);
++	q->cmd_size = min_t(u32, q->cmd_size, TPM_BUFSIZE);
++	q->rsp_size = min_t(u32, q->rsp_size, TPM_BUFSIZE);
++
++	if (ioread32(q->crb + CRB_CTRL_START) & CRB_START_INVOKE)
++		return dev_err_probe(dev, -EBUSY, "CRB start already set\n");
++
++	dev_info(dev, "%s app %u, CRB at %pa (cmd %#llx+%#x, rsp %#llx+%#x)\n",
++		 QTPM_APP_NAME, q->app_id, &q->crb_pa, cmd_pa, q->cmd_size, rsp_pa, q->rsp_size);
++	return 0;
++}
++
++static void qtpm_free(struct qtpm *q)
++{
++	if (q->crb)
++		iounmap(q->crb);
++	if (q->req)
++		qcom_tzmem_free(q->req);
++	if (q->rsp)
++		qcom_tzmem_free(q->rsp);
++	if (!IS_ERR_OR_NULL(q->pool))
++		qcom_tzmem_pool_free(q->pool);
++	if (q->pdev)
++		platform_device_unregister(q->pdev);
++	kfree(q);
++}
++
++static int __init qtpm_init(void)
++{
++	struct qtpm *q;
++	int ret;
++
++	if (!of_machine_is_compatible("qcom,x1e80100"))
++		return -ENODEV;
++
++	q = kzalloc_obj(*q);
++	if (!q)
++		return -ENOMEM;
++	q->pdev = platform_device_register_simple("tpm_qcom_crb", PLATFORM_DEVID_NONE, NULL, 0);
++	if (IS_ERR(q->pdev)) {
++		ret = PTR_ERR(q->pdev);
++		q->pdev = NULL;
++		goto err;
++	}
++	platform_set_drvdata(q->pdev, q);
++
++	ret = qtpm_setup(q);
++	if (ret)
++		goto err;
++
++	q->chip = tpm_chip_alloc(&q->pdev->dev, &qtpm_ops);
++	if (IS_ERR(q->chip)) {
++		ret = PTR_ERR(q->chip);
++		q->chip = NULL;
++		goto err;
++	}
++	q->chip->flags |= TPM_CHIP_FLAG_TPM2 | TPM_CHIP_FLAG_SYNC;
++	if (!hwrng)
++		q->chip->flags |= TPM_CHIP_FLAG_HWRNG_DISABLED;
++
++	ret = tpm_chip_register(q->chip);
++	if (ret) {
++		dev_err(&q->pdev->dev, "tpm_chip_register failed: %d\n", ret);
++		put_device(&q->chip->dev);
++		goto err;
++	}
++	qtpm = q;
++	return 0;
++
++err:
++	qtpm_free(q);
++	return ret;
++}
++
++static void __exit qtpm_exit(void)
++{
++	tpm_chip_unregister(qtpm->chip);
++	put_device(&qtpm->chip->dev);
++	qtpm_free(qtpm);
++}
++
++module_init(qtpm_init);
++module_exit(qtpm_exit);
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Qualcomm X1E80100 firmware TPM (qcom.tz.tpm) via CRB and QSEECOM");
+-- 
+2.43.0
+

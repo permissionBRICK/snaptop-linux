@@ -13,6 +13,8 @@ what you are about to do before anything that writes to disk, and report results
 - Change BitLocker, Secure Boot or other BIOS settings yourself, or resume BitLocker without the user.
 - Commit, upload or share the ASUS firmware files (they are not redistributable).
 - Put a boot loader in front of Windows Boot Manager or chainload Windows (BitLocker would ask for the recovery key).
+- Clear the TPM, change its authorizations or evict its persistent keys, or guess TPM PINs: Windows (BitLocker,
+  Windows Hello) owns its state (docs/tpm.md).
 
 ## Where you are
 
@@ -59,6 +61,7 @@ what you are about to do before anything that writes to disk, and report results
 - Standby: after one suspend, `cat /sys/kernel/debug/qcom_stats/cxsd` shows a rising count (needs debugfs);
   `/var/log/s15-sleep.log` logs every sleep with drain and residency.
 - Boot entries: `efibootmgr` shows Windows Boot Manager first, then "SteamOS (S15)".
+- TPM: `/dev/tpmrm0` exists; `tools/s15-tpm-check.py` (read-only) prints QCOM "xCGfTPM" and `OK` for PCR 0-7.
 
 ## Changing this repository
 
