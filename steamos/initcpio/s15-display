@@ -1,0 +1,15 @@
+#!/bin/bash
+# mkinitcpio install hook: the display driver (msm, from the kms hook) is not loaded automatically in the initramfs,
+# only when a passphrase prompt is needed (systemd-ask-password-console.service), by s15-display-check. A normal
+# boot (TPM unlock, or no encryption) starts the display in SteamOS, where a failed takeover (about 1 boot in 10,
+# docs/known-issues.md) is repaired before anything waits for it.
+build() {
+    printf '%s\n' '# s15-display: msm is loaded by s15-display-check when a passphrase prompt is needed' 'blacklist msm' \
+        | add_file - /etc/modprobe.d/s15-display.conf 0644
+    add_file /usr/local/sbin/s15-display-check /usr/lib/s15/s15-display-check 0755
+    add_binary dmesg
+    add_binary grep
+    printf '%s\n' '[Service]' 'ExecStartPre=-/usr/lib/s15/s15-display-check load' \
+        | add_file - /etc/systemd/system/systemd-ask-password-console.service.d/s15-display.conf 0644
+}
+help() { echo "Vivobook S15: load the display driver in the initramfs only for a passphrase prompt"; }

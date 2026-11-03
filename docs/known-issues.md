@@ -32,10 +32,24 @@
   about a minute (no Tj feed); the firmware then started Windows. The boot parameter is gone; `s15-sync-state`
   forces `sync_state()` right before the first suspend instead. Root cause (which provider's cut-off breaks the QUP
   engines, whose votes are declared in the DT) still unknown.
-- **One hang with the DSPs started in the initramfs:** the first full boot with `s15-dsp` (2026-11-03) stopped on a
-  plain blue screen (no fan, no power-off); its log was lost. The next full boot, logged to a USB stick, was normal.
-  If it happens again: hold the power button; the boot after that may need `btrfs rescue zero-log` from a live
-  system ([steamos.md](steamos.md#initramfs)).
+- **Display takeover:** in about 1 boot in 10 the first frame after the display driver (msm) takes over from the
+  firmware fails on the eDP path: `hw recovery is not complete for ctl:1`, `[dpu error]enc42 intf5 ctl 1 reset
+  failure: -22`, frame done and vblank timeouts (seen on 2026-11-01 with the driver loaded at 15-18 s, and on
+  2026-11-03). Every later frame fails too, each failure takes a display state snapshot, and the console waits a
+  second per frame; the screen keeps its last image (plain blue). When the desktop starts, its mode set repairs it
+  within seconds, which is why it went unnoticed. With the driver in the initramfs (2026-11-03) the console setup's
+  font redraws blocked the boot instead: a blue screen for over two minutes, Ctrl+Alt+F2 dead (twice). Now the
+  driver is only loaded in the initramfs for a passphrase prompt, SteamOS's console setup is masked, and
+  `s15-display-check` blanks and unblanks the console once when the first frame failed
+  ([steamos.md](steamos.md#initramfs)). The snapshots are kept in `/var/log/s15-devcoredump/` for finding the
+  cause. Counted over 46 logged boots: the takeover failed in 3 of 9 boots where it happened in the initramfs (about
+  3.5 s after power-on handover, firmware image still on screen) and in 3 of 37 where it happened in SteamOS
+  (15-21 s). The one test of the prompt path after the change also ended on a blue screen (its log was lost): the
+  blank/unblank repair did not help, and typing the passphrase blind did not work either (the password agent only
+  starts after `s15-display-check`, which hangs with the display). Workaround: power off and boot again until the
+  prompt appears. To do: start the agent independently of the display, give a signal without the display (e.g. the
+  Caps Lock LED), find the cause with the saved snapshots. Whether a charger on a USB-C hub plays a part is open (the
+  hung boots had one; boots with the hub but no charger were fine).
 - **Boot time:** about 14.5 s from a restart to the login screen (23 s with the busybox initramfs, ~30 s with GRUB):
   firmware ~7 s, systemd-boot 0.8 s, kernel and initramfs ~4 s, userspace ~3 s ([steamos.md](steamos.md#initramfs)).
 - **Volume keys in Game Mode:** they work in Desktop Mode; in Game Mode the volume overlay appears only

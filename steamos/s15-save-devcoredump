@@ -1,0 +1,9 @@
+#!/bin/sh
+# Keep a device coredump (e.g. the display driver's state snapshot after a failure) in /var/log/s15-devcoredump.
+d=/sys/class/devcoredump/$1
+[ -r "$d/data" ] || exit 0
+mkdir -p /var/log/s15-devcoredump
+f=/var/log/s15-devcoredump/$(date +%Y%m%d-%H%M%S)-$(basename "$(readlink -f "$d/failing_device")").txt
+cat "$d/data" > "$f"
+echo 1 > "$d/data"   # free it
+ls -1t /var/log/s15-devcoredump/* | tail -n +11 | xargs -r rm -f   # keep the last 10

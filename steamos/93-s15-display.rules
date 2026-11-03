@@ -1,0 +1,4 @@
+# The console framebuffer of the display driver appeared: check that the display started (s15-display-check).
+ACTION=="add", SUBSYSTEM=="graphics", KERNEL=="fb0", DRIVERS=="msm_dpu", TAG+="systemd", ENV{SYSTEMD_WANTS}+="s15-display-check.service"
+# The display driver's state snapshot after a failure (devcoredump): keep it for debugging.
+ACTION=="add", SUBSYSTEM=="devcoredump", RUN+="/usr/local/sbin/s15-save-devcoredump %k"

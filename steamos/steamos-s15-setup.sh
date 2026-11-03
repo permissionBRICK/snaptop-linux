@@ -281,7 +281,16 @@ say "initramfs for $KV (systemd; boot drivers, DSPs and display, keyboard, TPM, 
 # docs/steamos.md#initramfs. The install hooks are files in steamos/initcpio/; the busybox variant's /etc overlay hook
 # (s15_etc_overlay) is replaced by sd-s15-etc-overlay.
 mkdir -p "$R/etc/initcpio/install"
-for h in s15 s15-dsp sd-s15-etc-overlay; do install -m0644 "$HERE/initcpio/$h" "$R/etc/initcpio/install/$h"; done
+for h in s15 s15-dsp s15-display sd-s15-etc-overlay; do install -m0644 "$HERE/initcpio/$h" "$R/etc/initcpio/install/$h"; done
+# Display takeover check (docs/known-issues.md): in the initramfs only before a passphrase prompt (hook s15-display),
+# in SteamOS when the display driver's framebuffer appears; the driver's state snapshot after a failure is kept.
+install -D -m0755 "$HERE/s15-display-check" "$R/usr/local/sbin/s15-display-check"
+install -D -m0755 "$HERE/s15-save-devcoredump" "$R/usr/local/sbin/s15-save-devcoredump"
+install -D -m0644 "$HERE/s15-display-check.service" "$R/etc/systemd/system/s15-display-check.service"
+install -D -m0644 "$HERE/93-s15-display.rules" "$R/etc/udev/rules.d/93-s15-display.rules"
+# The initramfs sets keymap and font (global for all consoles). In SteamOS the console setup would only redraw the
+# consoles with the font again, which blocks the boot for minutes when the display takeover failed.
+ln -sfn /dev/null "$R/etc/systemd/system/systemd-vconsole-setup.service"
 rm -f "$R/etc/initcpio/install/s15_etc_overlay" "$R/etc/initcpio/hooks/s15_etc_overlay"
 install -m0644 "$HERE/mkinitcpio-s15.conf" "$R/etc/mkinitcpio-s15.conf"
 # Console font for a passphrase prompt on the 2880x1620 panel (the kernel's 8x16 font is tiny there). The keymap

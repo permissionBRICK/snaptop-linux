@@ -1,0 +1,7 @@
+[Unit]
+Description=Check that the internal display started (restart it once if not)
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s15-display-check

@@ -128,7 +128,7 @@ step_finish() {
   [ "$(blkid -o value -s TYPE "$p")" = crypto_LUKS ] || die "$p is not LUKS"
   cryptsetup luksDump "$p" | grep -q 'online-reencrypt' && die "encryption still pending"
   uuid=$(cryptsetup luksUUID "$p")
-  [ -e /dev/mapper/$NAME ] || cryptsetup open --key-file "$D/rk-plain" "$p" $NAME
+  [ -e /dev/mapper/$NAME ] || cryptsetup open --allow-discards --key-file "$D/rk-plain" "$p" $NAME
   echo "== btrfs check (read-only)"; btrfs check --readonly /dev/mapper/$NAME 2>&1 | tail -4
   echo "== key slots"
   local slots; slots=$(cryptsetup luksDump "$p" | grep -cE '^  [0-9]+: luks2' || true)
@@ -149,6 +149,9 @@ step_finish() {
     "$uuid" "$(date -Is)" /var/lib/s15-luks/reseal.key > "$m/var/lib/s15-luks/info"
   cryptsetup --test-passphrase --key-file "$m/var/lib/s15-luks/reseal.key" open "$p" && echo "re-seal key opens the volume"
   cryptsetup --test-passphrase --key-file "$D/pass" open "$p" && echo "passphrase opens the volume"
+  # The encryption wrote every block, so the SSD considers the whole partition in use (a QLC drive then gets slow):
+  # tell it which blocks are free.
+  fstrim -v "$m" || echo "fstrim failed (run 'fstrim -v /' in SteamOS)"
   umount "$m"
   [ -n "${S15_TEST_DEV:-}" ] && { cryptsetup close $NAME; progress "DONE (test)"; return; }
   echo "== boot entries on S15BOOT"

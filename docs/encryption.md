@@ -54,7 +54,9 @@ From a live ARM64 system (docs/live-system.md), SteamOS not running, about 50 mi
 3. Then it encrypts in place (`cryptsetup reencrypt --encrypt --reduce-device-size 32M`, after shrinking btrfs by
    32 MiB). This is crash-safe: after an interruption run `luks-encrypt.sh encrypt` again (it resumes). The Micron
    2400 (QLC) writes 1.1 GB/s until its SLC cache is full (~130 GB), then 125-170 MB/s.
-4. `finish`: read-only `btrfs check`, the passphrase and re-seal key slots, the boot entries, BootNext.
+4. `finish`: read-only `btrfs check`, the passphrase and re-seal key slots, `fstrim` of the free space (the
+   encryption wrote every block, so the SSD considers the whole partition in use and gets slow: boots took 30-37 s
+   instead of 15 s until a TRIM of 482 GB), the boot entries, BootNext.
 5. Restart: the boot asks for the passphrase once. `s15-luks-reseal.service` then enrolls the TPM tokens; the next
    boot unlocks without a prompt. Remove the temporary key and delete the photo:
    `systemd-cryptenroll --unlock-key-file=/var/lib/s15-luks/reseal.key --wipe-slot=0 /dev/disk/by-partlabel/SNAPSTEAM-NVME`
@@ -88,7 +90,10 @@ fails safely and the boot asks for the passphrase; `s15-luks-reseal` then seals 
 ## Recovery
 
 - **Passphrase prompt at boot:** something measured changed (see above). Type the passphrase; the TPM is re-sealed
-  during that boot.
+  during that boot. The display driver is only started for the prompt, and its takeover from the firmware failed in
+  a third of the boots where it started that early ([known-issues.md](known-issues.md), "Display takeover"). If the
+  screen stays plain blue instead of showing the prompt, typing does not help (tested: the prompt only starts after
+  the display check, which hangs with the display): hold the power button and boot again until the prompt appears.
 - **From a live system** (e.g. a btrfs problem):
   `cryptsetup open /dev/disk/by-partlabel/SNAPSTEAM-NVME root` (passphrase), then work on `/dev/mapper/root`
   (`btrfs check --readonly`, `btrfs rescue zero-log`, mount).
