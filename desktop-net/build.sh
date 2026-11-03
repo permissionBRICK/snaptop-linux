@@ -27,7 +27,9 @@ mountpoint -q "$W/chroot" || mount -t overlay overlay -o "lowerdir=$LOWER,upperd
 cleanup() { for m in dev sys proc; do umount -R "$W/chroot/$m" 2>/dev/null || true; done; umount "$W/chroot" 2>/dev/null || true
             mountpoint -q "$W/ro" && umount "$W/ro"; true; }
 trap cleanup EXIT
-for m in proc sys dev; do mount --rbind /$m "$W/chroot/$m"; done
+# --make-rslave: without it the recursive unmount in cleanup() propagates to the host (/ is a shared mount)
+# and takes /sys/fs/cgroup, /dev/pts, /dev/shm etc. with it, which breaks systemd until they are remounted.
+for m in proc sys dev; do mount --rbind /$m "$W/chroot/$m"; mount --make-rslave "$W/chroot/$m"; done
 # The overlay's upper dir keeps earlier results: finished packages (build/b/*.done) are skipped on a rerun, which
 # helps because configure steps under qemu occasionally fail spuriously (once: "Could NOT find Qt6Xml").
 mkdir -p "$W/chroot/build/src"

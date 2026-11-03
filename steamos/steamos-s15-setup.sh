@@ -320,7 +320,9 @@ HOOKS=(base udev autodetect modconf s15 block filesystems s15_etc_overlay)
 COMPRESSION="zstd"
 MODULES_DECOMPRESS="yes"
 EOF
-for m in proc sys dev run; do mountpoint -q "$R/$m" || mount --rbind "/$m" "$R/$m"; done
+# --make-rslave: without it the recursive unmount below propagates to the host (/ is a shared mount) and
+# takes /sys/fs/cgroup, /dev/pts, /dev/shm etc. with it, which breaks systemd until they are remounted.
+for m in proc sys dev run; do mountpoint -q "$R/$m" || { mount --rbind "/$m" "$R/$m"; mount --make-rslave "$R/$m"; }; done
 say "camera libraries and PipeWire plugin"
 install -m0755 "$HERE/install-camera.sh" "$R/var/tmp/s15-install-camera.sh"
 chroot "$R" bash /var/tmp/s15-install-camera.sh
