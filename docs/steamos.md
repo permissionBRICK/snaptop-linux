@@ -54,6 +54,17 @@ its file list is `/var/lib/s15-camera.files`. Temporary build files are removed 
 Check `cam -l` for sensor detection, then `wpctl status` in the desktop session for a Video source.
 A raw camera capture alone does not verify browser support. Firefox Flatpak uses the desktop camera portal;
 if that portal reports no camera, websites cannot see one. Test a website after granting camera access.
+In Firefox, set `media.webrtc.camera.allow-pipewire` to `true` in `about:config` and fully restart Firefox.
+Without that setting, the tested Flatpak build did not discover the camera even with a working portal.
+
+Rapid reopen or resolution changes also require the CCI recovery patch in our kernel build. Without it,
+the OV02C10 can leave its controller stalled (`master 1 queue 0 timeout`), and WirePlumber may hang after
+the failed stream start. The patch resets CCI on runtime resume and retries a transfer once after the
+existing timeout reset. A recovered transfer may still log that timeout.
+
+The visible camera activity LED is not configured in the current device tree. Its wiring and operation
+under Linux remain unverified; do not infer that the camera is off from an unlit indicator. The HM1092
+IR illuminator is a separate component.
 
 ## What `steamos-s15-setup.sh` changes in the Frame image
 

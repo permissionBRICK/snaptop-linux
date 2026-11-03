@@ -1,0 +1,86 @@
+From: snaptop-linux contributors <noreply@localhost>
+Subject: [PATCH] i2c: qcom-cci: recover camera transfers after power cycling
+
+Reset CCI on runtime resume once the interrupt handler is registered, and
+retry a timed-out transfer once after the existing queue timeout reset.
+The OV02C10 can stall CCI when it powers down between camera streams.
+Keep the initial probe resume free of IRQ-dependent resets: our GDSC
+power-on patch resumes the controller before registering its interrupt.
+
+Based on the reset/retry approach discussed by Birk Skyum and Loic Poulain:
+https://lore.kernel.org/r/179261145907.36927.5158021314822941179@pm.me
+
+---
+--- a/drivers/i2c/busses/i2c-qcom-cci.c
++++ b/drivers/i2c/busses/i2c-qcom-cci.c
+@@ -124,6 +124,8 @@
+ 	struct device *dev;
+ 	void __iomem *base;
+ 	unsigned int irq;
++	/* The first runtime resume precedes IRQ registration in probe. */
++	bool reset_ready;
+ 	const struct cci_data *data;
+ 	struct clk_bulk_data *clocks;
+ 	int nclocks;
+@@ -422,21 +424,27 @@
+ {
+ 	struct cci_master *cci_master = i2c_get_adapdata(adap);
+ 	struct cci *cci = cci_master->cci;
+-	int i, ret;
++	int i, ret, attempt;
+ 
+ 	ret = pm_runtime_get_sync(cci->dev);
+ 	if (ret < 0)
+ 		goto err;
+ 
+ 	for (i = 0; i < num; i++) {
+-		if (msgs[i].flags & I2C_M_RD)
+-			ret = cci_i2c_read(cci, cci_master->master,
+-					   msgs[i].addr, msgs[i].buf,
+-					   msgs[i].len);
+-		else
+-			ret = cci_i2c_write(cci, cci_master->master,
+-					    msgs[i].addr, msgs[i].buf,
+-					    msgs[i].len);
++		for (attempt = 0; attempt < 2; attempt++) {
++			if (msgs[i].flags & I2C_M_RD)
++				ret = cci_i2c_read(cci, cci_master->master,
++						   msgs[i].addr, msgs[i].buf,
++						   msgs[i].len);
++			else
++				ret = cci_i2c_write(cci, cci_master->master,
++						    msgs[i].addr, msgs[i].buf,
++						    msgs[i].len);
++
++			/* A timed-out queue has been reset by cci_run_queue(). */
++			if (ret != -ETIMEDOUT)
++				break;
++		}
+ 
+ 		if (ret < 0)
+ 			break;
+@@ -488,8 +496,14 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	cci_init(cci);
+-	return 0;
++	if (!cci->reset_ready) {
++		cci_init(cci);
++		return 0;
++	}
++	ret = cci_reset(cci);
++	if (ret)
++		cci_disable_clocks(cci);
++	return ret;
+ }
+ 
+ static const struct dev_pm_ops qcom_cci_pm = {
+@@ -614,6 +628,7 @@
+ 		goto put_runtime;
+ 	}
+ 
++	cci->reset_ready = true;
+ 	val = readl(cci->base + CCI_HW_VERSION);
+ 	dev_dbg(dev, "CCI HW version = 0x%08x", val);
+ 

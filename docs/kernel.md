@@ -28,6 +28,7 @@ Install a new payload in SteamOS: `sudo steamos/install-kernel.sh <payload>` (ke
    pinned to commit `c35ad9447dcc0883127de50edab1fb3e54f05334` (`COMMUNITY_REV`). The patches are applied with
    `git am`, so their authorship and Signed-off-by lines are kept:
    - `i2c: qcom-cci` power-on fix (camera bus)
+   - our CCI runtime-resume reset and timeout retry fix, for camera reopen and resolution changes
    - Himax HM1092 IR sensor driver, binding, IR illuminator strobe
    - `HID: asus-ec` - EC hotkeys and keyboard backlight
    - `qcom-hamoa-ec` - S15 support: SoC junction temperature feed, fan profiles, RPM query, I2C retries, suspend
