@@ -22,7 +22,7 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | Speakers (2x WSA8845) | works | Community patches + DT overlay + UCM profile. Left/right confirmed. We switch off the LPASS WSA macro compander (it made short sounds start loud and fade). No speaker protection (keep volume reasonable). |
 | Internal microphones | works | Captured signal confirmed. |
 | Headphone jack | untested | |
-| RGB camera (OV02C10) | works | 1920x1080 @ 30 through the libcamera simple pipeline with software ISP; image is dark and noisy. |
+| RGB camera (OV02C10) | capture works | 1920x1080 @ 30 through the libcamera simple pipeline with software ISP; image is dark and noisy. Browser access also needs the [camera components](steamos.md#cameras-and-browser-access), now included in setup. |
 | IR camera (HM1092) + IR illuminator | works | 560x360 raw; our build sets `rotation = <180>`. Face login (howdy) untested. |
 | Wi-Fi (WCN7850, ath12k) | works | Wi-Fi 7, 160 MHz, 1.9 Gbit/s link to a WPA2/WPA3 router. NetworkManager with iwd; the firmware can get stuck (see known issues, `s15-wifi-reset`). |
 | Bluetooth | works | Controller comes up with the correct public address. A Shokz OpenRun Pro 2 headset paired and plays over A2DP (SBC/SBC-XQ); its microphone works over HFP (mSBC, 16 kHz): WirePlumber switches to the headset profile while an app records and back to A2DP afterwards. |

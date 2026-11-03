@@ -319,6 +319,10 @@ COMPRESSION="zstd"
 MODULES_DECOMPRESS="yes"
 EOF
 for m in proc sys dev run; do mountpoint -q "$R/$m" || mount --rbind "/$m" "$R/$m"; done
+say "camera libraries and PipeWire plugin"
+install -m0755 "$HERE/install-camera.sh" "$R/var/tmp/s15-install-camera.sh"
+chroot "$R" bash /var/tmp/s15-install-camera.sh
+rm "$R/var/tmp/s15-install-camera.sh"
 chroot "$R" depmod "$KV"
 # From a live system, autodetect would look at the live kernel's view of the hardware; INITRAMFS_ALL_DRIVERS=1
 # (install.sh) builds this first image with all boot drivers instead. Later kernels (install-kernel.sh) use autodetect.

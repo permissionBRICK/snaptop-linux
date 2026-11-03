@@ -42,7 +42,7 @@ about 1-1.5 hours, mostly unattended.
    cd snaptop-linux && sudo ./install.sh
    ```
    It checks everything, shows what it will do and asks for `YES`. Then it partitions the free space, downloads
-   SteamOS, builds the kernel and the tray applets on the laptop, adapts SteamOS and sets up the boot entry
+   SteamOS, builds the kernel, camera integration and tray applets on the laptop, adapts SteamOS and sets up the boot entry
    ([what exactly](docs/steamos.md#what-installsh-does)).
 5. **Reboot** — SteamOS starts in Desktop Mode. Windows stays the default at power-on; "Reboot to Windows" is on the
    SteamOS desktop. In Windows, `windows\Install-RebootShortcut.ps1` (elevated) adds a "Reboot to SteamOS" icon.

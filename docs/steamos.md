@@ -33,6 +33,28 @@ The quick start is in the [README](../README.md). `install.sh` runs in a live AR
 Later kernels: build a payload with `kernel/build.sh` (on the laptop in SteamOS or on any Linux PC) and run
 `steamos/install-kernel.sh <payload>` in SteamOS.
 
+## Cameras and browser access
+
+The setup script runs `steamos/install-camera.sh` inside the installed image. It builds libcamera 0.7.1
+with the simple pipeline and software ISP, plus the libcamera SPA plugin from PipeWire 1.6.8. Source archives
+are pinned by SHA-256. The Frame image lacks these components; its repository's libcamera 0.2.0 is too old
+for the tested setup. The script installs libcamera under `/usr/local` and only adds the camera plugin to
+the existing PipeWire installation. It does not replace PipeWire or its audio plugins.
+
+For an existing installation, run as root on the laptop:
+
+```sh
+bash steamos/install-camera.sh
+```
+
+Then reboot, or run `systemctl --user restart wireplumber` from the desktop user's terminal and restart
+the browser. Restarting WirePlumber briefly interrupts audio. The script skips an already installed build;
+its file list is `/var/lib/s15-camera.files`. Temporary build files are removed on exit.
+
+Check `cam -l` for sensor detection, then `wpctl status` in the desktop session for a Video source.
+A raw camera capture alone does not verify browser support. Firefox Flatpak uses the desktop camera portal;
+if that portal reports no camera, websites cannot see one. Test a website after granting camera access.
+
 ## What `steamos-s15-setup.sh` changes in the Frame image
 
 | Change | Why |
