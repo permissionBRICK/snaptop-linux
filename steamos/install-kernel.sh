@@ -13,7 +13,7 @@ install -m 0644 "$P/vmlinuz-$KV" "/boot/vmlinuz-$KV"
 install -m 0644 "$P/dtb/x1e80100-asus-vivobook-s15-$KV-ec.dtb" /boot/x1e80100-asus-vivobook-s15-ec.dtb
 install -m 0644 "$P/dtb/x1e80100-asus-vivobook-s15-$KV.dtb" /boot/x1e80100-asus-vivobook-s15.dtb
 rm -f /boot/initramfs-s15.img /boot/initrd.uImage
-mkinitcpio -c /etc/mkinitcpio-s15.conf -k "$KV" -g /boot/initramfs-s15.img 2>&1 | grep -i -E "error|image generation" | head -4 || true
+mkinitcpio -c /etc/mkinitcpio-s15.conf -k "$KV" -g /boot/initramfs-s15.img 2>&1 | grep -i -E "error|s15-dsp|image generation" | head -6 || true
 # The Frame's deckard-uimage post hook wraps the image in a 64-byte U-Boot header and deletes the original.
 [ -f /boot/initramfs-s15.img ] || dd if=/boot/initrd.uImage of=/boot/initramfs-s15.img bs=64 skip=1 status=none
 echo "initramfs: $(stat -c %s /boot/initramfs-s15.img) bytes, modules inside: $(lsinitcpio /boot/initramfs-s15.img | grep -c '\.ko')"

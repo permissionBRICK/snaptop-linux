@@ -1,0 +1,28 @@
+#!/bin/bash
+# mkinitcpio install hook: boot the ADSP and CDSP from the initramfs. The display driver (msm) waits for the
+# USB-C/DisplayPort chain behind the ADSP (pmic_glink); only with the DSPs up does the display come on before the
+# root filesystem is mounted, e.g. for a LUKS passphrase prompt. SMEM needs the hardware spinlock, smp2p needs SMEM.
+# Firmware names come from this machine's devicetree; the files are the ones copied from Windows (docs/firmware.md).
+# A DSP whose driver loads in the initramfs but whose firmware is not in it never starts (remoteproc does not retry
+# after switch-root), so without all firmware files the hook adds nothing and the DSPs start from the root as before.
+build() {
+    local n f fw=()
+    for n in /sys/firmware/devicetree/base/soc@0/remoteproc@*; do
+        [[ -f $n/firmware-name ]] || continue
+        [[ $(tr -d '\0' < "$n/status" 2>/dev/null) == disabled ]] && continue
+        while IFS= read -r -d '' f; do fw+=("$f"); done < "$n/firmware-name"
+    done
+    if (( ${#fw[@]} == 0 )); then
+        warning "s15-dsp: no DSP firmware names in the devicetree; the DSPs start after the root filesystem"
+        return 0
+    fi
+    for f in "${fw[@]}"; do
+        [[ -f /usr/lib/firmware/$f ]] && continue
+        warning "s15-dsp: firmware $f missing; the DSPs start after the root filesystem"
+        return 0
+    done
+    map add_module qcom_hwspinlock qcom_q6v5_pas qrtr qrtr-smd qcom_pd_mapper pmic_glink pmic_glink_altmode \
+        ucsi_glink qcom_battmgr
+    for f in "${fw[@]}"; do add_file "/usr/lib/firmware/$f"; done
+}
+help() { echo "Vivobook S15: ADSP/CDSP with firmware in the initramfs (display available before the root filesystem)"; }

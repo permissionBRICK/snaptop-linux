@@ -32,10 +32,12 @@
   about a minute (no Tj feed); the firmware then started Windows. The boot parameter is gone; `s15-sync-state`
   forces `sync_state()` right before the first suspend instead. Root cause (which provider's cut-off breaks the QUP
   engines, whose votes are declared in the DT) still unknown.
-- **Boot time:** about 23 s from a restart to the login screen with systemd-boot (was ~30 s with GRUB). Firmware
-  ~7 s, kernel ~5 s (mostly PCIe/NVMe bring-up), userspace ~10 s. Left: `systemd-tmpfiles-setup` (2-4 s at boot,
-  0.1 s when run later), `firewalld` (1.5-2 s before NetworkManager), a systemd-based initramfs (no `udevadm
-  settle`, ~1 s).
+- **One hang with the DSPs started in the initramfs:** the first full boot with `s15-dsp` (2026-11-03) stopped on a
+  plain blue screen (no fan, no power-off); its log was lost. The next full boot, logged to a USB stick, was normal.
+  If it happens again: hold the power button; the boot after that may need `btrfs rescue zero-log` from a live
+  system ([steamos.md](steamos.md#initramfs)).
+- **Boot time:** about 14.5 s from a restart to the login screen (23 s with the busybox initramfs, ~30 s with GRUB):
+  firmware ~7 s, systemd-boot 0.8 s, kernel and initramfs ~4 s, userspace ~3 s ([steamos.md](steamos.md#initramfs)).
 - **Volume keys in Game Mode:** they work in Desktop Mode; in Game Mode the volume overlay appears only
   sometimes and the volume does not change. Under investigation (key events vs. the sink Steam controls).
 - **Wi-Fi power save and some access points:** with power save on, two access points (UniFi-type, 2.4 GHz)
@@ -72,7 +74,7 @@
 | Switching to Game Mode takes about a minute (black screen, text cursor) | Desktop autostart ran `steam -deckard` (branch `linux_arm64_beta_*`), Game Mode `-steamdeck` (`steamdeck_stable`): Steam downloaded the other client build on every switch | Desktop Steam starts with `-steamdeck -steamos3` too (user autostart/menu overrides) |
 | Screen flickering on and off every few seconds after plugging in the charger during standby | The USB-C xHCI on the left port had died (see Open), so every suspend failed at once with `-EINVAL`, and the dark-wake hook suspended again every few seconds | The dark-wake hook no longer retries a failed suspend and backs off after three wakes in two minutes; the xHCI death itself is open |
 | No Wi-Fi/Bluetooth applet or settings in Desktop Mode | The Frame image has no `plasma-nm`/`bluedevil` | `desktop-net/` builds and installs them |
-| Services enabled at runtime (e.g. the Wi-Fi watchdog timer) not started after a reboot | Our initramfs lacked Valve's `etc_overlay` hook, so systemd's `etc.mount` mounted the `/etc` overlay only after the unit graph was loaded | `s15_etc_overlay` initramfs hook mounts it before systemd starts |
+| Services enabled at runtime (e.g. the Wi-Fi watchdog timer) not started after a reboot | Our initramfs lacked Valve's `etc_overlay` hook, so systemd's `etc.mount` mounted the `/etc` overlay only after the unit graph was loaded | initramfs hook `sd-s15-etc-overlay` (earlier `s15_etc_overlay`) mounts it before systemd starts |
 | Awake for 7 hours in the bag after an EC dark wake | The dark-wake hook counted touchpad interrupts after the resume as "input" and stayed awake; then Steam blocked Plasma's idle timer | With the lid closed the hook always suspends again; `s15-input-wait` (real key presses) for the lid-open case; `s15-lid-watchdog` |
 | Shutdown menu on every wake by the power key | The PMIC power key delivers the waking press after resume; Plasma's power-button action is "show the logout screen" | `s15-power-key`: short press = sleep in Desktop Mode, waking press ignored; Plasma's action set to "do nothing" |
 | Wi-Fi not reconnecting after a wake until the applet was opened | iwd's own autoconnect scans fail after resume (`scan start failure`) and back off | `s15-wifi-resume` asks NetworkManager for a scan 5/15/30 s after a wake |

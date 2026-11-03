@@ -271,58 +271,16 @@ cat > "$R/etc/udev/rules.d/90-s15-media-mount.rules" <<'EOF'
 ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_BUS}=="usb", ENV{ID_FS_TYPE}=="ntfs|exfat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="s15-media-mount@%k.service"
 EOF
 
-say "initramfs for $KV (Qualcomm clock, PHY, PCIe/NVMe and USB storage drivers, btrfs)"
-mkdir -p "$R/etc/initcpio/install" "$R/etc/initcpio/hooks"
-# Boot drivers. With autodetect (HOOKS below) only drivers for hardware that is present go in: 74 modules,
-# 10 MB instead of 762 modules, 24 MB. Modules are stored uncompressed (MODULES_DECOMPRESS), so loading them
-# does not decompress xz in the kernel.
-cat > "$R/etc/initcpio/install/s15" <<'EOF'
-#!/bin/bash
-build() {
-  local d
-  for d in /drivers/clk/qcom/ /drivers/interconnect/ /drivers/phy/qualcomm/ /drivers/usb/dwc3/ /drivers/usb/host/ \
-           /drivers/usb/typec/ /drivers/pinctrl/qcom/ /drivers/soc/qcom/ /drivers/regulator/ /drivers/reset/ \
-           /drivers/gpio/ /drivers/i2c/busses/ /drivers/dma/qcom/ /drivers/mailbox/ /drivers/nvmem/ /drivers/pmdomain/ \
-           /drivers/power/sequencing/ /drivers/mfd/ /drivers/pci/ /drivers/iommu/; do
-    add_checked_modules "$d"
-  done
-  # Root on NVMe (btrfs comes from the filesystems hook); USB storage for booting from a stick.
-  add_module nvme
-  add_module phy-qcom-qmp-pcie
-  add_module pci-pwrctrl-pwrseq
-  add_module usb_storage
-  add_module uas
-  add_module sd_mod
-}
-help() { echo "Vivobook S15 (X1E) boot drivers"; }
-EOF
-# SteamOS keeps changes to /etc in an overlay whose upper dir lives in /var. Valve's etc_overlay hook mounts it in
-# the initramfs, but it also mounts a var-A/var-B partition that this single-partition install does not have. Without
-# the hook, systemd's etc.mount mounts the overlay only after the unit graph is loaded, so units enabled at runtime
-# (symlinks in the upper dir, e.g. s15-wifi-watchdog.timer) were silently not started at boot.
-cat > "$R/etc/initcpio/install/s15_etc_overlay" <<'EOF'
-#!/bin/bash
-build() { add_module overlay; add_runscript; }   # explicit: autodetect would drop overlay.ko
-help() { echo "Mount the /etc overlay (upper dir in /var/lib/overlays/etc on the root filesystem) before systemd starts"; }
-EOF
-cat > "$R/etc/initcpio/hooks/s15_etc_overlay" <<'EOF'
-#!/usr/bin/ash
-run_latehook() {
-    local R=/new_root O=/new_root/var/lib/overlays/etc
-    [ -d "$O/upper" ] || return 0
-    mkdir -p "$O/work"
-    mount -t overlay overlay -o "lowerdir=$R/etc,upperdir=$O/upper,workdir=$O/work" "$R/etc" ||
-        echo "s15_etc_overlay: mount failed, systemd's etc.mount will mount the overlay later"
-}
-EOF
-cat > "$R/etc/mkinitcpio-s15.conf" <<'EOF'
-MODULES=()
-BINARIES=()
-FILES=()
-HOOKS=(base udev autodetect modconf s15 block filesystems s15_etc_overlay)
-COMPRESSION="zstd"
-MODULES_DECOMPRESS="yes"
-EOF
+say "initramfs for $KV (systemd; boot drivers, DSPs and display, keyboard, TPM, LUKS, btrfs)"
+# docs/steamos.md#initramfs. The install hooks are files in steamos/initcpio/; the busybox variant's /etc overlay hook
+# (s15_etc_overlay) is replaced by sd-s15-etc-overlay.
+mkdir -p "$R/etc/initcpio/install"
+for h in s15 s15-dsp sd-s15-etc-overlay; do install -m0644 "$HERE/initcpio/$h" "$R/etc/initcpio/install/$h"; done
+rm -f "$R/etc/initcpio/install/s15_etc_overlay" "$R/etc/initcpio/hooks/s15_etc_overlay"
+install -m0644 "$HERE/mkinitcpio-s15.conf" "$R/etc/mkinitcpio-s15.conf"
+# Console font for a passphrase prompt on the 2880x1620 panel (the kernel's 8x16 font is tiny there). The keymap
+# stays as it is: KEYMAP= in /etc/vconsole.conf, e.g. de-latin1-nodeadkeys (default us).
+grep -qs '^FONT=' "$R/etc/vconsole.conf" || echo 'FONT=latarcyrheb-sun32' >> "$R/etc/vconsole.conf"
 # --make-rslave: without it the recursive unmount below propagates to the host (/ is a shared mount) and
 # takes /sys/fs/cgroup, /dev/pts, /dev/shm etc. with it, which breaks systemd until they are remounted.
 for m in proc sys dev run; do mountpoint -q "$R/$m" || { mount --rbind "/$m" "$R/$m"; mount --make-rslave "$R/$m"; }; done
@@ -335,7 +293,7 @@ chroot "$R" depmod "$KV"
 # (install.sh) builds this first image with all boot drivers instead. Later kernels (install-kernel.sh) use autodetect.
 C=/etc/mkinitcpio-s15.conf
 if [ "${INITRAMFS_ALL_DRIVERS:-0}" = 1 ]; then sed 's/ autodetect / /' "$R$C" > "$R/etc/mkinitcpio-s15-all.conf"; C=/etc/mkinitcpio-s15-all.conf; fi
-chroot "$R" mkinitcpio -c "$C" -k "$KV" -g "/boot/initramfs-s15.img" 2>&1 | grep -i -E "error|image generation" | head -12 || true
+chroot "$R" mkinitcpio -c "$C" -k "$KV" -g "/boot/initramfs-s15.img" 2>&1 | grep -i -E "error|s15-dsp|image generation" | head -12 || true
 rm -f "$R/etc/mkinitcpio-s15-all.conf"
 for m in run dev sys proc; do umount -R -l "$R/$m" || true; done
 # The Frame's deckard-uimage post hook wraps the image in a 64-byte U-Boot header and deletes the original.

@@ -1,0 +1,20 @@
+#!/bin/bash
+# mkinitcpio install hook: boot drivers. With autodetect only drivers for hardware that is present go in (about 75
+# modules instead of 760).
+build() {
+  local d
+  for d in /drivers/clk/qcom/ /drivers/interconnect/ /drivers/phy/qualcomm/ /drivers/usb/dwc3/ /drivers/usb/host/ \
+           /drivers/usb/typec/ /drivers/pinctrl/qcom/ /drivers/soc/qcom/ /drivers/regulator/ /drivers/reset/ \
+           /drivers/gpio/ /drivers/i2c/busses/ /drivers/dma/qcom/ /drivers/mailbox/ /drivers/nvmem/ /drivers/pmdomain/ \
+           /drivers/power/sequencing/ /drivers/mfd/ /drivers/pci/ /drivers/iommu/; do
+    add_checked_modules "$d"
+  done
+  # Root on NVMe (btrfs comes from the filesystems hook); USB storage for booting from a stick.
+  add_module nvme
+  add_module phy-qcom-qmp-pcie
+  add_module pci-pwrctrl-pwrseq
+  add_module usb_storage
+  add_module uas
+  add_module sd_mod
+}
+help() { echo "Vivobook S15 (X1E) boot drivers"; }

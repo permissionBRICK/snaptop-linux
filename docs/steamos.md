@@ -84,13 +84,43 @@ IR illuminator is a separate component.
 | Speaker UCM without the WSA macro compander | Short sounds started loud and faded ([games](games.md#audio-in-steams-menus)). |
 | Reboot to Windows (`steamos-s15-dualboot.sh`) | See [Switching between Windows and SteamOS](#switching-between-windows-and-steamos). |
 | USB NTFS/exFAT automount (`s15-media-mount`, udev rule on `ID_PATH=*usb*`, ntfs3 with `windows_names`) | Play from an existing Windows game drive. Match on `ID_PATH`: some USB-SATA bridges report `ID_BUS=ata`. |
-| mkinitcpio preset `/etc/mkinitcpio-s15.conf` with hook `s15` | Clock, PHY, PCIe/NVMe, USB storage drivers and btrfs in the initramfs. |
+| systemd initramfs `/etc/mkinitcpio-s15.conf` with hooks from `steamos/initcpio/` | See [Initramfs](#initramfs). |
 
-Initramfs gotchas on this image:
+## Initramfs
+
+`/etc/mkinitcpio-s15.conf` builds a systemd-based initramfs (`/boot/initramfs-s15.img`, copied to `S15BOOT`):
+
+| Hook / module | Why |
+|---|---|
+| `s15` | Clock, interconnect, PHY, PCIe/NVMe, USB and USB storage drivers for the root filesystem. |
+| `s15-dsp` | Starts the ADSP and CDSP with their firmware from the initramfs. The display driver waits for the USB-C/DisplayPort chain behind the ADSP (`pmic_glink`); without the DSPs it could only start after the root filesystem. |
+| `kms`, `keyboard`, `sd-vconsole`, `i2c_hid_of`, `hid_asus_ec` | Display, internal keyboard, console keymap and font (`/etc/vconsole.conf`) for a passphrase prompt. |
+| `tpm_qcom_crb`, `sd-encrypt` | Firmware TPM and LUKS, for an encrypted root ([tpm.md](tpm.md)); idle without `crypttab`/`rd.luks`. |
+| `sd-s15-etc-overlay` | Mounts SteamOS's `/etc` overlay before switch-root, so units enabled at runtime start at boot. |
+
+Why the DSPs start this early: the firmware's framebuffer (efifb) does not survive the kernel's cleanup of unused
+clocks and power domains (each one alone turns the panel black, and the eDP supply is cut ~30 s later), so the boot
+screen goes black after a few seconds. With the DSPs in the initramfs the real display driver takes over at ~3.4 s,
+before the root filesystem is mounted, and a prompt there is visible. `s15-dsp` takes the firmware names from the
+devicetree; if a file is missing it adds nothing (a DSP whose driver loads in the initramfs but whose firmware is
+not there would never start), and the DSPs start from the root filesystem as before.
+
+Boot (2026-11-03): display at 3.4 s, switch-root at 3.8 s, `graphical.target` at 6.6 s after the kernel started
+(15-16 s with the earlier busybox initramfs, which started the DSPs from the root filesystem); sound is ready at about
+10 s instead of 20 s. Two harmless messages: `failed to load gen70500_sqe.fw` (the GPU firmware is not in the
+initramfs; it loads from the root filesystem when the GPU is first used) and `32300000.remoteproc: timeout waiting
+for subsystem event response` (the CDSP does not answer the ADSP's start notification in the initramfs; the ADSP
+reports "up" 5 s later, everything works).
+
+Gotchas on this image:
 - `add_all_modules` takes one pattern per call; passing several silently adds nothing.
-- The Frame's `deckard-uimage` post hook wraps the image in a 64-byte U-Boot header and deletes the plain image.
-  The scripts strip the header again with `dd bs=64 skip=1`.
+- The Frame's `deckard-uimage` post hook wraps every image mkinitcpio builds in a 64-byte U-Boot header
+  (`/boot/initrd.uImage`) and deletes the plain image. The scripts strip the header again with `dd bs=64 skip=1`.
 - No `cpio` in the image; use `bsdtar`.
+- Do not test initramfs changes with a read-write root: a forced power-off of a hung boot once left a btrfs tree log
+  that the kernel could not replay (`tree-log.c` transaction abort, -22), so every later boot stopped before the root
+  was mounted (black screen, invisible emergency shell). `btrfs rescue zero-log` from a live system fixed it. Test
+  entries use `rootflags=...,notreelog` or a root that does not exist.
 
 ## Desktop Mode
 
@@ -157,11 +187,11 @@ measurements change and Windows asks for the recovery key.
 - Firmware entry **"SteamOS (S15)"** sits *behind* Windows Boot Manager in `BootOrder`. Power on: Windows. ESC at
   power-on: firmware menu, "SteamOS (S15)" starts SteamOS without a menu wait (hold Space for systemd-boot's menu:
   previous kernel, firmware setup). The reboot shortcuts use BootNext.
-- Boot time (2026-11-01, restart to the login screen): firmware 6.9 s, systemd-boot 0.7 s, kernel 4.9 s, userspace
-  10.2 s, so about 23 s; the desktop is ready ~3 s later. Most of the kernel phase is PCIe link-up and NVMe
-  initialisation. An earlier GRUB setup took about 7 s longer (3 s menu, slow reading of the 52 MB kernel).
+- Boot time (2026-11-03, `systemd-analyze`): firmware 7.0 s, systemd-boot 0.8 s, kernel 0.8 s, initramfs 3.0 s,
+  userspace 2.7 s, so about 14.5 s to the login screen (23 s on 2026-11-01 with the busybox initramfs). An earlier
+  GRUB setup took about 7 s longer (3 s menu, slow reading of the 52 MB kernel).
 - The initramfs written during the install carries all boot drivers; kernels installed later in SteamOS get one
-  with only the drivers for present hardware (mkinitcpio autodetect, about 75 modules).
+  with only the drivers for present hardware (mkinitcpio autodetect, about 200 modules, 30 MB).
 - EFI variables on X1E go through the TrustZone app `uefisecapp` (the S15 is on the kernel's allowlist). Linux
   registers them some seconds after boot, after systemd has mounted `efivarfs`; remount it before `efibootmgr`.
 

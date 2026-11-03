@@ -1,0 +1,27 @@
+#!/bin/bash
+# mkinitcpio install hook (systemd initramfs): mount SteamOS's /etc overlay on /sysroot/etc before switch-root.
+# SteamOS keeps changes to /etc in an overlay whose upper dir lives in /var. Valve's etc_overlay hook mounts it in the
+# initramfs, but it also mounts a var-A/var-B partition that this single-partition install does not have. Without the
+# overlay mounted before systemd starts, systemd's etc.mount mounts it only after the unit graph is loaded, so units
+# enabled at runtime (symlinks in the upper dir, e.g. s15-wifi-watchdog.timer) were silently not started at boot.
+build() {
+    add_module overlay   # explicit: autodetect would drop overlay.ko
+    add_binary mount
+    add_binary mkdir
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=Mount the SteamOS /etc overlay on /sysroot/etc' \
+        'DefaultDependencies=no' \
+        'Requires=sysroot.mount' \
+        'After=sysroot.mount' \
+        'Before=initrd-fs.target' \
+        'ConditionPathIsDirectory=/sysroot/var/lib/overlays/etc/upper' \
+        '[Service]' \
+        'Type=oneshot' \
+        'RemainAfterExit=yes' \
+        'ExecStart=/usr/bin/mkdir -p /sysroot/var/lib/overlays/etc/work' \
+        'ExecStart=/usr/bin/mount -t overlay overlay -o lowerdir=/sysroot/etc,upperdir=/sysroot/var/lib/overlays/etc/upper,workdir=/sysroot/var/lib/overlays/etc/work /sysroot/etc' \
+        | add_file - /usr/lib/systemd/system/s15-etc-overlay.service 0644
+    add_symlink /usr/lib/systemd/system/initrd-fs.target.wants/s15-etc-overlay.service ../s15-etc-overlay.service
+}
+help() { echo "systemd initramfs: mount the SteamOS /etc overlay before switch-root"; }
