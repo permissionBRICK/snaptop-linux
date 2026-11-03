@@ -1,3 +1,0 @@
-# Let the four dwc3 USB controllers and their xHCI hosts runtime-suspend when nothing is plugged in
-# (both levels are needed: the xHCI child keeps the controller active otherwise). Measured: about -0.3 W idle.
-ACTION=="add|bind", SUBSYSTEM=="platform", DRIVER=="dwc3-qcom|xhci-hcd", TEST=="power/control", ATTR{power/control}="auto"

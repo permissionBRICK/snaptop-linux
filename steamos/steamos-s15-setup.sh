@@ -198,7 +198,10 @@ printf '[Unit]\nDescription=Lid watchdog every minute\n[Timer]\nOnBootSec=2min\n
 install -d "$R/etc/systemd/system/timers.target.wants"
 ln -sfn /etc/systemd/system/s15-lid-watchdog.timer "$R/etc/systemd/system/timers.target.wants/s15-lid-watchdog.timer"
 install -D -m0755 "$HERE/../power/s15-sleep-hook" "$R/usr/lib/systemd/system-sleep/s15-sleep-hook"
-install -D -m0644 "$HERE/91-s15-usb-runtime-pm.rules" "$R/etc/udev/rules.d/91-s15-usb-runtime-pm.rules"
+# USB controllers: powered while awake (hot-plugging), runtime PM only around a suspend. Replaces the old udev rule
+# that kept them runtime-suspended all the time: a plugged-in device then never woke them.
+rm -f "$R/etc/udev/rules.d/91-s15-usb-runtime-pm.rules"
+install -D -m0755 "$HERE/s15-usb-sleep" "$R/usr/lib/systemd/system-sleep/s15-usb-sleep"
 install -D -m0644 "$HERE/92-s15-wakeup.rules" "$R/etc/udev/rules.d/92-s15-wakeup.rules"
 install -D -m0755 "$HERE/s15-lid-wake" "$R/usr/lib/systemd/system-sleep/s15-lid-wake"
 echo aoss_cxsd_only > "$R/etc/modules-load.d/s15-aoss-cxsd-only.conf"   # x1e-sleep: avoid AOSD (hourly resets)

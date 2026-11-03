@@ -1,0 +1,10 @@
+#!/bin/bash
+# systemd-sleep hook: the USB controllers stay powered while the laptop is awake, because on this laptop a
+# runtime-suspended controller does not wake up when a device is plugged in (hot-plugging would not work at all).
+# Before a suspend they switch to runtime PM, the state the standby measurements in docs/power.md were made in,
+# and back after resume. Install as /usr/lib/systemd/system-sleep/s15-usb-sleep.
+case "$1" in pre) v=auto ;; post) v=on ;; *) exit 0 ;; esac
+for f in /sys/bus/platform/drivers/dwc3-qcom/*/power/control /sys/bus/platform/drivers/xhci-hcd/*/power/control; do
+  [ -w "$f" ] && echo "$v" > "$f"
+done
+exit 0

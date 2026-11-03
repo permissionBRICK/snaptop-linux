@@ -42,15 +42,15 @@ Screen-off idle A/B (2026-11-01, 75-150 s per step):
 |---|---|
 | keyboard backlight level 1 → off | 4.08 → 3.25 W (**-0.8 W**) |
 | PCIe ASPM `default` → `powersupersave` | no change |
-| USB runtime PM on all four dwc3 controllers *and* their `xhci-hcd.N.auto` children | 3.42 → 3.10 W (-0.3 W); no shutdown here, unlike the upstream report |
+| USB runtime PM on all four dwc3 controllers *and* their `xhci-hcd.N.auto` children | 3.42 → 3.10 W (-0.3 W); no shutdown here, unlike the upstream report. **Not used while awake any more:** a runtime-suspended controller does not wake when a device is plugged in, so hot-plugging did not work. Now only around a suspend (`s15-usb-sleep`); getting the plug-in wakeup to work would bring the 0.3 W back. |
 
 Checked and fine: NVMe APST is on and the drive idles in PS4 (4 mW) with L1.2; USB4 and PCIe tunnel power
 domains are off; fans stop at idle. Still powered without a user: `gcc_ufs_phy_gdsc`/`gcc_ufs_mem_phy_gdsc` (no
 UFS on this laptop) and `gcc_usb30_tert_gdsc`, kept on by `pd_ignore_unused`.
 
 Open leads for the floor:
-- Runtime PM is off (`power/control = on`) on all four dwc3 USB controllers. Upstream measured 2.75 W → 2.5 W
-  screen-off with runtime PM on three of them; all four shut the machine down. Test one controller at a time.
+- USB runtime PM while awake (-0.3 W screen-off, see the table) needs a working wakeup on plug-in first; the dwc3
+  controllers report `wakeup=enabled`, the xHCI hosts `disabled`, and no plug event reaches a suspended controller.
 - Wi-Fi and NVMe have runtime PM off (NVMe relies on APST, `default_ps_max_latency_us` = 100000); check which
   APST state the drive reaches.
 - Keyboard backlight was at level 1 during the test.
