@@ -32,7 +32,8 @@ Windows owns this TPM's state. BitLocker and Windows Hello depend on it, and Lin
   runs with a measured UKI (`ConditionSecurity=measured-uki`), which this install does not use.
 
 Sealing data to the TPM (for example `systemd-cryptenroll --tpm2-device=auto`) only uses these keys as parents and
-stores the sealed blob outside the TPM; it changes nothing in the TPM.
+stores the sealed blob outside the TPM; it changes nothing in the TPM. systemd 257 seals under Windows' storage key
+at `0x81000001`; the disk encryption ([encryption.md](encryption.md)) works that way, verified unchanged TPM state.
 
 ## How it works
 

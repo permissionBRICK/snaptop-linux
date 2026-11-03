@@ -56,7 +56,10 @@ what you are about to do before anything that writes to disk, and report results
 
 ## Checking the installed system (in SteamOS, as root)
 
-- `uname -r` ends in `-s15+`; `cat /proc/cmdline` has `root=PARTLABEL=SNAPSTEAM-NVME`.
+- `uname -r` ends in `-s15+`; `cat /proc/cmdline` has `root=PARTLABEL=SNAPSTEAM-NVME`, or on an encrypted install
+  `root=/dev/mapper/root rd.luks.name=<UUID>=root` (docs/encryption.md; `journalctl -u s15-luks-reseal` shows the
+  TPM re-sealing). Never remove the passphrase key slot or the re-seal key; the TPM tokens are managed by
+  `s15-luks-reseal`.
 - Audio: `aplay -l` lists the X1E80100 card; Wi-Fi: `nmcli device wifi list`; GPU: `vulkaninfo --summary` (Turnip).
 - Standby: after one suspend, `cat /sys/kernel/debug/qcom_stats/cxsd` shows a rising count (needs debugfs);
   `/var/log/s15-sleep.log` logs every sleep with drain and residency.

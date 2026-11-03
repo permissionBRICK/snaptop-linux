@@ -6,7 +6,13 @@
 # Usage (root): install-esp.sh <SteamOS root> <S15BOOT partition device>
 set -euo pipefail
 R=$(realpath "${1:?SteamOS root}"); EP=$(readlink -f "${2:?S15BOOT partition}")
-ARGS="root=PARTLABEL=SNAPSTEAM-NVME rw rootfstype=btrfs rootflags=noatime,compress=zstd:1 qcom_hamoa_ec.allow_suspend=1"
+# An encrypted SteamOS partition (docs/encryption.md) is opened by the initramfs and mounted as /dev/mapper/root.
+ROOT="root=PARTLABEL=SNAPSTEAM-NVME"
+if [ "$(blkid -o value -s TYPE /dev/disk/by-partlabel/SNAPSTEAM-NVME 2>/dev/null)" = crypto_LUKS ]; then
+  U=$(cryptsetup luksUUID /dev/disk/by-partlabel/SNAPSTEAM-NVME)
+  ROOT="root=/dev/mapper/root rd.luks.name=$U=root rd.luks.options=$U=discard,tpm2-device=auto"
+fi
+ARGS="$ROOT rw rootfstype=btrfs rootflags=noatime,compress=zstd:1 qcom_hamoa_ec.allow_suspend=1"
 ARGS="$ARGS nvme.quirks=1344:5413:simple_suspend pcie_port_pm=force pcie_aspm.policy=powersupersave quiet loglevel=3"
 ARGS="$ARGS systemd.show_status=auto"
 KV=$(ls "$R/usr/lib/modules" | grep -- '-s15' | sort -V | tail -1)
@@ -16,6 +22,7 @@ cat > "$R/usr/local/sbin/s15-update-esp" <<'EOS'
 #!/bin/bash
 # Copy the S15 kernel, initramfs and DTB from /boot to the S15BOOT partition (keeps the previous set as *.old,
 # booted by the systemd-boot entry "SteamOS (S15) - previous kernel"; hold Space at power-on for the menu).
+# On an encrypted install it then re-seals the TPM unlock for the new files (s15-luks-reseal).
 set -euo pipefail
 KV=${1:-$(ls /usr/lib/modules | grep -- '-s15' | sort -V | tail -1)}
 M=$(mktemp -d); mount /dev/disk/by-partlabel/S15BOOT "$M"; trap 'umount "$M"; rmdir "$M"' EXIT
@@ -24,7 +31,9 @@ for f in vmlinuz initramfs-s15.img x1e80100-asus-vivobook-s15-ec.dtb; do [ -f "$
 cp -f /boot/vmlinuz-$KV "$T/vmlinuz"
 cp -f /boot/initramfs-s15.img "$T/initramfs-s15.img"
 cp -f /boot/x1e80100-asus-vivobook-s15-ec.dtb "$T/x1e80100-asus-vivobook-s15-ec.dtb"
-sync; echo "S15BOOT updated ($KV)"
+sync; umount "$M"; rmdir "$M"; trap - EXIT
+echo "S15BOOT updated ($KV)"
+if [ -f /var/lib/s15-luks/reseal.key ]; then /usr/local/sbin/s15-luks-reseal; fi
 EOS
 chmod 0755 "$R/usr/local/sbin/s15-update-esp"
 

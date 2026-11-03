@@ -203,6 +203,12 @@ install -D -m0755 "$HERE/../power/s15-sleep-hook" "$R/usr/lib/systemd/system-sle
 rm -f "$R/etc/udev/rules.d/91-s15-usb-runtime-pm.rules"
 install -D -m0755 "$HERE/s15-usb-sleep" "$R/usr/lib/systemd/system-sleep/s15-usb-sleep"
 install -D -m0644 "$HERE/92-s15-wakeup.rules" "$R/etc/udev/rules.d/92-s15-wakeup.rules"
+# Encrypted root (docs/encryption.md): keep the TPM unlock matching the boot entries, at every boot and after
+# s15-update-esp. The service does nothing until the partition is encrypted (no /var/lib/s15-luks/reseal.key).
+install -D -m0755 "$HERE/s15-luks-reseal" "$R/usr/local/sbin/s15-luks-reseal"
+install -D -m0644 "$HERE/s15-luks-reseal.service" "$R/etc/systemd/system/s15-luks-reseal.service"
+install -d "$R/etc/systemd/system/multi-user.target.wants"
+ln -sfn /etc/systemd/system/s15-luks-reseal.service "$R/etc/systemd/system/multi-user.target.wants/s15-luks-reseal.service"
 install -D -m0755 "$HERE/s15-lid-wake" "$R/usr/lib/systemd/system-sleep/s15-lid-wake"
 echo aoss_cxsd_only > "$R/etc/modules-load.d/s15-aoss-cxsd-only.conf"   # x1e-sleep: avoid AOSD (hourly resets)
 install -d -o 1000 -g 1000 "$R/home/steamos/.config"

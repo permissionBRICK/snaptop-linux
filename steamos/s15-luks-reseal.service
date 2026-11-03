@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep the TPM unlock of the encrypted SteamOS partition matching the boot entries
+Documentation=file:///usr/local/sbin/s15-luks-reseal
+ConditionPathExists=/var/lib/s15-luks/reseal.key
+After=local-fs.target tpm2.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s15-luks-reseal
+
+[Install]
+WantedBy=multi-user.target

@@ -12,7 +12,8 @@ FEX for Windows games, a Plasma desktop and a Steam Deck-style Game Mode:
 - speakers and microphones, both cameras, keyboard with backlight and RGB colour, touchpad, Fn keys
 - Wi-Fi and Bluetooth (with tray applets in Desktop Mode), USB-A, the right USB-C port with docks
 - dual boot next to BitLocker-protected Windows, one-click reboot in both directions
-- the firmware TPM 2.0 (own driver, [docs/tpm.md](docs/tpm.md))
+- the firmware TPM 2.0 (own driver, [docs/tpm.md](docs/tpm.md)); optional disk encryption that the TPM unlocks
+  like BitLocker, re-sealed automatically after kernel updates ([docs/encryption.md](docs/encryption.md))
 - old 32-bit DirectX 9 games (FlatOut 2 tested) running smoothly under Proton ARM64
 
 Not yet: NPU, USB4/Thunderbolt, USB devices on the left USB-C port, light sensor; Secure Boot must be off.
@@ -49,6 +50,8 @@ about 1-1.5 hours, mostly unattended.
    SteamOS desktop. In Windows, `windows\Install-RebootShortcut.ps1` (elevated) adds a "Reboot to SteamOS" icon.
    When you are done with BIOS changes: `Resume-BitLocker -MountPoint C:`.
 
+Optional: encrypt the SteamOS partition with TPM unlock from the live system ([docs/encryption.md](docs/encryption.md)).
+
 Optional: `games/` adds Windows games to Steam with Proton ARM64 and the fixes old games need ([docs/games.md](docs/games.md)).
 
 ### Or let an AI agent do it
@@ -71,6 +74,8 @@ cd snaptop-linux && claude "Read AGENTS.md and install SteamOS on this laptop."
 | [docs/kernel.md](docs/kernel.md) | Kernel sources, patches, config, boot parameters |
 | [docs/firmware.md](docs/firmware.md) | Which firmware Linux needs and where it comes from |
 | [docs/power.md](docs/power.md) | Idle and standby power, the standby setup, measuring |
+| [docs/tpm.md](docs/tpm.md) | The firmware TPM: driver, what Linux must not change |
+| [docs/encryption.md](docs/encryption.md) | LUKS2 encryption with TPM unlock (PCR 4+9), passphrase fallback, automatic re-sealing |
 | [docs/games.md](docs/games.md) | Windows games: Proton ARM64, FEX, DSOAL, native d3dx9 |
 | [docs/known-issues.md](docs/known-issues.md) | Open problems and resolved ones |
 
