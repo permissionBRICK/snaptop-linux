@@ -160,12 +160,13 @@ step_finish() {
   [ -n "${S15_TEST_DEV:-}" ] && { cryptsetup close $NAME; progress "DONE (test)"; return; }
   echo "== boot entries on S15BOOT"
   b=$D/esp; mkdir -p "$b"; mountpoint -q "$b" || mount /dev/disk/by-partlabel/S15BOOT "$b"
-  local opt="root=/dev/mapper/root rd.luks.name=$uuid=root rd.luks.options=$uuid=discard,tpm2-device=auto"
+  local opt="root=/dev/mapper/root rd.luks.name=$uuid=root rd.luks.options=$uuid=discard,tpm2-device=auto,tpm2-measure-pcr=yes"
   for e in s15 s15-previous; do
     f=$b/loader/entries/$e.conf
     [ -f "$f" ] || continue
     [ -f "$f.pre-luks" ] || cp "$f" "$f.pre-luks"
     sed -i "s#root=PARTLABEL=SNAPSTEAM-NVME#$opt#" "$f"
+    grep -q '^options.* systemd.gpt_auto=0' "$f" || sed -i 's/^options .*/& systemd.gpt_auto=0/' "$f"
     grep -q "rd.luks.name=$uuid" "$f" || die "$f not updated"
   done
   # The previous entry had the busybox initramfs, which cannot open LUKS: give it the current (systemd) one.

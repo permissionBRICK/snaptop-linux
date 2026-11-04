@@ -6,24 +6,63 @@ fallback. After kernel and initramfs updates the TPM unlock is re-sealed automat
 
 ## What it protects and what not
 
-The TPM releases the key only if PCR 4 and PCR 9 have the expected values:
+The TPM releases the key only if PCR 0, 2, 4, 9 and 15 have the values of one of the SteamOS boot entries on
+`S15BOOT`:
 
-| PCR | Measured by | Contents |
-|---|---|---|
-| 4 | firmware | firmware applications run before the boot option (here `QcomChargerApp`), the separator, then the Authenticode hashes of systemd-boot and of the kernel |
-| 9 | kernel EFI stub | the kernel command line (`LOADED_IMAGE::LoadOptions`, UTF-16LE), then the initrd |
+| PCR | Measured by | Contents | Changes when |
+|---|---|---|---|
+| 0 | firmware | the firmware's own code (version, configuration) | a BIOS update |
+| 2 | firmware, systemd-boot | firmware drivers before the boot loader; after it, EFI drivers that systemd-boot loads (`\EFI\systemd\drivers`) | an extra EFI driver is loaded |
+| 4 | firmware | boot applications: `QcomChargerApp`, the separator, then the Authenticode hashes of systemd-boot and of the kernel | another boot loader or kernel |
+| 9 | kernel EFI stub | the kernel command line (`LOADED_IMAGE::LoadOptions`, UTF-16LE, it names the initrd), then the initrd | an edited command line, another initrd |
+| 15 | systemd-cryptsetup | zero until a LUKS volume is opened; then its volume key (`tpm2-measure-pcr=yes`) | every boot, right after the unlock |
 
-So a changed boot loader, kernel, initramfs or kernel command line on the unencrypted `S15BOOT` gets the
-passphrase prompt instead of the key. Not part of the binding:
+So everything that runs before the root file system with the released key is measured: firmware, boot loader,
+kernel, its command line and initramfs. Escaping into the boot menu, a changed command line (`init=/bin/sh`,
+`rd.break`, `systemd.unit=emergency.target`; the menu's editor is off, so this means a boot entry changed on
+`S15BOOT`), another kernel or initrd, an EFI shell or a live USB system all work, but each ends at the passphrase
+prompt instead of an unlocked disk. Only the normal boot path, which ends at the
+login screen ([login.md](login.md)), unlocks with the TPM. Without a login password that protection is moot: the
+normal path then logs in automatically.
+
+Closed on top of the PCR binding:
+
+- **A fake root file system.** An attacker could add a partition with the same LUKS UUID that opens without a
+  passphrase; the initramfs would then boot the attacker's system on the unchanged boot path, and that system could
+  ask the TPM for the real key. PCR 15 prevents it: opening any volume measures its key into PCR 15, after which the
+  TPM refuses the token. The real volume is opened first and only once per boot.
+- **systemd's GPT auto-discovery** (`systemd.gpt_auto=0` on the command line): it would mount partitions by type
+  from the disk without asking the boot entry.
+- **Two unmeasured inputs of the kernel** (an initrd named by the devicetree, the `SystemdOptions` EFI variable):
+  closed by kernel patches 0012 and 0013 ([kernel.md](kernel.md#our-patches-boot-fixes-for-the-tpm-unlock)). A
+  kernel without them is not sealed.
+
+Not part of the binding:
 
 - **PCR 7 (Secure Boot state):** Windows updates the Secure Boot revocation list (dbx) now and then, which changes
   PCR 7; Linux would then ask for the passphrase after Windows updates. Secure Boot is off on this install anyway.
-- **PCR 0/2 (firmware code):** BIOS updates would need the passphrase every time.
-- **The devicetree** (`x1e80100-asus-vivobook-s15-ec.dtb` on `S15BOOT`): systemd-boot does not measure it into
-  PCR 4 or 9.
+- **PCR 1, 3, 5, 6** (firmware settings, boot order, GPT): they change with BIOS settings, boot order changes by
+  Windows, or the partition table, and none of them changes what runs on the measured path.
+- **The devicetree** (`x1e80100-asus-vivobook-s15-ec.dtb` on `S15BOOT`): systemd-boot does not measure it. It only
+  describes the hardware; patch 0012 keeps it from naming an initrd. Someone could still describe the hardware
+  wrongly in it, e.g. to keep a device from working, but not run their own code with the key.
 
-This protects the data on a lost or stolen laptop against reading the SSD elsewhere and against a modified boot
-chain. It does not protect against someone who can change the firmware.
+Limits:
+
+- **Without Secure Boot nothing checks what the firmware starts before the passphrase is typed.** Someone with the
+  laptop in their hands could put a lookalike prompt on `S15BOOT` that records the passphrase, then come back for
+  the laptop. The TPM would not unlock on that path, but a typed passphrase is enough. If a passphrase prompt
+  appears without a reason (no BIOS update, no kernel change), boot Windows or a known live system and check
+  `S15BOOT` before typing it.
+- **Physical attacks on the running laptop** (memory or bus probing) and attacks on the firmware TPM itself are out
+  of scope, as for BitLocker without a PIN.
+- **The measurements come from the firmware itself.** A firmware that measured something other than what it runs
+  would get the key. Replacing it needs a firmware that the SoC accepts (Snapdragon SoCs check the boot firmware's
+  signature before it runs; not verified on this unit), and a different signed BIOS changes PCR 0 and gets the
+  passphrase prompt.
+
+This protects the data on a lost or stolen laptop against reading the SSD elsewhere and against booting it on another
+path.
 
 ## Layout
 
@@ -32,11 +71,12 @@ chain. It does not protect against someone who can change the firmware.
 - Key slots: the passphrase (argon2id, about 2 s), the re-seal key (`/var/lib/s15-luks/reseal.key`, 64 random
   bytes, root only, inside the encrypted file system; slot priority "prefer", so unlocking with it does not first run
   the passphrase slot's argon2id), one systemd-tpm2 token per boot entry and firmware variant.
-- When testing which slot a key opens, add `--disable-external-tokens`: cryptsetup otherwise tries the TPM tokens
-  first and reports the slot of a token that matches the running boot.
-- Boot entries (`S15BOOT/loader/entries/s15*.conf`):
-  `root=/dev/mapper/root rd.luks.name=<UUID>=root rd.luks.options=<UUID>=discard,tpm2-device=auto`.
-  `install-esp.sh` writes these options itself when the partition is LUKS. The old GRUB entry cannot open it.
+- When testing which slot a key opens, add `--disable-external-tokens`, so that cryptsetup does not try the TPM
+  tokens first.
+- Boot entries (`S15BOOT/loader/entries/s15*.conf`): `root=/dev/mapper/root rd.luks.name=<UUID>=root
+  rd.luks.options=<UUID>=discard,tpm2-device=auto,tpm2-measure-pcr=yes systemd.gpt_auto=0`. `install-esp.sh` and
+  `luks-encrypt.sh finish` write these options when the partition is LUKS; `login-lock.sh enable` adds the last two
+  to the entries of an install encrypted before 2026-11-04. The old GRUB entry cannot open the partition.
 - The initramfs ([steamos.md](steamos.md#initramfs)) has `sd-encrypt`, the TPM driver, keyboard, console keymap
   and font, and the display (the DSPs start in the initramfs), so the prompt is visible and typed with the right layout.
 
@@ -70,20 +110,29 @@ From a live ARM64 system (docs/live-system.md), SteamOS not running, about 50 mi
 
 Runs at every boot (`s15-luks-reseal.service`, in the background at low priority, so the desktop does not wait for
 it) and after every `s15-update-esp` (so after `install-kernel.sh`).
-For every boot entry that opens this partition and every firmware variant seen at boot within 180 days, it
-predicts PCR 4 and 9 from the files on `S15BOOT`, computes the policy digest of each prediction (`TPM2_PolicyPCR`,
-the token's `tpm2-policy-hash`), enrolls the missing ones (`systemd-cryptenroll --tpm2-pcrs=4:sha256=...+9:sha256=...`,
-unlocked with the re-seal key) and removes tokens that no entry produces any more. It always keeps a token for the
-PCR values of the running boot: after a boot that needed the passphrase (BIOS update, an unknown boot path) the
-next boot unlocks with the TPM again. Log: `journalctl -u s15-luks-reseal`; preview: `s15-luks-reseal --dry-run`.
+For every boot entry that opens this partition and every known firmware variant of the installed BIOS, it predicts
+PCR 0, 2, 4 and 9 from the files on `S15BOOT` (PCR 15 is always zero), computes the policy digest of each
+prediction (`TPM2_PolicyPCR`, the token's `tpm2-policy-hash`), enrolls the missing ones
+(`systemd-cryptenroll --tpm2-pcrs=0:sha256=...+2:...+4:...+9:...+15:...`, unlocked with the re-seal key) and
+removes tokens that no entry produces any more. Log: `journalctl -u s15-luks-reseal`; preview:
+`s15-luks-reseal --dry-run`.
 
-- "Firmware variants" are the PCR 4 events before the separator (`/var/lib/s15-luks/firmware-variants.json`). A
-  new one (other charger state, the ESC boot menu, a BIOS update) costs one passphrase prompt; from then on it is
-  known. Only one has been seen so far.
+- Only boot entries are sealed, never the running boot as such: a boot on another path (an edited command line, a
+  debug option, an extra EFI driver) must keep asking for the passphrase. The tool only reports whether the running
+  boot matches an entry.
+- An entry is skipped (it asks for the passphrase) if its kernel lacks patch 0012 or 0013, or its command line lacks
+  `tpm2-measure-pcr=yes`. If no entry can be sealed, nothing is changed.
+- "Firmware variants" are the PCR 0, 2 and 4 events up to the separator (`/var/lib/s15-luks/firmware-variants.json`).
+  The variant of every boot is recorded, so a new one (a BIOS update, other charger state, the ESC boot menu)
+  costs one passphrase prompt and is known from then on. Variants unused for 180 days are dropped, and so are all
+  variants of another BIOS (other PCR 0): after a BIOS update, going back to the previous BIOS needs the passphrase.
 - The two systemd-boot entries need separate tokens even with identical files: the kernel command line names the
   initrd (`initrd=\EFI\S15\initramfs-s15.img.old`), which changes PCR 9.
-- Tested 2026-11-03: prediction = event log = TPM for the current entry; a token enrolled from the prediction alone
-  unlocked the "previous kernel" entry, which had not been booted since the encryption.
+- After the unlock PCR 15 holds the volume key's measurement, so a running system cannot test a token; the tool
+  only checks that the token it enrolled has the predicted policy. Before changing anything it checks that PCR 0
+  and 2 in the TPM equal their event log up to the separator, the basis of every prediction.
+- Tested 2026-11-03 (PCR 4+9): prediction = event log = TPM for the current entry; a token enrolled from the
+  prediction alone unlocked the "previous kernel" entry, which had not been booted since the encryption.
 
 ## TPM state
 
@@ -95,9 +144,11 @@ fails safely and the boot asks for the passphrase; `s15-luks-reseal` then seals 
 
 ## Recovery
 
-- **Passphrase prompt at boot:** something measured changed (see above). Type the passphrase; the TPM is re-sealed
-  during that boot. The display driver is only started for the prompt, and its takeover from the firmware failed in
-  a third of the boots where it started that early ([known-issues.md](known-issues.md), "Display takeover"). The
+- **Passphrase prompt at boot:** something measured changed (see above). Type the passphrase. After a BIOS update
+  or a new firmware variant the next boot unlocks with the TPM again; a boot path that is not one of the entries
+  keeps asking. Check `S15BOOT` first if there is no reason for the prompt ("Limits" above). The display driver
+  is only started for the prompt, and its takeover from the firmware failed in a third of the boots where it started
+  that early ([known-issues.md](known-issues.md), "Display takeover"). The
   **Caps Lock light blinks while the passphrase is requested**; the prompt does not wait for the display, so when it
   blinks, type the passphrase and press Enter even if the screen stays black or plain blue.
 - **From a live system** (e.g. a btrfs problem):

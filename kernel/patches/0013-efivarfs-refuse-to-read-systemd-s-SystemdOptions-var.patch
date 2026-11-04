@@ -1,0 +1,77 @@
+From 01598f9dc95fd82ef16640a089b6fb85ade3e2d3 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 10:39:01 +0000
+Subject: [PATCH 13/13] efivarfs: refuse to read systemd's SystemdOptions
+ variable
+
+Unless Secure Boot is on, systemd reads the "SystemdOptions" EFI variable
+(vendor GUID 8cf2644b-4b0b-428f-9387-6d876050dc67) and treats its contents
+as additional kernel command line options, in the initrd and in the
+system. Nothing measures the variable.
+
+On a machine whose TPM releases a disk key only for the measured boot
+path, the kernel command line is part of the measurement (PCR 9), but this
+variable is not: anyone who can write EFI variables, for example from a
+boot from other media, could add "systemd.debug_shell" or similar and get
+a root shell on the unlocked system with all PCRs unchanged.
+
+Return -EPERM when the variable is read through efivarfs. systemd then
+treats it as absent. Deleting it still works.
+
+Signed-off-by: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+---
+ fs/efivarfs/file.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/fs/efivarfs/file.c b/fs/efivarfs/file.c
+index cb1b6d0c3..5264d5f3a 100644
+--- a/fs/efivarfs/file.c
++++ b/fs/efivarfs/file.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/efi.h>
++#include <linux/ucs2_string.h>
+ #include <linux/delay.h>
+ #include <linux/fs.h>
+ #include <linux/slab.h>
+@@ -76,6 +77,26 @@ static ssize_t efivarfs_file_write(struct file *file,
+ 	return bytes;
+ }
+ 
++/*
++ * systemd appends the contents of its "SystemdOptions" variable to the kernel
++ * command line it acts on, unless Secure Boot is on. Nothing measures that
++ * variable. On a machine whose TPM releases a disk key for the measured boot
++ * path, anyone who can write EFI variables (a boot from other media) could
++ * use it to change how the unlocked system starts, for example with a root
++ * shell, while all PCRs stay the same. Refuse to read it; it can still be
++ * deleted.
++ */
++static bool efivarfs_is_systemd_options(struct efivar_entry *var)
++{
++	static const efi_guid_t systemd_guid =
++		EFI_GUID(0x8cf2644b, 0x4b0b, 0x428f,
++			 0x93, 0x87, 0x6d, 0x87, 0x60, 0x50, 0xdc, 0x67);
++	static const efi_char16_t name[] = L"SystemdOptions";
++
++	return efi_guidcmp(var->var.VendorGuid, systemd_guid) == 0 &&
++	       ucs2_strncmp(var->var.VariableName, name, ARRAY_SIZE(name)) == 0;
++}
++
+ static ssize_t efivarfs_file_read(struct file *file, char __user *userbuf,
+ 		size_t count, loff_t *ppos)
+ {
+@@ -86,6 +107,9 @@ static ssize_t efivarfs_file_read(struct file *file, char __user *userbuf,
+ 	ssize_t size = 0;
+ 	int err;
+ 
++	if (efivarfs_is_systemd_options(var))
++		return -EPERM;
++
+ 	while (!__ratelimit(&file->f_cred->user->ratelimit))
+ 		msleep(50);
+ 
+-- 
+2.43.0
+

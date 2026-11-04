@@ -1,0 +1,55 @@
+From 062cb3811edce89ac3e08eedfc521822831b1153 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 10:38:46 +0000
+Subject: [PATCH 12/13] efi/libstub: ignore an initrd named by the devicetree
+
+On arm64 the kernel takes the initrd from the devicetree's /chosen node
+(linux,initrd-start/end) when it is there, and only falls back to the
+initrd the EFI stub loaded (LINUX_EFI_INITRD_MEDIA_GUID) while
+phys_initrd_size is still 0.
+
+The stub measures its initrd into PCR 9, but the devicetree that the
+boot loader installs is not measured. On a machine whose TPM releases a
+disk key only for the measured boot path (kernel, command line and initrd
+in PCR 4 and 9), a changed devicetree file could name an initrd of its
+own, staged somewhere in memory, and run it with all PCRs unchanged.
+
+Delete these two properties from the devicetree the stub passes on, so
+the only initrd that can run is the measured one.
+
+Signed-off-by: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+---
+ drivers/firmware/efi/libstub/fdt.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/drivers/firmware/efi/libstub/fdt.c b/drivers/firmware/efi/libstub/fdt.c
+index 23b3543d3..a729d90ba 100644
+--- a/drivers/firmware/efi/libstub/fdt.c
++++ b/drivers/firmware/efi/libstub/fdt.c
+@@ -92,6 +92,23 @@ static efi_status_t update_fdt(void *orig_fdt, unsigned long orig_fdt_size,
+ 			goto fdt_set_fail;
+ 	}
+ 
++	/*
++	 * The stub hands the kernel its initrd itself (LINUX_EFI_INITRD_MEDIA_GUID)
++	 * and measures it into PCR 9 together with the command line. An initrd
++	 * named by the devicetree takes precedence over that one, because
++	 * efi_config_parse_tables() only uses the stub's initrd while
++	 * phys_initrd_size is still 0. The devicetree itself is not measured, so
++	 * on a machine whose TPM releases a disk key for the measured boot path a
++	 * changed devicetree could run an initrd of its own choosing with the PCRs
++	 * unchanged. Drop such an initrd.
++	 */
++	if (fdt_getprop(fdt, node, "linux,initrd-start", NULL) ||
++	    fdt_getprop(fdt, node, "linux,initrd-end", NULL)) {
++		efi_warn("Ignoring the initrd named by the devicetree\n");
++		fdt_delprop(fdt, node, "linux,initrd-start");
++		fdt_delprop(fdt, node, "linux,initrd-end");
++	}
++
+ 	/* Add FDT entries for EFI runtime services in chosen node. */
+ 	node = fdt_subnode_offset(fdt, 0, "chosen");
+ 	fdt_val64 = cpu_to_fdt64((u64)(unsigned long)efi_system_table);
+-- 
+2.43.0
+

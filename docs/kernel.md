@@ -35,8 +35,8 @@ Install a new payload in SteamOS: `sudo steamos/install-kernel.sh <payload>` (ke
      notification (`allow_suspend`)
    - `ps883x` USB-C retimer DP pin F fix
    - reverts of the LPASS macro PM-clock conversion (audio)
-3. **Our patches** in `kernel/patches/`, among them 8 bpc on the panel (`0001`, below) and the firmware TPM driver
-   (`0011`, [tpm](tpm.md)).
+3. **Our patches** in `kernel/patches/`, among them 8 bpc on the panel (`0001`, below), the firmware TPM driver
+   (`0011`, [tpm](tpm.md)) and two boot fixes for the TPM unlock (`0012`, `0013`, below).
 4. **DT overlay** from the same community repo (`overlay/build-overlay.sh --dtbo-only`): audio (WSA8845 speakers,
    SoundWire, mics), RGB and IR cameras, and optionally the EC node. `build.sh` merges it into the mainline DTB
    with `fdtoverlay`, and also sets `rotation = <180>` on the HM1092 node (`camera@24`), which the overlay misses.
@@ -56,6 +56,22 @@ if (!data_rate_khz)
 
 Check: `cat /sys/kernel/debug/dri/0/eDP-1/dp_debug` shows `bpp = 24`. A proper upstream fix would compute the
 bpp after link training; this patch is the minimal workaround.
+
+## Our patches: boot fixes for the TPM unlock
+
+The TPM unlocks the encrypted SteamOS partition only for the measured boot path ([encryption](encryption.md)). Two
+things in a stock kernel would let someone change the boot without changing a measurement:
+
+- `0012` (EFI stub): the stub measures the initrd it loads into PCR 9, but if the devicetree already names an initrd
+  (`linux,initrd-start`/`-end` in `/chosen`), the kernel uses that one. The devicetree on `S15BOOT` is not
+  measured, so an initrd added through it would run with the TPM-released key. The stub now deletes both properties
+  and logs `Ignoring the initrd named by the devicetree`.
+- `0013` (efivarfs): systemd reads the EFI variable `SystemdOptions` as extra kernel command line options when
+  Secure Boot is off (it is off on this install). Anyone at the boot menu's shell, or with any OS, can set EFI
+  variables, and the variable is not measured. Reading it now fails with `EPERM`, so systemd ignores it.
+
+`s15-luks-reseal` and `steamos/login-lock.sh` look for both (the stub's message in the kernel image, the variable
+name in the efivarfs module) and do not seal a kernel without them.
 
 ## Config: how it was made and what we learned
 

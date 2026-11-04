@@ -6,16 +6,18 @@
 # Usage (root): install-esp.sh <SteamOS root> <S15BOOT partition device>
 set -euo pipefail
 R=$(realpath "${1:?SteamOS root}"); EP=$(readlink -f "${2:?S15BOOT partition}")
-# An encrypted SteamOS partition (docs/encryption.md) is opened by the initramfs and mounted as /dev/mapper/root.
+# An encrypted SteamOS partition (docs/encryption.md) is opened by the initramfs and mounted as /dev/mapper/root;
+# tpm2-measure-pcr=yes measures the volume key into PCR 15 right after, so the TPM key is released once per boot.
 ROOT="root=PARTLABEL=SNAPSTEAM-NVME"
 if [ "$(blkid -o value -s TYPE /dev/disk/by-partlabel/SNAPSTEAM-NVME 2>/dev/null)" = crypto_LUKS ]; then
   U=$(cryptsetup luksUUID /dev/disk/by-partlabel/SNAPSTEAM-NVME)
-  ROOT="root=/dev/mapper/root rd.luks.name=$U=root rd.luks.options=$U=discard,tpm2-device=auto"
+  ROOT="root=/dev/mapper/root rd.luks.name=$U=root rd.luks.options=$U=discard,tpm2-device=auto,tpm2-measure-pcr=yes"
 fi
 ARGS="$ROOT rw rootfstype=btrfs rootflags=noatime,compress=zstd:1 qcom_hamoa_ec.allow_suspend=1"
 ARGS="$ARGS nvme.quirks=1344:5413:simple_suspend pcie_port_pm=force pcie_aspm.policy=powersupersave quiet loglevel=3"
-ARGS="$ARGS systemd.show_status=auto"
-KV=$(ls "$R/usr/lib/modules" | grep -- '-s15' | sort -V | tail -1)
+# systemd.gpt_auto=0: no partitions are mounted or used as swap just because of their GPT type (docs/encryption.md).
+ARGS="$ARGS systemd.show_status=auto systemd.gpt_auto=0"
+KV=$(ls "$R/usr/lib/modules" | grep -E -- '-s15\+?$' | sort -V | tail -1)
 [ -f "$R/boot/vmlinuz-$KV" ] && [ -f "$R/boot/initramfs-s15.img" ] || { echo "kernel/initramfs missing in $R/boot (steamos-s15-setup.sh)"; exit 1; }
 
 cat > "$R/usr/local/sbin/s15-update-esp" <<'EOS'
@@ -24,7 +26,7 @@ cat > "$R/usr/local/sbin/s15-update-esp" <<'EOS'
 # booted by the systemd-boot entry "SteamOS (S15) - previous kernel"; hold Space at power-on for the menu).
 # On an encrypted install it then re-seals the TPM unlock for the new files (s15-luks-reseal).
 set -euo pipefail
-KV=${1:-$(ls /usr/lib/modules | grep -- '-s15' | sort -V | tail -1)}
+KV=${1:-$(ls /usr/lib/modules | grep -E -- '-s15\+?$' | sort -V | tail -1)}
 M=$(mktemp -d); mount /dev/disk/by-partlabel/S15BOOT "$M"; trap 'umount "$M"; rmdir "$M"' EXIT
 T=$M/EFI/S15; mkdir -p "$T"
 for f in vmlinuz initramfs-s15.img x1e80100-asus-vivobook-s15-ec.dtb; do [ -f "$T/$f" ] && cp -f "$T/$f" "$T/$f.old"; done

@@ -1,5 +1,6 @@
 #!/bin/bash
-# mkinitcpio install hook (systemd initramfs): mount SteamOS's /etc overlay on /sysroot/etc before switch-root.
+# mkinitcpio install hook (systemd initramfs): mount SteamOS's /etc overlay on /sysroot/etc before switch-root, and make
+# systemd-cryptsetup measure the volume key into PCR 15 (below).
 # SteamOS keeps changes to /etc in an overlay whose upper dir lives in /var. Valve's etc_overlay hook mounts it in the
 # initramfs, but it also mounts a var-A/var-B partition that this single-partition install does not have. Without the
 # overlay mounted before systemd starts, systemd's etc.mount mounts it only after the unit graph is loaded, so units
@@ -23,5 +24,12 @@ build() {
         'ExecStart=/usr/bin/mount -t overlay overlay -o lowerdir=/sysroot/etc,upperdir=/sysroot/var/lib/overlays/etc/upper,workdir=/sysroot/var/lib/overlays/etc/work /sysroot/etc' \
         | add_file - /usr/lib/systemd/system/s15-etc-overlay.service 0644
     add_symlink /usr/lib/systemd/system/initrd-fs.target.wants/s15-etc-overlay.service ../s15-etc-overlay.service
+    # tpm2-measure-pcr=yes (docs/encryption.md): systemd-cryptsetup measures the volume key into PCR 15 only when the
+    # kernel came as a UKI through systemd-stub (efi_measured_uki: EFI variable StubPcrKernelImage). This install boots
+    # the kernel's own EFI stub from systemd-boot, so without the override the measurement is skipped silently and the
+    # TPM would release the key a second time in the same boot. The variable only affects this service; the other
+    # measuring units are conditioned in PID 1 (ConditionSecurity=measured-uki) and stay off.
+    printf '%s\n' '[Service]' 'Environment=SYSTEMD_FORCE_MEASURE=1' \
+        | add_file - /etc/systemd/system/systemd-cryptsetup@.service.d/s15-measure.conf 0644
 }
-help() { echo "systemd initramfs: mount the SteamOS /etc overlay before switch-root"; }
+help() { echo "systemd initramfs: mount the SteamOS /etc overlay before switch-root; measure the volume key"; }

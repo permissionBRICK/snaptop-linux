@@ -1,26 +1,41 @@
 #!/usr/bin/env python3
 """Keep the TPM unlock of the encrypted SteamOS partition working across kernel and initramfs updates.
 
-The root partition (LUKS2) has TPM2 tokens (systemd-cryptenroll) bound to PCR 4 and PCR 9 (docs/encryption.md):
+The root partition (LUKS2) has TPM2 tokens (systemd-cryptenroll) bound to PCR 0, 2, 4, 9 and 15 (docs/encryption.md):
+  PCR 0  the firmware's own code, as the firmware measures it up to the separator (changes with a BIOS update)
+  PCR 2  firmware events up to the separator; nothing after it (an EFI driver loaded by the boot path changes it)
   PCR 4  firmware events up to the separator, then the Authenticode hashes of systemd-boot and of the kernel
   PCR 9  sha256 of the kernel's load options (UTF-16LE, with NUL), then sha256 of the initrd file
-This tool predicts both values for every SteamOS boot entry on S15BOOT that unlocks this partition, for every
-firmware variant (the PCR 4 events before the separator) seen at boot within the last 180 days, and makes the TPM2
-tokens match: missing ones are enrolled with the predicted values, tokens for values that no entry produces any more
-are removed. It also always keeps a token for the PCR values of the running boot, so after a boot that needed the
-passphrase (a changed firmware, an unknown boot path) the next boot unlocks with the TPM again, as with BitLocker.
+  PCR 15 zero: systemd-cryptsetup measures the volume key into it right after opening the volume
+         (tpm2-measure-pcr=yes), so the TPM releases the key only once per boot, before anything from the disk runs
+This tool predicts the values for every SteamOS boot entry on S15BOOT that unlocks this partition, for every
+firmware variant (the PCR 0, 2 and 4 events before the separator) seen at boot within the last 180 days with the
+installed firmware, and makes the TPM2 tokens match: missing ones are enrolled with the predicted values, tokens for
+values that no entry produces any more are removed. After a boot that needed the passphrase because the firmware
+changed (BIOS update, a new firmware variant), the next boot unlocks with the TPM again, as with BitLocker; variants
+of the previous BIOS are dropped then, so going back to it needs the passphrase. Boot paths that are not one of the
+entries (edited kernel command line, other kernels or initrds, an extra EFI driver) are never sealed: they always need
+the passphrase. Neither are kernels without our two boot fixes: kernel/patches/0012 (otherwise a changed devicetree
+could replace the measured initrd) and 0013 (otherwise the SystemdOptions EFI variable could change the boot), nor
+initramfs images without the drop-in that makes systemd-cryptsetup measure the volume key (it does so only for a UKI
+booted through systemd-stub, otherwise; the initcpio hook sd-s15-etc-overlay adds SYSTEMD_FORCE_MEASURE=1).
 
 New key slots are added with the re-seal key /var/lib/s15-luks/reseal.key (a key slot of its own, readable only by
-root on the unlocked system). Only systemd-tpm2 tokens bound to exactly PCR 4+9 are changed; the passphrase and any
-other token stay. Nothing in the TPM changes: sealing creates transient objects under the existing storage key.
+root on the unlocked system). Only systemd-tpm2 tokens bound to exactly PCR 0+2+4+9+15 (or the older PCR 4+9) are
+changed; the passphrase and any other token stay. Nothing in the TPM changes: sealing creates transient objects under
+the existing storage key.
 
 usage: s15-luks-reseal [--dry-run]
 Runs at every boot (s15-luks-reseal.service; it records the boot's firmware variant) and after every change of
 kernel, initramfs, systemd-boot or boot entries (s15-update-esp calls it).
 """
+import glob
+import gzip
 import hashlib
 import json
+import lzma
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -33,7 +48,14 @@ VARIANTS = f"{STATE}/firmware-variants.json"
 LOG = "/sys/kernel/security/tpm0/binary_bios_measurements"
 LOADER = "EFI/S15/systemd-bootaa64.efi"   # what firmware entry "SteamOS (S15)" starts
 KEEP_DAYS = 180
-PCRS = [4, 9]
+PCRS = [0, 2, 4, 9, 15]
+FW_PCRS = [0, 2, 4]     # predicted from the firmware's events up to the separator (firmware variants)
+OURS = (PCRS, [4, 9])   # token PCR sets this tool manages; [4, 9] = before 2026-11-04, replaced and removed
+# kernel/patches/0012: string in the EFI stub; 0013: the variable name (UTF-16) in efivarfs (module or kernel)
+STUB_FIX = b"Ignoring the initrd named by the devicetree"
+EFIVARFS_FIX = "SystemdOptions".encode("utf-16-le")
+# initcpio hook sd-s15-etc-overlay: makes systemd-cryptsetup measure the volume key into PCR 15 without a UKI
+MEASURE_DROPIN = "etc/systemd/system/systemd-cryptsetup@.service.d/s15-measure.conf"
 
 
 def die(msg):
@@ -78,7 +100,8 @@ def authenticode_sha256(path):
 
 
 def firmware_events():
-    """sha256 digests of the PCR 4 events up to and including the separator, from this boot's event log."""
+    """{pcr: sha256 digests of its events up to and including the separator} for PCR 0, 2 and 4, from this boot's
+    event log."""
     data = open(LOG, "rb").read()
     size = struct.unpack_from("<I", data, 28)[0]
     spec = data[32:32 + size]
@@ -95,12 +118,16 @@ def firmware_events():
                 sha = data[p + 2:p + 34]
             p += 2 + sizes[a]
         off = p + 4 + struct.unpack_from("<I", data, p)[0]
-        if pcr == 4 and et != 3:   # EV_NO_ACTION is not extended
-            ev.append((et, sha))
-    seps = [i for i, (et, _) in enumerate(ev) if et == 4]
-    if not seps:
-        die("no separator in PCR 4 of the event log")
-    return [sha.hex() for _, sha in ev[:seps[0] + 1]]
+        if pcr in FW_PCRS and et != 3:   # EV_NO_ACTION is not extended
+            ev.append((pcr, et, sha))
+    out = {}
+    for n in FW_PCRS:
+        e = [(et, sha) for pcr, et, sha in ev if pcr == n]
+        seps = [i for i, (et, _) in enumerate(e) if et == 4]
+        if not seps:
+            die(f"no separator in PCR {n} of the event log")
+        out[n] = [sha.hex() for _, sha in e[:seps[0] + 1]]
+    return out
 
 
 def pcr_values():
@@ -109,7 +136,7 @@ def pcr_values():
         f = line.split()
         out[int(f[0])] = bytes.fromhex(f[-1])
     if sorted(out) != PCRS:
-        die("cannot read PCR 4 and 9 from the TPM")
+        die(f"cannot read PCR {', '.join(map(str, PCRS))} from the TPM")
     return out
 
 
@@ -149,18 +176,48 @@ def entries(esp, uuid):
     return out
 
 
+def kernel_fixes(kernel):
+    """Problems of a kernel image (with its efivarfs module from /usr/lib/modules) with our two boot fixes."""
+    data = open(kernel, "rb").read()
+    bad = [] if STUB_FIX in data else ["devicetree initrd fix (kernel/patches/0012)"]
+    if EFIVARFS_FIX not in data:   # efivarfs not built in: its module
+        m = re.search(rb"Linux version (\S+)", data)
+        mods = glob.glob(f"/usr/lib/modules/{m.group(1).decode()}/kernel/fs/efivarfs/efivarfs.ko*") if m else []
+        ok = False
+        for f in mods:
+            d = open(f, "rb").read()
+            if f.endswith(".xz"):
+                d = lzma.decompress(d)
+            elif f.endswith(".gz"):
+                d = gzip.decompress(d)
+            elif f.endswith(".zst"):
+                d = subprocess.run(["zstd", "-dc", f], capture_output=True, check=True).stdout
+            ok = ok or EFIVARFS_FIX in d
+        if not ok:
+            bad.append("SystemdOptions fix (kernel/patches/0013)")
+    return bad
+
+
+def initrd_measures(initrd):
+    """The initramfs makes systemd-cryptsetup measure the volume key (else PCR 15 stays zero all boot long)."""
+    r = subprocess.run(["lsinitcpio", initrd], capture_output=True, text=True)
+    return r.returncode == 0 and MEASURE_DROPIN in {line.strip().lstrip("./") for line in r.stdout.splitlines()}
+
+
 def predict(fw, loader, kernel, initrd, options):
-    pcr4 = extend([bytes.fromhex(h) for h in fw] + [authenticode_sha256(loader), authenticode_sha256(kernel)])
+    pcr0 = extend([bytes.fromhex(h) for h in fw["pcr0"]])
+    pcr2 = extend([bytes.fromhex(h) for h in fw["pcr2"]])
+    pcr4 = extend([bytes.fromhex(h) for h in fw["events"]] + [authenticode_sha256(loader), authenticode_sha256(kernel)])
     pcr9 = extend([hashlib.sha256((options + "\0").encode("utf-16-le")).digest(),
                    hashlib.sha256(open(initrd, "rb").read()).digest()])
-    return {4: pcr4, 9: pcr9}
+    return {0: pcr0, 2: pcr2, 4: pcr4, 9: pcr9, 15: bytes(32)}
 
 
 def tpm2_tokens(dev):
     meta = json.loads(run("cryptsetup", "luksDump", "--dump-json-metadata", dev).stdout)
     out = []
     for tid, t in meta["tokens"].items():
-        if t.get("type") == "systemd-tpm2" and sorted(t.get("tpm2-pcrs", [])) == PCRS and "tpm2-policy-hash" in t:
+        if t.get("type") == "systemd-tpm2" and sorted(t.get("tpm2-pcrs", [])) in OURS and "tpm2-policy-hash" in t:
             out.append((int(tid), t["keyslots"], t["tpm2-policy-hash"]))
     return out
 
@@ -178,33 +235,55 @@ def main():
 
     variants = json.load(open(VARIANTS)) if os.path.exists(VARIANTS) else {}
     fw = firmware_events()
-    fid = hashlib.sha256("".join(fw).encode()).hexdigest()[:16]
-    variants.setdefault(fid, {"events": fw, "first_seen": now})["last_seen"] = now
-    variants = {k: v for k, v in variants.items() if k == fid or now - v["last_seen"] < KEEP_DAYS * 86400}
+    for v in variants.values():   # variants recorded before PCR 0/2 were bound: same firmware as now
+        v.setdefault("pcr0", fw[0])
+        v.setdefault("pcr2", fw[2])
+    fid = hashlib.sha256("|".join("".join(fw[n]) for n in (4, 2, 0)).encode()).hexdigest()[:16]
+    variants.setdefault(fid, {"events": fw[4], "pcr2": fw[2], "pcr0": fw[0], "first_seen": now})["last_seen"] = now
+    # Only the installed firmware (PCR 0 as in this boot): after a BIOS update, the previous BIOS needs the passphrase.
+    variants = {k: v for k, v in variants.items()
+                if k == fid or (v["pcr0"] == fw[0] and now - v["last_seen"] < KEEP_DAYS * 86400)}
 
     esp = tempfile.mkdtemp(prefix="s15-reseal-")
     run("mount", "-o", "ro", "/dev/disk/by-partlabel/S15BOOT", esp)
     try:
-        ents = entries(esp, uuid)
+        ents = []
+        for name, kernel, initrd, lo in entries(esp, uuid):
+            bad = kernel_fixes(kernel)
+            if bad:
+                print(f"  {name}: kernel without the {' and '.join(bad)} - not sealed")
+            elif "tpm2-measure-pcr=yes" not in lo:
+                print(f"  {name}: no tpm2-measure-pcr=yes in rd.luks.options - not sealed")
+            elif not initrd_measures(initrd):
+                print(f"  {name}: initramfs without the PCR 15 measurement (initcpio hook sd-s15-etc-overlay) - not sealed")
+            else:
+                ents.append((name, kernel, initrd, lo))
         if not ents:
-            die("no boot entry on S15BOOT unlocks this partition - nothing changed")
+            die("no boot entry on S15BOOT can be sealed - nothing changed")
         want = {}
         for vid, v in variants.items():
             for name, kernel, initrd, lo in ents:
-                p = predict(v["events"], f"{esp}/{LOADER}", kernel, initrd, lo)
+                p = predict(v, f"{esp}/{LOADER}", kernel, initrd, lo)
                 want.setdefault(policy(p), (p, f"{name} (firmware variant {vid})"))
     finally:
         run("umount", esp)
         os.rmdir(esp)
 
-    booted_ours = f"rd.luks.name={uuid}=" in open("/proc/cmdline").read()
+    # The running boot is checked, never sealed as such: a boot that is not one of the entries (an edited command
+    # line, a debug option, an extra EFI driver) must keep asking for the passphrase.
     cur = pcr_values()
-    if booted_ours:
-        if policy(cur) in want:
-            print(f"running boot: PCR 4/9 = prediction for {want[policy(cur)][1]}")
-        else:
-            print("running boot: PCR 4/9 differ from every prediction; keeping a token for them")
-            want[policy(cur)] = (cur, "the running boot")
+    # Nothing extends PCR 0 or 2 after the separator on a normal boot, so the TPM must hold what the event log up to
+    # the separator gives; otherwise every prediction would be wrong and the next boots would need the passphrase.
+    for n in (0, 2):
+        if extend(bytes.fromhex(h) for h in fw[n]) != cur[n]:
+            die(f"PCR {n} in the TPM is not its event log up to the separator (an extra EFI driver in this boot?)"
+                " - no token changed")
+    cur[15] = bytes(32)   # the value at unlock time; the volume key has been measured into it since
+    cur_pol = policy(cur)
+    if cur_pol in want:
+        print(f"running boot: PCR 0/2/4/9 = prediction for {want[cur_pol][1]}")
+    else:
+        print("running boot: PCR 0/2/4/9 match no boot entry (passphrase boot or a different boot path) - not sealed")
 
     have = tpm2_tokens(dev)
     seen, drop = set(), []
@@ -217,7 +296,7 @@ def main():
     for pol, (p, why) in want.items():
         print(f"{'keep' if pol in seen else 'ADD '} {pol[:16]}  {why}")
     for tid, slots, pol in drop:
-        print(f"DROP {pol[:16]}  token {tid}, key slot {','.join(slots)} (no entry produces these values)")
+        print(f"DROP {pol[:16]}  token {tid}, key slot {','.join(slots)} (no sealed entry produces these values)")
     if dry:
         return
     for pol, p, why in add:
@@ -234,9 +313,9 @@ def main():
     with open(tmp, "w") as f:
         json.dump(variants, f, indent=1)
     os.replace(tmp, VARIANTS)
-    if booted_ours and not run("cryptsetup", "open", "--test-passphrase", "--token-only", "--token-type",
-                               "systemd-tpm2", dev, check=False).returncode:
-        print("TPM unlock for the running boot: OK")
+    # A test unlock is not possible here: PCR 15 no longer is zero after the volume was opened.
+    if cur_pol in {t[2] for t in tpm2_tokens(dev)}:
+        print("the running boot path unlocks with the TPM")
 
 
 if __name__ == "__main__":
