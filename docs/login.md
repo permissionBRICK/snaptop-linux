@@ -81,8 +81,11 @@ killed or restarted session or SDDM, a switch file written from a locked or miss
   shortcut works from the next login (a switch to Game Mode and back is enough).
 - Failed passwords: `pam_faillock` (`deny = 10`, `unlock_time = 600`, `dir = /var/lib/faillock`, between marker
   lines in `/etc/security/faillock.conf`). The records are kept on disk, so a restart does not reset the count. It
-  applies to every password prompt of the system's PAM stack (login screen, screen lock, `sudo`). Unlock early as
-  root: `faillock --user steamos --reset`.
+  applies to every password prompt of the system's PAM stack (login screen, screen lock, `sudo`, polkit dialogs).
+  Unlock early as root: `faillock --user steamos --reset`. polkit's password helper (`polkit-agent-helper@.service`,
+  in 0.5.7) runs with `ProtectSystem=strict`; without a drop-in that allows writing `/var/lib/faillock`, pam_faillock
+  failed with "Read-only file system" and every password in a polkit dialog (e.g. Plasma's battery settings) was
+  rejected.
 
 ## PIN
 

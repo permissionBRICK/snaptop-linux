@@ -136,6 +136,12 @@ install_login() {  # $1: root directory, "" for the running system
   # group, so a user setting cannot lift it): no Meta+L and no "Lock" entry. With a password it is allowed.
   [ ! -f "$R$KG" ] || sed -i 's#^action/lock_screen=false$#action/lock_screen=true#' "$R$KG"
   install -d -m 0755 "$R/var/lib/faillock"
+  # polkit's password helper (polkit-agent-helper@.service) runs with ProtectSystem=strict: pam_faillock cannot write
+  # its tally file there, "Error opening the tally file: Read-only file system", and every password in a polkit
+  # dialog (Plasma's settings) fails with "System error" once the file exists
+  install -d "$R/etc/systemd/system/polkit-agent-helper@.service.d"
+  printf '[Service]\n# docs/login.md: pam_faillock keeps its tally files here\nReadWritePaths=-/var/lib/faillock -/run/faillock\n' \
+    > "$R/etc/systemd/system/polkit-agent-helper@.service.d/s15-faillock.conf"
   sed -i "\%^$FL_BEGIN\$%,\%^$FL_END\$%d" "$R$FL"
   printf '%s\n' "$FL_BEGIN" 'deny = 10' 'unlock_time = 600' 'dir = /var/lib/faillock' "$FL_END" >> "$R$FL"
 }
@@ -187,6 +193,7 @@ disable() {
     if [ -s "$KSL.s15-orig" ]; then mv -f "$KSL.s15-orig" "$KSL"; else rm -f "$KSL" "$KSL.s15-orig"; fi
   fi
   sed -i "\%^$FL_BEGIN\$%,\%^$FL_END\$%d" "$FL"
+  rm -f /etc/systemd/system/polkit-agent-helper@.service.d/s15-faillock.conf
   [ ! -f "$KG" ] || sed -i 's#^action/lock_screen=true$#action/lock_screen=false#' "$KG"
   echo "automatic login, screen lock and password settings as SteamOS has them again (login screen compositor kept)"
 }
