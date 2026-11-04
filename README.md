@@ -13,8 +13,12 @@ FEX for Windows games, a Plasma desktop and a Steam Deck-style Game Mode:
 - Wi-Fi and Bluetooth (with tray applets in Desktop Mode), USB-A, the right USB-C port with docks
 - dual boot next to BitLocker-protected Windows, one-click reboot in both directions
 - the firmware TPM 2.0 (own driver, [docs/tpm.md](docs/tpm.md)); optional disk encryption that the TPM unlocks
-  like BitLocker, re-sealed automatically after kernel updates ([docs/encryption.md](docs/encryption.md))
+  like BitLocker, only on the normal boot path, re-sealed automatically after kernel updates
+  ([docs/encryption.md](docs/encryption.md)); optional login password with Game Mode/Desktop Mode switches that
+  do not ask for it ([docs/login.md](docs/login.md))
 - old 32-bit DirectX 9 games (FlatOut 2 tested) running smoothly under Proton ARM64
+- SteamOS updates from Valve's servers, installed next to the running version with our adaptations and a fallback
+  to the previous one ([docs/updates.md](docs/updates.md))
 
 Not yet: NPU, USB4/Thunderbolt, USB devices on the left USB-C port, light sensor; Secure Boot must be off.
 Details: [docs/status.md](docs/status.md), [docs/known-issues.md](docs/known-issues.md).
@@ -50,7 +54,10 @@ about 1-1.5 hours, mostly unattended.
    SteamOS desktop. In Windows, `windows\Install-RebootShortcut.ps1` (elevated) adds a "Reboot to SteamOS" icon.
    When you are done with BIOS changes: `Resume-BitLocker -MountPoint C:`.
 
-Optional: encrypt the SteamOS partition with TPM unlock from the live system ([docs/encryption.md](docs/encryption.md)).
+Optional: encrypt the SteamOS partition with TPM unlock from the live system ([docs/encryption.md](docs/encryption.md)),
+then set a login password in SteamOS (`passwd`, then `sudo /opt/snaptop-linux/steamos/login-lock.sh enable`,
+[docs/login.md](docs/login.md)).
+Encryption without a login password only protects the SSD taken out of the laptop.
 
 Optional: `games/` adds Windows games to Steam with Proton ARM64 and the fixes old games need ([docs/games.md](docs/games.md)).
 
@@ -70,12 +77,14 @@ cd snaptop-linux && claude "Read AGENTS.md and install SteamOS on this laptop."
 |---|---|
 | [docs/status.md](docs/status.md) | Per-component status |
 | [docs/steamos.md](docs/steamos.md) | What the install does, the SteamOS adaptations, Desktop Mode, boot, dual boot |
+| [docs/updates.md](docs/updates.md) | SteamOS updates: Valve's builds installed as a second version, what an update keeps, fallback |
 | [docs/live-system.md](docs/live-system.md) | Live USB system, BIOS settings, booting pitfalls |
 | [docs/kernel.md](docs/kernel.md) | Kernel sources, patches, config, boot parameters |
 | [docs/firmware.md](docs/firmware.md) | Which firmware Linux needs and where it comes from |
 | [docs/power.md](docs/power.md) | Idle and standby power, the standby setup, measuring |
 | [docs/tpm.md](docs/tpm.md) | The firmware TPM: driver, what Linux must not change |
-| [docs/encryption.md](docs/encryption.md) | LUKS2 encryption with TPM unlock (PCR 4+9), passphrase fallback, automatic re-sealing |
+| [docs/encryption.md](docs/encryption.md) | LUKS2 encryption with TPM unlock (PCR 0+2+4+9+15, only the normal boot path), passphrase fallback, automatic re-sealing |
+| [docs/login.md](docs/login.md) | Login password: login screen at boot, mode switches without it, screen lock, failed-password lockout |
 | [docs/games.md](docs/games.md) | Windows games: Proton ARM64, FEX, DSOAL, native d3dx9 |
 | [docs/known-issues.md](docs/known-issues.md) | Open problems and resolved ones |
 

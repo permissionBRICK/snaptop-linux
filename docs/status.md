@@ -41,6 +41,8 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | Reboot | mostly works | Twice hung at the final reset; see known issues. |
 | Hexagon NPU | not yet tried | No QNN runtime for Linux and no upstream NPU accelerator driver, so normal AI apps cannot use it. A lower-level path exists: the mainline `fastrpc` driver plus the CDSP firmware (already boots here) runs llama.cpp's Hexagon backend on another X1E laptop (github.com/armbrusl/x1e-npu). Needs `fastrpc_shell_unsigned_3` from ASUS's Windows NPU driver package. |
 | TPM | works | Qualcomm firmware TPM 2.0 in TrustZone through our driver `tpm_qcom_crb` (kernel patch 0011): `/dev/tpmrm0`, boot event log, PCRs match the log, survives suspend. Windows owns its state; see [tpm](tpm.md) before using it. |
+| Disk encryption | works | LUKS2, TPM unlock without a prompt, passphrase fallback, automatic re-sealing ([encryption](encryption.md)). Binding to PCR 0+2+4+9+15 (only the normal boot path unlocks) written 2026-11-04, not yet tested on the laptop. |
+| Login password | written, untested | Login screen at boot and logout, mode switches without it, screen lock, failed-password lockout ([login](login.md)). |
 | Ambient light / presence sensors | no | |
 | Video decode (Iris) | untested | In mainline since 7.0. |
 

@@ -31,7 +31,8 @@ The quick start is in the [README](../README.md). `install.sh` runs in a live AR
    "SteamOS (S15)" after Windows Boot Manager, BootNext for the first start.
 
 Later kernels: build a payload with `kernel/build.sh` (on the laptop in SteamOS or on any Linux PC) and run
-`steamos/install-kernel.sh <payload>` in SteamOS.
+`steamos/install-kernel.sh <payload>` in SteamOS. Later SteamOS builds from Valve: `s15-os-update`
+([updates.md](updates.md)).
 
 ## Cameras and browser access
 
@@ -74,7 +75,7 @@ IR illuminator is a separate component.
 | Firmware: ASUS blobs, `ath12k/WCN7850`, `qca`, `qcom/gen70500_*` | The image only has the headset's firmware. |
 | ALSA UCM: S15 profile | Without it, no speaker/mic routing. |
 | `scmi-cpufreq` in `modules-load.d` | It does not autoload; without it no idle downclocking. |
-| Masks headset units (SteamVR, `deckard-*` fan/LED/FPGA/charger, adbd/USB gadget, `steamos-boot`, `systemd-repart`, Bluetooth/Wi-Fi MAC setters, A/B partition mounts) | They fail or fight with the laptop hardware. **Not** `iwd`: NetworkManager uses it as the Wi-Fi backend (masking it leaves Wi-Fi "enabled" with no networks). |
+| Masks headset units (SteamVR, `deckard-*` fan/LED/FPGA/charger, adbd/USB gadget, `steamos-boot`, `systemd-repart`, Bluetooth/Wi-Fi MAC setters, A/B partition mounts) and, from 0.5.7, the swap file for hibernation (`swapfile.service`, `home-swapfile.swap`: btrfs refuses a swap file on a compressed mount, and zram is there) | They fail or fight with the laptop hardware. **Not** `iwd`: NetworkManager uses it as the Wi-Fi backend (masking it leaves Wi-Fi "enabled" with no networks). |
 | fstab: A/B partition-set mounts commented out | Everything lives on one btrfs. |
 | `gamescope-session`: `--backend drm --prefer-output '*,eDP-1'` plus `-w/-h/-W/-H` from the panel's native mode, `--keep-alive --mangoapp --steam` | The Frame runs gamescope with the OpenVR backend for the headset. |
 | `RUNSTEAM.sh`: drop `-vrgamepadui`, `-deckard` → `-steampal` | Steam Deck UI instead of the headset UI. |
@@ -155,11 +156,12 @@ on the laptop just bounced back to Game Mode, and later showed a black screen wi
   `zzt-steamos-temp-login.conf`; our `steamos-session-select` no longer makes "Return to Gaming Mode" the new
   default, so Game Mode lasts until the next reboot. `steamosctl set-default-login-mode game|desktop` (as the
   user) changes the default.
-- **Wi-Fi and Bluetooth in the tray:** the image ships neither `plasma-nm` nor `bluedevil`, so Desktop Mode has
-  no network or Bluetooth applet, no settings pages for them and no secret agent (no password prompt). `desktop-net/`
-  builds them, with NetworkManagerQt, ModemManagerQt and BluezQt, against the image's own Qt 6.8, KF6 6.14 and
-  Plasma 6.2.5, in a chroot of the image under an overlay; `install.sh` runs it natively on the laptop (a few
-  minutes). bluedevil is built without its handbook (KF6DocTools is not in the image); VPN editor plugins are
+- **Wi-Fi and Bluetooth in the tray:** the 0.5.3 image ships neither `plasma-nm` nor `bluedevil`, so Desktop Mode
+  has no network or Bluetooth applet, no settings pages for them and no secret agent (no password prompt).
+  `desktop-net/` builds whichever of them the image lacks, with NetworkManagerQt, ModemManagerQt and BluezQt as
+  needed, at the image's own KDE Frameworks and Plasma versions (read from the image: KF6 6.14 / Plasma 6.2.5 in
+  0.5.3; 0.5.7 has KF6 6.23 / Plasma 6.6.2 and its own `plasma-nm`, so only Bluetooth is built), in a chroot of the
+  image under an overlay; `install.sh` and `s15-os-update` run it natively on the laptop (a few minutes). bluedevil is built without its handbook (KF6DocTools is not in the image); VPN editor plugins are
   included, OpenConnect is not. The package holds no file that the image already has. To rebuild or remove it
   in a running SteamOS:
 

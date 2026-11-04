@@ -1,0 +1,63 @@
+#!/bin/bash
+# Steam's OS update hook on this install (docs/updates.md): the interface of Valve's /usr/bin/steamos-update, backed by
+# s15-os-update. install-os-update.sh installs it as /usr/bin/steamos-update and /usr/bin/steamos-polkit-helpers/
+# steamos-update; Steam runs the latter (through pkexec, Valve's polkit action allows it without a password):
+#   --enable-duplicate-detection check
+#           exit 0 and print the build id when the selected branch has a newer build, 7 when not, 8 when one is
+#           staged already (restart to use it), 1 on errors
+#   (no "check")
+#           stage that build (20-60 minutes) as the systemd unit s15-os-update-stage, printing its progress as
+#           "NN%" lines; exit 0: staged, restart to switch to it. The unit keeps running if Steam gives up waiting.
+#   --supports-duplicate-detection   exit 0
+set -u
+[ "$(id -u)" = 0 ] || exec pkexec --disable-internal-agent "$0" "$@"
+U=/usr/local/sbin/s15-os-update
+RUN=/run/s15-os
+UNIT=s15-os-update-stage
+LOG=/var/log/s15-os-update.log
+check=; dup=
+for a in "$@"; do
+  case $a in
+    check) check=1 ;;
+    --enable-duplicate-detection) dup=1 ;;
+    --supports-duplicate-detection) echo >&2 "This script supports the duplicate detection option"; exit 0 ;;
+    --beta|-d) ;;
+    *) echo >&2 "Unknown option \"$a\""; exit 1 ;;
+  esac
+done
+
+if [ -n "$check" ]; then
+  if [ -n "$dup" ] && "$U" staged >/dev/null 2>&1; then
+    echo >&2 "An update has already been applied, please reboot to enable it"; exit 8
+  fi
+  out=$("$U" check 2>/dev/null); rc=$?
+  case $rc in
+    0) echo >&2 "Update available"; set -- $out; echo "${2:-$1}"; exit 0 ;;
+    7) echo >&2 "No update available"; exit 7 ;;
+    *) echo >&2 "Failed to check for updates"; exit 1 ;;
+  esac
+fi
+
+if ! systemctl is-active -q "$UNIT"; then
+  rm -f "$RUN/result" "$RUN/progress"
+  systemctl reset-failed "$UNIT" 2>/dev/null
+  # no suspend while it runs (Plasma's idle suspend, the lid watchdog)
+  systemd-run -q --unit="$UNIT" --description="SteamOS update (s15-os-update stage, docs/updates.md)" \
+    -p StandardOutput="append:$LOG" -p StandardError="append:$LOG" \
+    systemd-inhibit --what=sleep:idle:handle-lid-switch --who=s15-os-update --why="SteamOS update" "$U" stage ||
+    { echo >&2 "Update failed"; exit 1; }
+fi
+last=
+for _ in $(seq 1 7200); do   # 2 hours at most
+  p=$(sed -n 's/.*"percent": \([0-9]*\).*/\1/p' "$RUN/progress" 2>/dev/null)
+  [ -n "$p" ] && [ "$p" != "$last" ] && { echo "$p%"; last=$p; }
+  [ -f "$RUN/result" ] && break
+  systemctl is-active -q "$UNIT" || { sleep 2; [ -f "$RUN/result" ] && break; echo >&2 "Update failed"; exit 1; }
+  sleep 1
+done
+code=$(sed -n 's/.*"code": \([0-9]*\).*/\1/p' "$RUN/result" 2>/dev/null)
+case $code in
+  0) echo >&2 "Applied an update"; exit 0 ;;
+  7) echo >&2 "No update available"; exit 7 ;;
+  *) echo >&2 "Update failed (see $LOG)"; exit 1 ;;
+esac

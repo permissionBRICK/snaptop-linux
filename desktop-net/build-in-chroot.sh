@@ -1,6 +1,6 @@
 #!/bin/bash
-# Runs INSIDE the Frame image chroot (aarch64 under qemu-user). Builds the KDE network and Bluetooth stack that
-# the Steam Frame image leaves out, against the image's own Qt 6.8 / KF6 6.14 / Plasma 6.2.5.
+# Runs INSIDE the Frame image chroot (natively or under qemu-user). Builds the parts of the KDE network and
+# Bluetooth stack that the Steam Frame image leaves out (build.sh picks them and the versions from the image).
 set -euo pipefail
 S=/build/src; B=/build/b; STAGE=/build/stage; J=${J:-8}
 mkdir -p $B $STAGE
@@ -18,10 +18,9 @@ build() {  # name, stage(yes|no), cmake args...
   [ "$st" = yes ] && DESTDIR=$STAGE ninja -C $B/$n install >> $B/$n.install.log 2>&1
   touch $B/$n.done; log "done $n"
 }
-build extra-cmake-modules-6.14.0 no -DBUILD_DOC=OFF
-build networkmanager-qt-6.14.0 yes
-build modemmanager-qt-6.14.0 yes
-build bluez-qt-6.14.0 yes
-build plasma-nm-6.2.5 yes -DBUILD_OPENCONNECT=OFF
-build bluedevil-6.2.5 yes
+# /build/components (from build.sh): "<source dir> <stage yes|no> [cmake arguments]", in build order
+while read -r n st args; do
+  # shellcheck disable=SC2086
+  build "$n" "$st" $args
+done < /build/components
 log "ALL DONE"

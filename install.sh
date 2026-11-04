@@ -137,7 +137,7 @@ step "Plasma Wi-Fi and Bluetooth applets (built natively, a few minutes)"
 mkdir -p "$WORK/desktop-net"; mountpoint -q "$WORK/desktop-net" || mount -t tmpfs -o size=6G tmpfs "$WORK/desktop-net"
 bash "$HERE/desktop-net/build.sh" "$R" "$WORK/desktop-net" > >(tail -n 20 >> "$LOG") 2>&1 || die "desktop-net build failed (end of $LOG)"
 PKG=$(ls -t "$WORK"/desktop-net/s15-desktop-net-*.tar.zst | head -1)
-zstd -dc "$PKG" | tar -tf - | grep -v '/$' | sed 's#^#/#' > "$R/var/lib/s15-desktop-net.files"
+zstd -dc "$PKG" | tar -tf - | { grep -v '/$' || true; } | sed 's#^#/#' > "$R/var/lib/s15-desktop-net.files"
 zstd -dc "$PKG" | tar -xpf - -C "$R" --no-same-owner
 chroot "$R" ldconfig
 echo "installed $(wc -l < "$R/var/lib/s15-desktop-net.files") files"

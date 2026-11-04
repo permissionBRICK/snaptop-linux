@@ -57,9 +57,17 @@ what you are about to do before anything that writes to disk, and report results
 ## Checking the installed system (in SteamOS, as root)
 
 - `uname -r` ends in `-s15+`; `cat /proc/cmdline` has `root=PARTLABEL=SNAPSTEAM-NVME`, or on an encrypted install
-  `root=/dev/mapper/root rd.luks.name=<UUID>=root` (docs/encryption.md; `journalctl -u s15-luks-reseal` shows the
-  TPM re-sealing). Never remove the passphrase key slot or the re-seal key; the TPM tokens are managed by
-  `s15-luks-reseal`.
+  `root=/dev/mapper/root rd.luks.name=<UUID>=root`, `tpm2-measure-pcr=yes` in `rd.luks.options` and
+  `systemd.gpt_auto=0` (docs/encryption.md; `journalctl -u s15-luks-reseal` shows the TPM re-sealing, bound to
+  PCR 0+2+4+9+15). Never remove the passphrase key slot or the re-seal key; the TPM tokens are managed by
+  `s15-luks-reseal`. Never seal the running boot or other PCR sets by hand: only the boot entries may unlock.
+- SteamOS updates (docs/updates.md): `s15-os-update status`. `steamos-update` (what Steam runs) is ours and calls
+  `s15-os-update`. Never run Valve's updater (`atomupd-manager update`, `rauc install`, `steamos-update.valve`) on
+  this install, and never delete a subvolume in `.s15-os/` or the top level's files by hand;
+  `s15-os-update discard`/`rollback` do that.
+- Login password (docs/login.md): `sudo /opt/snaptop-linux/steamos/login-lock.sh status`. Never set or ask for the
+  user's password or the disk passphrase; the user types them. Never remove the `s15-login-gate check` line from
+  `/etc/pam.d/sddm-autologin` or add automatic logins except through `login-lock.sh disable`.
 - Audio: `aplay -l` lists the X1E80100 card; Wi-Fi: `nmcli device wifi list`; GPU: `vulkaninfo --summary` (Turnip).
 - Standby: after one suspend, `cat /sys/kernel/debug/qcom_stats/cxsd` shows a rising count (needs debugfs);
   `/var/log/s15-sleep.log` logs every sleep with drain and residency.

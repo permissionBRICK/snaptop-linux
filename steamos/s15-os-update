@@ -1,0 +1,1003 @@
+#!/usr/bin/env python3
+"""SteamOS updates for the Vivobook S15 (docs/updates.md).
+
+Valve's updater writes a new raw image into the other A/B partition, with the Steam Frame kernel and none of our
+changes. This tool installs Valve's next SteamOS build as a second version inside the same (encrypted) partition:
+
+  stage    ask Valve's update server (the installed image's own configuration and selected branch) for the current
+           build of the branch, download the signed bundle, verify it with the keys of the installed image, assemble
+           the image with desync (the current version's image as seed: only changed chunks are downloaded), copy it
+           into a new btrfs subvolume .s15-os/<buildid>, adapt it with steamos-s15-setup.sh (kernel, modules and
+           firmware from the running system), carry the system state over as Valve's own update does (all of /var
+           except image-owned parts, the /etc changes on Valve's keep list plus ours), re-apply login-lock, build the
+           initramfs, check the result, and add the boot entry "s15-next.conf" for one boot (LoaderEntryOneShot).
+  catchup  at shutdown after stage (s15-os-catchup.service): copy the state again, so changes made between staging
+           and the restart are not lost.
+  confirm  in the new version, a few minutes after a boot that reached the login screen (s15-os-confirm.timer):
+           make it the default "SteamOS (S15)" entry and keep the version it replaced as "previous system".
+           If the new version does not get that far, the next power-on starts the old default again.
+  rollback make the previous system the default again (and the current one the previous).
+  discard  remove a staged version that was not confirmed.
+  check    print the build the selected branch offers (exit 0: newer than the installed one, 7: none).
+  status   versions, boot entries, branch.
+
+The partition's top level (btrfs subvolume 5) holds /home for all versions and .s15-os/ (versions, the seed image,
+state.json). An install made before this tool runs from the top level itself ("legacy"); it stays as the previous
+system after the first update. Nothing here touches another partition than SNAPSTEAM-NVME and S15BOOT.
+"""
+import argparse
+import configparser
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+REPO = "/opt/snaptop-linux"     # this repository on the installed system (--repo for another checkout)
+RUN = "/run/s15-os"
+TOP = f"{RUN}/top"              # the btrfs top level (subvolid=5); versions in a subvolume mount it from fstab
+OSREL = ".s15-os"               # relative to TOP
+OS = f"{TOP}/{OSREL}"
+STATE = f"{OS}/state.json"
+NEW = "/mnt/s15-os-new"         # the version being prepared (not below /run: the setup script binds /run into it)
+ESP_DEV = "/dev/disk/by-partlabel/S15BOOT"
+KEEP_S15 = "/etc/atomic-update.conf.d/s15.conf"
+# /var paths that belong to the image, not to the state (Valve's holo-sync-var excludes, plus ours)
+VAR_EXCLUDES = ["/boot/", "/lib/dkms/", "/lib/modules/", "/lib/pacman/", "/lib/NetworkManager/", "/lost+found/",
+                "/lib/overlays/etc/", "/lib/s15-desktop-net.files"]
+UPPER = "var/lib/overlays/etc/upper"
+FREE_MIN = 30 << 30             # bytes free on the partition before staging (image + version + headroom)
+LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+ONESHOT = f"/sys/firmware/efi/efivars/LoaderEntryOneShot-{LOADER_GUID}"
+DESYNC = "desync"
+SYSROOT = ""                   # where the running system's update configuration is read from (tests: an image)
+PROGRESS = False                # --progress: bare "NN%" lines (the protocol of Steam's steamos-update)
+
+
+def log(msg):
+    print(msg, file=sys.stderr if PROGRESS else sys.stdout, flush=True)
+
+
+def progress(pct, what):
+    """Steam's hook (steamos-update-s15) follows RUN/progress; --progress also prints the 'NN%' lines itself."""
+    try:
+        os.makedirs(RUN, exist_ok=True)
+        with open(f"{RUN}/progress.tmp", "w") as f:
+            json.dump({"percent": pct, "step": what, "time": time.time()}, f)
+        os.replace(f"{RUN}/progress.tmp", f"{RUN}/progress")
+    except OSError:
+        pass
+    if PROGRESS:
+        print(f"{pct}%", flush=True)
+    log(f"== {what} ({pct}%)")
+
+
+def die(msg):
+    print(f"s15-os-update: {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+def run(*cmd, check=True, capture=False, **kw):
+    r = subprocess.run([str(c) for c in cmd], text=True,
+                       stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None, **kw)
+    if check and r.returncode:
+        die(f"{' '.join(map(str, cmd))} failed ({r.returncode}): {(r.stderr or '').strip()[-800:]}")
+    return r
+
+
+def out(*cmd):
+    return run(*cmd, capture=True).stdout.strip()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# where we run, state
+
+def root_source():
+    """(device, subvolume path) of the running root, e.g. ('/dev/mapper/root', '/.s15-os/20261103.6153824')."""
+    src = out("findmnt", "-no", "SOURCE", "/")
+    m = re.match(r"^(.*?)(\[(.*)\])?$", src)
+    return m.group(1), (m.group(3) or "/")
+
+
+def running_id():
+    _, sub = root_source()
+    if sub == "/":
+        return "legacy"
+    if sub.startswith(f"/{OSREL}/"):
+        return sub[len(OSREL) + 2:]
+    die(f"the root file system is the unexpected subvolume {sub}")
+
+
+def subvol_of(vid):
+    return "" if vid == "legacy" else f"{OSREL}/{vid}"
+
+
+def mount_top():
+    dev, _ = root_source()
+    os.makedirs(TOP, exist_ok=True)
+    if not os.path.ismount(TOP):
+        run("mount", "-o", "subvolid=5,noatime,compress=zstd:1", dev, TOP)
+    os.makedirs(OS, exist_ok=True)
+
+
+def manifest(root=None):
+    return json.load(open(f"{SYSROOT if root is None else root}/etc/steamos-atomupd/manifest.json"))
+
+
+def load_state():
+    if os.path.exists(STATE):
+        return json.load(open(STATE))
+    m = manifest()
+    return {"versions": {"legacy": {"buildid": m["buildid"], "version": m["version"], "created": None}},
+            "current": "legacy", "previous": None, "next": None}
+
+
+def save_state(st):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def lock():
+    os.makedirs(RUN, exist_ok=True)
+    f = open(f"{RUN}/lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        die("another s15-os-update is running")
+    return f
+
+
+def preflight():
+    if os.geteuid():
+        die("run as root")
+    m = manifest()
+    if m.get("variant") != "vr" or m.get("arch") != "aarch64":
+        die("not the Steam Frame SteamOS this repository installs")
+    model = open("/sys/firmware/devicetree/base/model", "rb").read().decode(errors="replace")
+    if "Vivobook S 15" not in model and "S5507Q" not in model:
+        die(f"not the Vivobook S15 ({model.strip(chr(0))})")
+    if out("findmnt", "-no", "FSTYPE", "/") != "btrfs":
+        die("the root file system is not btrfs")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Valve's update server
+
+def client_conf():
+    c = configparser.ConfigParser()
+    c.read([f"{SYSROOT}/usr/lib/steamos-atomupd/client.conf", f"{SYSROOT}/etc/steamos-atomupd/client.conf"])
+    return c["Server"]
+
+
+def branch():
+    """The branch selected in Steam (Valve's daemon keeps it in preferences.conf), else the image's default."""
+    for f in (f"{SYSROOT}/etc/steamos-atomupd/preferences.conf",):
+        if os.path.exists(f):
+            for line in open(f):
+                k, _, v = line.partition("=")
+                if k.strip().lower() == "branch" and v.strip():
+                    return v.strip()
+    if os.path.exists(f"{SYSROOT}/var/lib/steamos-branch"):
+        b = open(f"{SYSROOT}/var/lib/steamos-branch").read().strip()
+        if b:
+            return "stable" if b == "rel" else b
+    return manifest().get("default_update_branch", "stable")
+
+
+def http_get(url, auth=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "s15-os-update"})
+    if auth:
+        mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        mgr.add_password(None, url, *auth)
+        opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(mgr))
+    else:
+        opener = urllib.request.build_opener()
+    with opener.open(req, timeout=60) as r:
+        return r.read()
+
+
+def vkey(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def query(br=None):
+    """The candidate image of the branch: dict(buildid, version, branch, bundle_url, store_url)."""
+    s, m = client_conf(), manifest()
+    br = br or branch()
+    auth = (s.get("Username"), s.get("Password")) if s.get("Username") else None
+    base = s["MetaUrl"].rstrip("/")
+    q = urllib.parse.quote
+    bits = "/".join(q(x) for x in (m["release"], m["product"], m["arch"], m["variant"], br))
+    paths = [f"{bits}/{q(m['version'])}/{q(m['buildid'])}.json", f"{bits}.json"]
+    data, err = None, None
+    for p in paths:
+        try:
+            data = json.loads(http_get(f"{base}/{p}", auth) or b"{}")
+            break
+        except Exception as e:   # noqa: BLE001 - try the fallback path like Valve's client
+            err = e
+    if data is None:
+        die(f"update server: {err}")
+    cands = [c for kind in ("minor", "major") for c in (data.get(kind) or {}).get("candidates", [])]
+    if not cands:
+        return None
+    c = cands[0]
+    img = c["image"]
+    images = s["ImagesUrl"].rstrip("/") + "/"
+    return {"buildid": img["buildid"], "version": img["version"], "branch": img.get("branch", br),
+            "bundle_url": urllib.parse.urljoin(images, c["update_path"]),
+            "store_url": urllib.parse.urljoin(images, c["chunks_store_path"])}
+
+
+def newer(c, cur):
+    """Offer a build only if it is newer by build id and not an older version (the stable branch can lag behind the
+    beta builds a laptop was installed with)."""
+    return c["buildid"] > cur["buildid"] and vkey(c["version"]) >= vkey(cur["version"])
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# bundle, signature, image
+
+def verify_bundle(path, br):
+    """RAUC 'plain' bundle: squashfs, CMS signature (DER), 8-byte size. Verified against the installed image's keys;
+    like Valve's daemon, the development keys count only on a branch other than stable."""
+    d = open(path, "rb").read()
+    n = struct.unpack(">Q", d[-8:])[0]
+    if n <= 0 or n > len(d) - 8:
+        die("bundle has no signature")
+    work = os.path.dirname(path)
+    sig, sq = f"{work}/bundle.sig", f"{work}/bundle.sqfs"
+    open(sig, "wb").write(d[-8 - n:-8])
+    open(sq, "wb").write(d[:-8 - n])
+    dirs = [f"{SYSROOT}/etc/rauc/trusted_keys"] + ([f"{SYSROOT}/etc/rauc/development_keys"] if br != "stable" else [])
+    ca = f"{work}/keys.pem"
+    with open(ca, "w") as f:
+        for k in sorted(p for dd in dirs for p in glob.glob(f"{dd}/*")):
+            f.write(open(k).read())
+    r = run("openssl", "cms", "-verify", "-binary", "-inform", "DER", "-in", sig, "-content", sq, "-CAfile", ca,
+            "-purpose", "any", "-out", "/dev/null", check=False, capture=True)
+    if r.returncode:
+        die(f"bundle signature not valid for the keys of the installed SteamOS ({', '.join(dirs)}): "
+            f"{r.stderr.strip()[-300:]}")
+    run("unsquashfs", "-q", "-f", "-d", f"{work}/bundle", sq, capture=True)
+    os.remove(sig)
+    os.remove(sq)
+    mf = configparser.ConfigParser()
+    mf.read(f"{work}/bundle/manifest.raucm")
+    sysconf = configparser.ConfigParser()
+    sysconf.read(f"{SYSROOT}/etc/rauc/system.conf")
+    if mf["update"]["compatible"] != sysconf["system"]["compatible"]:
+        die(f"bundle is for {mf['update']['compatible']}, this system is {sysconf['system']['compatible']}")
+    return mf["update"]["version"], mf["image.rootfs"]["sha256"], f"{work}/bundle/{mf['image.rootfs']['filename']}"
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(8 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def assemble(caibx, store, out_img, sha):
+    """desync with the current version's image as seed: only chunks that changed are downloaded (0.5.3 -> 0.5.7:
+    3.3 GB instead of about 4.3 GB; Valve's builds change most of the image)."""
+    seeds = []
+    for img in glob.glob(f"{OS}/images/*.img"):
+        if os.path.exists(img + ".caibx"):
+            seeds += ["--seed", img + ".caibx"]
+    cmd = [DESYNC, "extract", "--store", store, "--error-retry", "35"]
+    if os.path.exists(f"{SYSROOT}/etc/desync/config.json"):
+        cmd += ["--config", f"{SYSROOT}/etc/desync/config.json"]
+    done = []
+
+    def watch():   # desync writes into a temporary file next to out_img: 5..40 % by its allocated size
+        last = 5
+        while not done:
+            time.sleep(15)
+            used = sum(os.stat(f).st_blocks * 512 for f in glob.glob(os.path.join(os.path.dirname(out_img), ".*"))
+                       if os.path.isfile(f))
+            pct = 5 + int(35 * min(1.0, used / (10 << 30)))
+            if pct > last:
+                progress(pct, "downloading and assembling the image")
+                last = pct
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        run(*cmd, *seeds, caibx, out_img)
+    finally:
+        done.append(1)
+    if sha256(out_img) != sha:
+        die("assembled image does not match the bundle's sha256")
+    run("fallocate", "--dig-holes", out_img)   # desync writes the empty space too: 10 GiB -> about 4 GB on disk
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# state carried into a new version (the rules of Valve's holo-sync-var)
+
+def keep_patterns(new_root):
+    pats = []
+    for f in [f"{new_root}/usr/lib/rauc/atomic-update-keep.conf"] + sorted(glob.glob("/etc/atomic-update.conf.d/*.conf")):
+        if os.path.exists(f):
+            pats += [l.strip() for l in open(f) if l.strip() and not l.lstrip().startswith("#")]
+    # ours, in case the running version is older than the one that writes /etc/atomic-update.conf.d/s15.conf
+    if os.path.exists(f"{new_root}{KEEP_S15}"):
+        pats += [l.strip() for l in open(f"{new_root}{KEEP_S15}") if l.strip() and not l.startswith("#")]
+    return sorted({p[len("/etc"):] if p.startswith("/etc/") else p for p in pats if p.startswith("/etc/")})
+
+
+def snapshot_running():
+    """A read-only snapshot of the running root as a consistent source (Valve freezes /var instead; here /var is on
+    the same file system as the target)."""
+    snap = f"{OS}/sync-src"
+    if os.path.exists(snap):
+        run("btrfs", "subvolume", "delete", snap, capture=True)
+    run("btrfs", "subvolume", "snapshot", "-r", f"{TOP}/{subvol_of(running_id())}".rstrip("/") or TOP, snap,
+        capture=True)
+    return snap
+
+
+def sync_state(src, dst, catchup=False):
+    """src, dst: version roots. /var: everything except the image-owned parts and the /etc overlay; /etc: the files
+    on the keep lists that differ from dst's own /etc. The old /etc changes are kept in /etc/previous."""
+    os.makedirs(f"{dst}/var", exist_ok=True)
+    ex = [f"--exclude={e}" for e in VAR_EXCLUDES] + (["--exclude=/lib/steamos-atomupd/"] if catchup else [])
+    # mount points of other file systems in the running /var (Valve's offload binds: /var/log, /var/tmp, ...)
+    for line in out("findmnt", "-rno", "TARGET").splitlines():
+        if line.startswith("/var/"):
+            ex.append(f"--exclude={line[4:]}/")
+    run("rsync", "-aHAX", "--delete", "--one-file-system", *ex, f"{src}/var/", f"{dst}/var/")
+    up_src, up_dst = f"{src}/{UPPER}", f"{dst}/{UPPER}"
+    os.makedirs(up_dst, exist_ok=True)
+    os.makedirs(f"{dst}/var/lib/overlays/etc/work", exist_ok=True)
+    if os.path.isdir(up_src):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("\n".join(keep_patterns(dst)) + "\n")
+            inc = f.name
+        try:
+            run("rsync", "-rlpgoDHA", "--delete", "--checksum", "--prune-empty-dirs", f"--compare-dest={dst}/etc/",
+                "--exclude=/previous", "--include=*/", f"--include-from={inc}", "--exclude=*",
+                f"{up_src}/", f"{up_dst}/")
+        finally:
+            os.remove(inc)
+        if not catchup:
+            prev = f"{up_dst}/previous"
+            shutil.rmtree(prev, ignore_errors=True)
+            os.makedirs(prev)
+            open(f"{prev}/README", "w").write(
+                "The 'previous' directory contains the edited files that you had in '/etc' before you applied the\n"
+                "last system update (s15-os-update, docs/updates.md, same rules as Valve's updater).\n")
+            run("rsync", "-aHA", "--one-file-system", "--exclude=/previous", f"{up_src}/", f"{prev}/")
+    for p in ("os-release", "rauc", "pacman.d/gnupg", ".updated"):
+        q = f"{up_dst}/{p}"
+        if os.path.isdir(q) and not os.path.islink(q):
+            shutil.rmtree(q)
+        elif os.path.lexists(q):
+            os.remove(q)
+    carry_enable_links(dst)
+    # a whiteout for /etc/.updated and no /var/.updated: systemd's ConditionNeedsUpdate units run at the first boot
+    os.mknod(f"{up_dst}/.updated", 0o000 | 0o020000, os.makedev(0, 0))
+    if os.path.lexists(f"{dst}/var/.updated"):
+        os.remove(f"{dst}/var/.updated")
+
+
+def carry_enable_links(dst):
+    """Units enabled on the running system stay enabled: a *.wants/*.requires link that the new version has neither
+    in its image nor in the kept /etc changes is added to the latter if the unit exists there. Covers links that live
+    in the running version's image layer (an older setup) and so are on no keep list."""
+    up = f"{dst}/{UPPER}"
+    for kind in ("system", "user"):
+        for d in glob.glob(f"/etc/systemd/{kind}/*.wants") + glob.glob(f"/etc/systemd/{kind}/*.requires"):
+            for name in sorted(os.listdir(d)):
+                src = os.path.join(d, name)
+                if not os.path.islink(src):
+                    continue
+                rel = os.path.relpath(src, "/etc")
+                if os.path.lexists(f"{dst}/etc/{rel}") or os.path.lexists(f"{up}/{rel}"):
+                    continue
+                unit = os.path.basename(os.readlink(src))
+                unit = re.sub(r"@[^.]+\.", "@.", unit)   # an instance: its template
+                if not any(os.path.exists(f"{r}/systemd/{kind}/{unit}") for r in
+                           (f"{dst}/etc", f"{dst}/usr/lib", up)):
+                    continue
+                os.makedirs(os.path.dirname(f"{up}/{rel}"), exist_ok=True)
+                os.symlink(os.readlink(src), f"{up}/{rel}")
+                log(f"  kept enabled: {rel}")
+
+
+def carry_local(dst):
+    """/usr/local of the running version: files the new version does not have (installed after setup)."""
+    added = []
+    for d, dirs, files in os.walk("/usr/local"):
+        for f in files:
+            s = os.path.join(d, f)
+            t = dst + s
+            if not os.path.lexists(t):
+                os.makedirs(os.path.dirname(t), exist_ok=True)
+                shutil.copy2(s, t, follow_symlinks=False)
+                added.append(s)
+    for a in added:
+        log(f"  kept {a}")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# boot entries on S15BOOT
+
+class Esp:
+    def __enter__(self):
+        self.m = tempfile.mkdtemp(prefix="s15-os-esp-")
+        run("mount", ESP_DEV, self.m)
+        return self.m
+
+    def __exit__(self, *a):
+        run("sync")
+        run("umount", self.m)
+        os.rmdir(self.m)
+
+
+FILES = ("vmlinuz", "initramfs-s15.img", "x1e80100-asus-vivobook-s15-ec.dtb")
+
+
+def read_entry(path):
+    kv = {}
+    for line in open(path, encoding="utf-8"):
+        k, _, v = line.strip().partition(" ")
+        if k:
+            kv[k] = v.strip()
+    return kv
+
+
+def options_for(opts, vid):
+    """The kernel command line of the current entry with the root subvolume of version vid."""
+    def fix(m):
+        flags = [f for f in m.group(1).split(",") if f and not f.startswith(("subvol=", "subvolid="))]
+        if vid != "legacy":
+            flags.append(f"subvol={subvol_of(vid)}")
+        return "rootflags=" + ",".join(flags)
+    if "rootflags=" not in opts:
+        opts += " rootflags="
+    return re.sub(r"rootflags=(\S*)", fix, opts)
+
+
+def write_entry(esp, name, title, sort, d, suffix, options):
+    with open(f"{esp}/loader/entries/{name}.tmp", "w") as f:
+        f.write(f"title   {title}\nsort-key {sort}\nlinux   /EFI/S15/{d}vmlinuz{suffix}\n"
+                f"initrd  /EFI/S15/{d}initramfs-s15.img{suffix}\n"
+                f"devicetree /EFI/S15/{d}x1e80100-asus-vivobook-s15-ec.dtb{suffix}\noptions {options}\n")
+    os.replace(f"{esp}/loader/entries/{name}.tmp", f"{esp}/loader/entries/{name}")
+
+
+def remove_next_entry():
+    with Esp() as esp:
+        shutil.rmtree(f"{esp}/EFI/S15/next", ignore_errors=True)
+        if os.path.exists(f"{esp}/loader/entries/s15-next.conf"):
+            os.remove(f"{esp}/loader/entries/s15-next.conf")
+
+
+def boot_next_steamos():
+    """Windows Boot Manager is first at power-on; a restart after an update should come back to SteamOS."""
+    r = run("efibootmgr", check=False, capture=True)
+    m = re.search(r"^Boot([0-9A-F]{4})\* SteamOS \(S15\)\t", r.stdout or "", re.M)
+    if m:
+        run("efibootmgr", "-q", "-n", m.group(1), check=False, capture=True)
+
+
+def reseal():
+    if os.path.exists("/var/lib/s15-luks/reseal.key"):
+        run("/usr/local/sbin/s15-luks-reseal")
+
+
+def efivars():
+    """EFI variables on the X1E go through the TrustZone app uefisecapp, which registers some 30 s into boot; an
+    efivarfs mounted before that stays empty, so mount it again if it shows no BootOrder."""
+    d = "/sys/firmware/efi/efivars"
+    for _ in range(2):
+        if os.path.ismount(d) and glob.glob(f"{d}/BootOrder-*"):
+            return
+        if os.path.ismount(d):
+            run("umount", d, check=False)
+        run("mount", "-t", "efivarfs", "efivarfs", d, check=False)
+    die("no EFI variables (efivarfs)")
+
+
+def set_oneshot(entry):
+    """systemd-boot boots this entry once (EFI variable LoaderEntryOneShot); the default stays as it is."""
+    efivars()
+    run("chattr", "-i", ONESHOT, check=False, capture=True)
+    data = struct.pack("<I", 7) + (entry + "\0").encode("utf-16-le")   # NV, boot service and runtime access
+    with open(ONESHOT, "wb") as f:
+        f.write(data)
+
+
+def clear_oneshot():
+    efivars()
+    if os.path.exists(ONESHOT):
+        run("chattr", "-i", ONESHOT, check=False, capture=True)
+        os.remove(ONESHOT)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# stage
+
+def bind_chroot(root):
+    for m in ("proc", "sys", "dev", "run"):
+        if not os.path.ismount(f"{root}/{m}"):
+            run("mount", "--rbind", f"/{m}", f"{root}/{m}")
+            run("mount", "--make-rslave", f"{root}/{m}")   # else unmounting propagates to the host
+
+
+def unbind_chroot(root):
+    for m in ("run", "dev", "sys", "proc"):
+        if os.path.ismount(f"{root}/{m}"):
+            run("umount", "-R", "-l", f"{root}/{m}", check=False)
+
+
+def home_from_top(root, dev):
+    """A version in a subvolume mounts the top level from the root device itself (on an encrypted install
+    /dev/mapper/root, the volume the initramfs opened) and binds /home from it. The setup script masks the Frame's
+    home.mount (its home partition); here systemd needs a real home.mount, because Valve's offload mounts
+    (/var/log, /var/tmp, ... bound from /home/.steamos/offload) depend on it."""
+    unit = f"{root}/etc/systemd/system/home.mount"
+    if os.path.islink(unit):
+        os.remove(unit)
+    lines = [l if l.endswith("\n") else l + "\n" for l in open(f"{root}/etc/fstab") if "s15-os" not in l]
+    lines += ["# s15-os-update (docs/updates.md): /home lives in the top level of the SteamOS partition\n",
+              f"{dev}  {TOP}  btrfs  subvolid=5,noatime,compress=zstd:1  0 0  # s15-os\n",
+              f"{TOP}/home  /home  none  bind  0 0  # s15-os\n"]
+    open(f"{root}/etc/fstab", "w").writelines(lines)
+
+
+def kernel_release():
+    return os.uname().release
+
+
+def initramfs(root, kv):
+    """Built inside the new version with its /etc overlay mounted, so it sees the kept /etc files (vconsole.conf: the
+    passphrase prompt's keyboard layout)."""
+    up, wk = f"{root}/{UPPER}", f"{root}/var/lib/overlays/etc/work"
+    bind_chroot(root)
+    run("mount", "-t", "overlay", "overlay", "-o", f"lowerdir={root}/etc,upperdir={up},workdir={wk}", f"{root}/etc")
+    try:
+        for f in ("/boot/initramfs-s15.img", "/boot/initrd.uImage"):
+            if os.path.exists(root + f):
+                os.remove(root + f)
+        r = run("chroot", root, "mkinitcpio", "-c", "/etc/mkinitcpio-s15.conf", "-k", kv, "-g",
+                "/boot/initramfs-s15.img", check=False, capture=True)
+        if not os.path.exists(f"{root}/boot/initramfs-s15.img") and os.path.exists(f"{root}/boot/initrd.uImage"):
+            # the Frame's deckard-uimage post hook wraps the image in a 64-byte U-Boot header
+            with open(f"{root}/boot/initrd.uImage", "rb") as a, open(f"{root}/boot/initramfs-s15.img", "wb") as b:
+                a.seek(64)
+                shutil.copyfileobj(a, b)
+        if not os.path.exists(f"{root}/boot/initramfs-s15.img"):
+            die(f"mkinitcpio produced no image: {r.stdout[-600:]} {r.stderr[-600:]}")
+    finally:
+        run("umount", f"{root}/etc")
+        unbind_chroot(root)
+
+
+def login_lock_on():
+    try:
+        return "s15-login-gate check" in open("/etc/pam.d/sddm-autologin").read()
+    except OSError:
+        return False
+
+
+def verify_version(root, kv):
+    """The adaptations that matter for booting and for Game Mode; a Valve change that breaks one of the setup
+    script's edits stops the update here instead of after the restart."""
+    bad = []
+
+    def need(cond, what):
+        if not cond:
+            bad.append(what)
+
+    def has(path, text):
+        try:
+            return text in open(root + path, errors="replace").read()
+        except OSError:
+            return False
+
+    need(os.path.isdir(f"{root}/usr/lib/modules/{kv}"), f"modules {kv}")
+    need(os.path.exists(f"{root}/boot/vmlinuz-{kv}"), "kernel image")
+    need(os.path.getsize(f"{root}/boot/initramfs-s15.img") > 5 << 20 if os.path.exists(f"{root}/boot/initramfs-s15.img") else False, "initramfs")
+    need(os.path.exists(f"{root}/usr/lib/firmware/qcom/x1e80100/ASUSTeK/vivobook-s15/qcadsp8380.mbn"), "ASUS firmware")
+    need(os.path.exists(f"{root}/usr/share/alsa/ucm2/Qualcomm/x1e80100/ASUS-Vivobook-S15.conf"), "S15 UCM profile")
+    need(has("/usr/lib/steamos/gamescope-session", "--backend drm"), "gamescope DRM backend")
+    need(os.path.islink(f"{root}/etc/systemd/system/steamos-boot.service"), "Frame units masked")
+    need(os.path.exists(f"{root}/usr/local/sbin/s15-luks-reseal"), "s15-luks-reseal")
+    need(os.path.exists(f"{root}/etc/mkinitcpio-s15.conf"), "mkinitcpio-s15.conf")
+    if os.path.exists("/var/lib/s15-luks/reseal.key"):
+        need(has("/etc/mkinitcpio-s15.conf", "sd-encrypt"), "LUKS in the initramfs")
+    if login_lock_on():
+        need(has("/etc/pam.d/sddm-autologin", "s15-login-gate check"), "login gate (login-lock.sh)")
+    need(any(TOP in l and "subvolid=5" in l for l in open(f"{root}/etc/fstab")), "/home from the top level (fstab)")
+    need(has("/usr/bin/steamos-polkit-helpers/steamos-update", "s15-os-update"), "Steam's update hook")
+    need(not os.path.islink(f"{root}/etc/systemd/system/home.mount"), "home.mount not masked")
+    if bad:
+        die("the new version is missing: " + ", ".join(bad))
+
+
+def stage(args):
+    preflight()
+    lk = lock()
+    mount_top()
+    st = load_state()
+    cur = st["versions"][st["current"]]
+    if running_id() != st["current"]:
+        die(f"running {running_id()}, but the default is {st['current']}: confirm or roll back first (status)")
+    if st.get("next"):
+        die(f"{st['next']} is already staged: restart to try it, or s15-os-update discard")
+    br = args.branch or branch()
+    progress(1, f"asking Valve's update server (branch {br})")
+    c = query(br)
+    if not c:
+        die(f"the branch {br} has no image")
+    if not args.force and not newer(c, cur):
+        log(f"no update: branch {br} offers {c['version']} ({c['buildid']}), installed {cur['version']} ({cur['buildid']})")
+        sys.exit(7)
+    vid = c["buildid"]
+    if not re.fullmatch(r"[0-9]{8}\.[0-9]+", vid):
+        die(f"unexpected build id {vid}")
+    if os.path.exists(f"{OS}/{vid}"):
+        die(f"{OS}/{vid} exists already")
+    st_vfs = os.statvfs(TOP)
+    if st_vfs.f_bavail * st_vfs.f_frsize < FREE_MIN:
+        die(f"needs {FREE_MIN >> 30} GB free on the SteamOS partition")
+    kv = kernel_release()
+    work = f"{OS}/work"
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    run("chattr", "+C", work, check=False, capture=True)   # no copy-on-write for the image file
+    part = f"{OS}/{vid}.partial"
+    ok = False
+    try:
+        progress(3, f"SteamOS {c['version']} ({vid}): bundle and signature")
+        bundle = f"{work}/bundle.raucb"
+        open(bundle, "wb").write(http_get(c["bundle_url"]))
+        version, sha, caibx = verify_bundle(bundle, c["branch"])
+        if version != vid:
+            die(f"bundle is {version}, the server announced {vid}")
+        progress(5, "downloading and assembling the image (changed chunks only)")
+        img = f"{work}/rootfs.img"
+        assemble(caibx, c["store_url"], img, sha)
+        progress(40, "copying the image into a new subvolume")
+        if os.path.exists(part):
+            run("btrfs", "subvolume", "delete", part, capture=True)
+        run("btrfs", "subvolume", "create", part, capture=True)
+        imgmnt = f"{work}/mnt"
+        os.makedirs(imgmnt)
+        run("mount", "-o", "loop,ro", img, imgmnt)
+        try:
+            run("rsync", "-aHAXS", "--numeric-ids", f"{imgmnt}/", f"{part}/")
+        finally:
+            run("umount", imgmnt)
+        dev, _ = root_source()
+        os.makedirs(NEW, exist_ok=True)
+        run("mount", "-o", f"subvol={OSREL}/{vid}.partial,noatime,compress=zstd:1", dev, NEW)
+        try:
+            progress(50, "adapting it to the laptop (steamos-s15-setup.sh)")
+            for f in [f"/boot/vmlinuz-{kv}"] + glob.glob("/boot/x1e80100-asus-vivobook-s15*.dtb"):
+                shutil.copy2(f, NEW + f)
+            run("rsync", "-a", "--delete", "--exclude=.git", f"{REPO}/", f"{NEW}/opt/snaptop-linux/")
+            tz = out("timedatectl", "show", "-p", "Timezone", "--value")
+            try:
+                env = dict(os.environ, R=NEW, PAYLOAD="", KV=kv, FW="/usr/lib/firmware", UCM="/usr/share/alsa/ucm2",
+                           TIMEZONE=tz, S15_SKIP_INITRAMFS="1")
+                run("bash", f"{REPO}/steamos/steamos-s15-setup.sh", env=env)
+                home_from_top(NEW, dev)
+                progress(65, "Plasma Wi-Fi and Bluetooth applets (desktop-net)")
+                dn = f"{work}/desktop-net"
+                os.makedirs(dn)
+                run("bash", f"{REPO}/desktop-net/build.sh", NEW, dn)
+                pkg = sorted(glob.glob(f"{dn}/s15-desktop-net-*.tar.zst"), key=os.path.getmtime)[-1]
+                names = out("sh", "-c", f"zstd -dc '{pkg}' | tar -tf - | grep -v '/$' | sed 's#^#/#'")
+                run("sh", "-c", f"zstd -dc '{pkg}' | tar -xpf - -C '{NEW}' --no-same-owner")
+                run("chroot", NEW, "ldconfig")
+                progress(75, "carrying the system state over (Valve's rules)")
+                snap = snapshot_running()
+                try:
+                    sync_state(snap, NEW)
+                finally:
+                    run("btrfs", "subvolume", "delete", snap, capture=True)
+                open(f"{NEW}/var/lib/s15-desktop-net.files", "w").write(names + "\n")
+                carry_local(NEW)
+                if login_lock_on():
+                    log("== login password (login-lock.sh)")
+                    run("bash", f"{REPO}/steamos/login-lock.sh", "apply-root", NEW)
+                progress(85, "initramfs")
+                initramfs(NEW, kv)
+            finally:
+                unbind_chroot(NEW)
+            verify_version(NEW, kv)
+        finally:
+            run("umount", NEW, check=False)
+        os.rename(part, f"{OS}/{vid}")
+        progress(92, "boot entry for one boot of the new version")
+        dev, _ = root_source()
+        os.makedirs(NEW, exist_ok=True)
+        run("mount", "-o", f"subvol={OSREL}/{vid},ro", dev, NEW)
+        try:
+            with Esp() as esp:
+                cur_opts = read_entry(f"{esp}/loader/entries/s15.conf")["options"]
+                os.makedirs(f"{esp}/EFI/S15/next", exist_ok=True)
+                for f, src in zip(FILES, (f"/boot/vmlinuz-{kv}", "/boot/initramfs-s15.img",
+                                          "/boot/x1e80100-asus-vivobook-s15-ec.dtb")):
+                    shutil.copyfile(NEW + src, f"{esp}/EFI/S15/next/{f}")
+                write_entry(esp, "s15-next.conf", f"SteamOS (S15) - update {c['version']}", "s15-0", "next/", "",
+                            options_for(cur_opts, vid))
+        finally:
+            run("umount", NEW)
+        reseal()                      # includes s15-next.conf
+        set_oneshot("s15-next.conf")
+        # the seed for the next update: this image (with its index)
+        os.makedirs(f"{OS}/images", exist_ok=True)
+        run("chattr", "+C", f"{OS}/images", check=False, capture=True)
+        shutil.copyfile(caibx, f"{OS}/images/{vid}.img.caibx")
+        os.replace(img, f"{OS}/images/{vid}.img")
+        st["versions"][vid] = {"buildid": vid, "version": c["version"], "branch": c["branch"], "created": time.time()}
+        st["next"] = vid
+        save_state(st)
+        os.makedirs(RUN, exist_ok=True)
+        open(f"{RUN}/catchup", "w").write(vid + "\n")
+        ok = True
+        progress(100, f"SteamOS {c['version']} is ready: restart to switch to it")
+    finally:
+        if not ok:
+            if os.path.ismount(NEW):
+                run("umount", "-R", "-l", NEW, check=False)
+            for p in (part, f"{OS}/{vid}"):
+                if os.path.exists(p) and not args.keep:
+                    run("btrfs", "subvolume", "delete", p, check=False, capture=True)
+            for undo in (remove_next_entry, lambda: os.path.exists(ONESHOT) and clear_oneshot(),
+                         lambda: [os.remove(f) for f in glob.glob(f"{OS}/images/{vid}.img*")]):
+                try:
+                    undo()
+                except BaseException as e:   # noqa: BLE001 - keep the original error visible
+                    print(f"s15-os-update: cleanup: {e}", file=sys.stderr)
+        shutil.rmtree(work, ignore_errors=True)
+    lk.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# after staging: catch-up at shutdown, confirm, rollback, discard
+
+def catchup(args):
+    global TOP, OS, STATE
+    if not os.path.exists(f"{RUN}/catchup"):
+        return
+    # a mount of its own: at shutdown systemd unmounts the fstab mount of the top level in parallel
+    TOP = f"{RUN}/catchup-top"
+    OS, STATE = f"{TOP}/{OSREL}", f"{TOP}/{OSREL}/state.json"
+    mount_top()
+    st = load_state()
+    nxt = st.get("next")
+    if not nxt or running_id() != st["current"] or not os.path.isdir(f"{OS}/{nxt}"):
+        return
+    snap = snapshot_running()
+    try:
+        sync_state(snap, f"{OS}/{nxt}", catchup=True)
+    finally:
+        run("btrfs", "subvolume", "delete", snap, capture=True)
+    log(f"state copied to {nxt} again")
+    if "reboot.target" in out("systemctl", "list-jobs", "--no-legend"):
+        boot_next_steamos()
+
+
+def rotate(esp, st, new_cur, new_prev):
+    """Make new_cur the default entry (files in EFI/S15) and new_prev the previous system (EFI/S15/prev-os)."""
+    e = f"{esp}/EFI/S15"
+    opts = read_entry(f"{esp}/loader/entries/s15.conf")["options"]
+    tmp = f"{e}/rot"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    src_cur = f"{e}/next" if st.get("next") == new_cur else f"{e}/prev-os"
+    for f in FILES:
+        shutil.copyfile(f"{e}/{f}", f"{tmp}/{f}")          # the files of the version that becomes previous
+        shutil.copyfile(f"{src_cur}/{f}", f"{e}/{f}")
+        shutil.copyfile(f"{src_cur}/{f}", f"{e}/{f}.old")   # previous kernel of this version: none yet
+    shutil.rmtree(f"{e}/prev-os", ignore_errors=True)
+    os.replace(tmp, f"{e}/prev-os")
+    shutil.rmtree(f"{e}/next", ignore_errors=True)
+    for n in ("s15-next.conf", "s15-prev-os.conf"):
+        if os.path.exists(f"{esp}/loader/entries/{n}"):
+            os.remove(f"{esp}/loader/entries/{n}")
+    v = st["versions"]
+    write_entry(esp, "s15.conf", "SteamOS (S15)", "s15-1", "", "", options_for(opts, new_cur))
+    write_entry(esp, "s15-previous.conf", "SteamOS (S15) - previous kernel", "s15-2", "", ".old",
+                options_for(opts, new_cur))
+    write_entry(esp, "s15-prev-os.conf", f"SteamOS (S15) - previous system {v[new_prev]['version']}", "s15-3",
+                "prev-os/", "", options_for(opts, new_prev))
+
+
+def confirm(args):
+    mount_top()
+    st = load_state()
+    me = running_id()
+    nxt = st.get("next")
+    efivars()
+    if nxt and me == st["current"] and not os.path.exists(ONESHOT) and not os.path.exists(f"{RUN}/catchup"):
+        # systemd-boot used the one-time entry, but the version did not reach this point: back on the old default
+        if not st["versions"][nxt].get("failed"):
+            st["versions"][nxt]["failed"] = time.time()
+            save_state(st)
+        log(f"{nxt} was started but not confirmed (it did not reach the login screen for long enough). "
+            "s15-os-update try starts it once more, s15-os-update discard removes it.")
+        return
+    if nxt != me:
+        log("nothing to confirm")
+        return
+    if not args.now:
+        # booted into the login screen or a session, and nothing failed on the way
+        if run("systemctl", "is-active", "-q", "display-manager.service", check=False).returncode:
+            die("the login screen is not running - not confirming this version")
+    lk = lock()
+    old = st["current"]
+    with Esp() as esp:
+        rotate(esp, st, me, old)
+    # keep two versions: drop the one before the previous (never the legacy top level, see docs/updates.md)
+    gone = st.get("previous")
+    st.update(previous=old, current=me, next=None)
+    if gone and gone not in (old, me) and gone != "legacy" and os.path.isdir(f"{OS}/{gone}"):
+        run("btrfs", "subvolume", "delete", f"{OS}/{gone}", capture=True)
+        st["versions"].pop(gone, None)
+    for img in glob.glob(f"{OS}/images/*.img"):
+        if os.path.basename(img)[:-4] != me:
+            os.remove(img)
+            if os.path.exists(img + ".caibx"):
+                os.remove(img + ".caibx")
+    save_state(st)
+    reseal()
+    lk.close()
+    log(f"{me} ({st['versions'][me]['version']}) is now the default; previous system: {old}")
+
+
+def rollback(args):
+    preflight()
+    lk = lock()
+    mount_top()
+    st = load_state()
+    if st.get("next"):
+        die("a new version is staged: discard it first")
+    prev = st.get("previous")
+    if not prev:
+        die("there is no previous system")
+    cur = st["current"]
+    with Esp() as esp:
+        rotate(esp, st, prev, cur)
+    st.update(current=prev, previous=cur)
+    save_state(st)
+    reseal()
+    lk.close()
+    log(f"default: {prev}; previous system: {cur}. Restart to use it.")
+
+
+def discard(args):
+    preflight()
+    lk = lock()
+    mount_top()
+    st = load_state()
+    nxt = st.get("next")
+    if not nxt:
+        die("nothing staged")
+    if running_id() == nxt:
+        die("running the staged version: confirm it, or restart into the default first")
+    clear_oneshot()
+    remove_next_entry()
+    if os.path.isdir(f"{OS}/{nxt}"):
+        run("btrfs", "subvolume", "delete", f"{OS}/{nxt}", capture=True)
+    for f in glob.glob(f"{OS}/images/{nxt}.img*"):
+        os.remove(f)
+    st["versions"].pop(nxt, None)
+    st["next"] = None
+    save_state(st)
+    if os.path.exists(f"{RUN}/catchup"):
+        os.remove(f"{RUN}/catchup")
+    reseal()
+    lk.close()
+    log(f"{nxt} removed")
+
+
+def try_next(args):
+    preflight()
+    mount_top()
+    st = load_state()
+    if not st.get("next"):
+        die("nothing staged")
+    st["versions"][st["next"]].pop("failed", None)
+    save_state(st)
+    set_oneshot("s15-next.conf")
+    log(f"the next start of SteamOS (S15) boots {st['next']} once")
+
+
+def staged(args):
+    """exit 0 if a version is staged (and was not tried without success): Steam's duplicate detection."""
+    mount_top()
+    st = load_state()
+    nxt = st.get("next")
+    sys.exit(0 if nxt and not st["versions"].get(nxt, {}).get("failed") else 1)
+
+
+def check(args):
+    c = query(args.branch)
+    cur = manifest()
+    if not c:
+        log("no image on this branch")
+        sys.exit(7)
+    if newer(c, cur):
+        print(f"{c['version']} {c['buildid']} ({c['branch']})")
+        sys.exit(0)
+    log(f"no update: {c['branch']} offers {c['version']} ({c['buildid']}), installed {cur['version']} ({cur['buildid']})")
+    sys.exit(7)
+
+
+def status(args):
+    mount_top()
+    st = load_state()
+    print(f"running: {running_id()}, branch: {branch()}")
+    for vid, v in st["versions"].items():
+        role = [r for r in ("current", "previous", "next") if st.get(r) == vid]
+        print(f"  {vid:22} {v['version']:8} {','.join(role) or '-'}{'  (did not confirm)' if v.get('failed') else ''}")
+    with Esp() as esp:
+        for f in sorted(glob.glob(f"{esp}/loader/entries/s15*.conf")):
+            print(f"  entry {os.path.basename(f)}: {read_entry(f).get('title', '')}")
+    efivars()
+    if os.path.exists(ONESHOT):
+        print("  next boot (one time): " + open(ONESHOT, "rb").read()[4:].decode("utf-16-le").rstrip("\0"))
+
+
+def main():
+    global PROGRESS, REPO
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--repo", default=REPO, help="checkout of this repository whose scripts adapt the new version")
+    p.add_argument("--progress", action="store_true", help="'NN%%' lines for Steam's updater")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("stage")
+    s.add_argument("--branch")
+    s.add_argument("--force", action="store_true", help="install the branch's image even if it is not newer")
+    s.add_argument("--keep", action="store_true", help="keep a failed version for inspection")
+    sub.add_parser("catchup")
+    s = sub.add_parser("confirm")
+    s.add_argument("--now", action="store_true")
+    sub.add_parser("rollback")
+    sub.add_parser("discard")
+    sub.add_parser("try")
+    sub.add_parser("staged")
+    s = sub.add_parser("check")
+    s.add_argument("--branch")
+    sub.add_parser("status")
+    a = p.parse_args()
+    PROGRESS, REPO = a.progress, os.path.realpath(a.repo)
+    if a.cmd == "stage":
+        for f in ("result", "progress"):
+            if os.path.exists(f"{RUN}/{f}"):
+                os.remove(f"{RUN}/{f}")
+        code, msg = 1, "failed"
+        try:
+            stage(a)
+            code, msg = 0, "staged: restart to switch to the new version"
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else 1
+            msg = {0: "staged", 7: "no update"}.get(code, "failed (journal or /var/log/s15-os-update.log)")
+            raise
+        finally:
+            os.makedirs(RUN, exist_ok=True)
+            with open(f"{RUN}/result", "w") as f:
+                json.dump({"code": code, "message": msg, "time": time.time()}, f)
+        return
+    {"staged": staged, "try": try_next, "stage": stage, "catchup": catchup, "confirm": confirm, "rollback": rollback, "discard": discard,
+     "check": check, "status": status}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

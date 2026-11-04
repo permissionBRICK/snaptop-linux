@@ -1,0 +1,8 @@
+[Unit]
+Description=Confirm a newly started SteamOS version 3 minutes after boot (docs/updates.md)
+
+[Timer]
+OnBootSec=3min
+
+[Install]
+WantedBy=timers.target

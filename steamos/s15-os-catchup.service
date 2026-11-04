@@ -1,0 +1,15 @@
+[Unit]
+Description=Copy the system state into the staged SteamOS version at shutdown (s15-os-update, docs/updates.md)
+DefaultDependencies=no
+Before=shutdown.target
+# any ordering against a unit that is being stopped makes that stop happen first: their state is final
+After=NetworkManager.service iwd.service bluetooth.service display-manager.service
+ConditionPathExists=/run/s15-os/catchup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s15-os-update catchup
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=shutdown.target

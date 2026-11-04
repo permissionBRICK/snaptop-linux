@@ -1,0 +1,7 @@
+[Unit]
+Description=Make a newly started SteamOS version the default (s15-os-update confirm, docs/updates.md)
+After=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s15-os-update confirm

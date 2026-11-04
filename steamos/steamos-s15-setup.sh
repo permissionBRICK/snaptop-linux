@@ -108,7 +108,7 @@ for u in steamvr-program-ble.service steamvr-v4l2loopback.service steamvr-set-ke
          deckard-power-monitor.service deckard-fpga-resume.service deckard-boot-images.service \
          adbd.service adbd-post.service usb-gadget.service usb-gadget.target usb-ncm-gadget@.service \
          usb-ncm-dnsmasq@.service steamos-boot.service efi.mount esp.mount home.mount persist.mount \
-         systemd-repart.service set-bluetooth-mac-address.service; do
+         systemd-repart.service set-bluetooth-mac-address.service swapfile.service home-swapfile.swap; do
   ln -sfn /dev/null "$R/etc/systemd/system/$u"
 done
 for u in steamvr.service steamvr-logs.service steamvr-proxmicmute.service steamvr-v4l2cam.service \
@@ -209,6 +209,8 @@ install -D -m0755 "$HERE/s15-luks-reseal" "$R/usr/local/sbin/s15-luks-reseal"
 install -D -m0644 "$HERE/s15-luks-reseal.service" "$R/etc/systemd/system/s15-luks-reseal.service"
 install -d "$R/etc/systemd/system/multi-user.target.wants"
 ln -sfn /etc/systemd/system/s15-luks-reseal.service "$R/etc/systemd/system/multi-user.target.wants/s15-luks-reseal.service"
+# SteamOS updates (docs/updates.md): s15-os-update, its units and the /etc keep list
+bash "$HERE/install-os-update.sh" "$R"
 install -D -m0755 "$HERE/s15-lid-wake" "$R/usr/lib/systemd/system-sleep/s15-lid-wake"
 echo aoss_cxsd_only > "$R/etc/modules-load.d/s15-aoss-cxsd-only.conf"   # x1e-sleep: avoid AOSD (hourly resets)
 install -d -o 1000 -g 1000 "$R/home/steamos/.config"
@@ -308,14 +310,17 @@ rm "$R/var/tmp/s15-install-camera.sh"
 chroot "$R" depmod "$KV"
 # From a live system, autodetect would look at the live kernel's view of the hardware; INITRAMFS_ALL_DRIVERS=1
 # (install.sh) builds this first image with all boot drivers instead. Later kernels (install-kernel.sh) use autodetect.
+# S15_SKIP_INITRAMFS=1: s15-os-update builds it later, after the kept /etc files (console keymap) are in place.
 C=/etc/mkinitcpio-s15.conf
-if [ "${INITRAMFS_ALL_DRIVERS:-0}" = 1 ]; then sed 's/ autodetect / /' "$R$C" > "$R/etc/mkinitcpio-s15-all.conf"; C=/etc/mkinitcpio-s15-all.conf; fi
-chroot "$R" mkinitcpio -c "$C" -k "$KV" -g "/boot/initramfs-s15.img" 2>&1 | grep -i -E "error|s15-dsp|image generation" | head -12 || true
-rm -f "$R/etc/mkinitcpio-s15-all.conf"
+if [ "${S15_SKIP_INITRAMFS:-0}" != 1 ]; then
+  if [ "${INITRAMFS_ALL_DRIVERS:-0}" = 1 ]; then sed 's/ autodetect / /' "$R$C" > "$R/etc/mkinitcpio-s15-all.conf"; C=/etc/mkinitcpio-s15-all.conf; fi
+  chroot "$R" mkinitcpio -c "$C" -k "$KV" -g "/boot/initramfs-s15.img" 2>&1 | grep -i -E "error|s15-dsp|image generation" | head -12 || true
+  rm -f "$R/etc/mkinitcpio-s15-all.conf"
+fi
 for m in run dev sys proc; do umount -R -l "$R/$m" || true; done
 # The Frame's deckard-uimage post hook wraps the image in a 64-byte U-Boot header and deletes the original.
 if [ -f "$R/boot/initrd.uImage" ] && [ ! -f "$R/boot/initramfs-s15.img" ]; then
   dd if="$R/boot/initrd.uImage" of="$R/boot/initramfs-s15.img" bs=64 skip=1 status=none
 fi
-ls -la "$R/boot/initramfs-s15.img"
+[ "${S15_SKIP_INITRAMFS:-0}" = 1 ] || ls -la "$R/boot/initramfs-s15.img"
 echo "SETUP DONE"

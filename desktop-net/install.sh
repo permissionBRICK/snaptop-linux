@@ -4,7 +4,7 @@
 set -euo pipefail
 P=$(realpath "${1:?package}")
 LIST=/var/lib/s15-desktop-net.files
-zstd -dc "$P" | tar -tf - | grep -v '/$' > "$LIST.new"
+zstd -dc "$P" | tar -tf - | { grep -v '/$' || true; } > "$LIST.new"
 zstd -dc "$P" | tar -xpf - -C / --no-same-owner
 mv "$LIST.new" "$LIST"; echo "installed $(wc -l < "$LIST") files (list: $LIST)"
 ldconfig
