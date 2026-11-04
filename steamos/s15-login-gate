@@ -1,0 +1,46 @@
+#!/bin/bash
+# Login gate for SDDM (docs/login.md). SteamOS logs in automatically at boot and after every end of a session. With a
+# login password only one automatic login stays: the one that finishes a switch between Game Mode and Desktop Mode.
+# steamos-manager starts such a switch by writing its one-time session file (zzt-*-temp-login.conf) and ending the
+# session; everything else (boot, logout, a crashed or killed session, a restarted SDDM) gets SDDM's login screen.
+#   arm     s15-login-gate.service, started by s15-login-gate.path when that file is written: records the switch if an
+#           unlocked graphical session is active on seat0 (the switch was asked for from inside it)
+#   check   pam_exec, first auth line of /etc/pam.d/sddm-autologin: lets the automatic login through once if a switch
+#           was recorded in the last 2 minutes; otherwise PAM fails and SDDM shows the login screen
+#   status  what is recorded
+set -euo pipefail
+TOKEN=/run/s15-login/switch
+MAXAGE=120
+log() { logger -t s15-login-gate -- "$*" 2>/dev/null || true; echo "$*"; }
+
+case "${1:-}" in
+  arm)
+    f=
+    for c in /etc/sddm.conf.d/zzt-steamos-temp-login.conf /etc/sddm.conf.d/zzt-holo-temp-login.conf; do
+      [ -f "$c" ] && [ $(( $(date +%s) - $(stat -c %Y "$c") )) -le 10 ] && f=$c
+    done
+    [ -n "$f" ] || exit 0   # removed or not just written: no switch
+    sid=
+    for s in $(loginctl list-sessions --no-legend | awk '{print $1}'); do
+      p=$(loginctl show-session "$s" -p Active -p LockedHint -p Seat -p Class -p Type 2>/dev/null) || continue
+      grep -qx 'Active=yes' <<< "$p" && grep -qx 'LockedHint=no' <<< "$p" && grep -qx 'Seat=seat0' <<< "$p" &&
+        grep -qx 'Class=user' <<< "$p" && grep -qE '^Type=(wayland|x11)$' <<< "$p" && { sid=$s; break; }
+    done
+    if [ -z "$sid" ]; then log "$f written, but no unlocked graphical session is active - not a switch"; exit 0; fi
+    install -d -m 0700 /run/s15-login
+    date +%s > "$TOKEN.tmp"; mv -f "$TOKEN.tmp" "$TOKEN"
+    log "session $sid switches mode ($f): the next automatic login is allowed"
+    ;;
+  check)
+    [ "${PAM_SERVICE:-}" = sddm-autologin ] || exit 1
+    [ -f "$TOKEN" ] && [ ! -L "$TOKEN" ] || { log "automatic login refused: no mode switch - login screen"; exit 1; }
+    age=$(( $(date +%s) - $(stat -c %Y "$TOKEN") )); rm -f "$TOKEN"
+    if [ "$age" -lt 0 ] || [ "$age" -gt "$MAXAGE" ]; then log "automatic login refused: switch $age s ago"; exit 1; fi
+    log "automatic login after a mode switch (${age} s)"
+    ;;
+  status)
+    grep -q 's15-login-gate check' /etc/pam.d/sddm-autologin 2>/dev/null && echo "gate: on" || echo "gate: off"
+    if [ -f "$TOKEN" ]; then echo "switch recorded $(( $(date +%s) - $(stat -c %Y "$TOKEN") )) s ago"; else echo "no switch recorded"; fi
+    ;;
+  *) echo "usage: $0 arm|check|status"; exit 2 ;;
+esac

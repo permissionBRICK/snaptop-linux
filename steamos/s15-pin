@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Login PIN for the login screen and Desktop Mode's lock screen (docs/login.md).
+
+The password field of SDDM's login screen and of Plasma's lock screen takes the PIN as well as the password. A short
+root service (s15-pin.socket, one s15-pin@.service per check) holds the PIN's hash and the lockout state; the PAM
+line in front of the password check (pam_exec, first auth line of /etc/pam.d/sddm and /etc/pam.d/kde) asks it.
+Only digits count as a PIN attempt (6-12 of them), so a password typed into the same field never uses up PIN tries.
+
+Lockout: after 5 wrong PINs the PIN is refused for 1 minute, after each further wrong one twice as long (up to
+60 minutes); after 15 wrong PINs it is off until a login with the password at the login screen (or s15-pin reset).
+A correct PIN or such a login resets the count. The state survives restarts. The password itself keeps its own
+lockout (pam_faillock) and is the only thing sudo and administrator prompts accept.
+
+The service answers a user process only about that user's own PIN (SO_PEERCRED), like unix_chkpwd does for the
+password; resets come only from root (the login screen's PAM stack).
+
+  s15-pin set [user]    (root) set or change the PIN, typed twice (default user: the SDDM user, steamos)
+  s15-pin clear [user]  (root) remove it; the fields take only the password again
+  s15-pin reset [user]  (root) clear the lockout
+  s15-pin status [user]
+  s15-pin pam           (pam_exec, auth: expose_authtok) succeeds if the typed value is the PIN
+  s15-pin pam-reset     (pam_exec, account phase of /etc/pam.d/sddm, root) a login succeeded: reset the count
+  s15-pin serve         (s15-pin@.service, Accept=yes socket) one request on stdin/stdout
+"""
+import fcntl
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import pwd
+import re
+import secrets
+import socket
+import struct
+import sys
+import time
+
+SOCK = "/run/s15-pin.sock"
+STATE = "/var/lib/s15-pin"
+PIN_RE = re.compile(r"[0-9]{6,12}")
+FREE_TRIES = 5          # wrong PINs before the first wait
+FIRST_WAIT = 60         # seconds, doubled for every further wrong PIN
+MAX_WAIT = 3600
+OFF_AFTER = 15          # wrong PINs until the PIN is off (until a password login or s15-pin reset)
+SCRYPT = {"n": 2 ** 15, "r": 8, "p": 1}   # about 0.1 s on the X1E
+
+
+def die(msg):
+    print(f"s15-pin: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def default_user():
+    for d in ("/etc/sddm.conf.d", "/usr/lib/sddm/sddm.conf.d"):
+        try:
+            for f in sorted(os.listdir(d), reverse=True):
+                for line in open(os.path.join(d, f), errors="replace"):
+                    if line.startswith("User=") and line.strip()[5:]:
+                        return line.strip()[5:]
+        except OSError:
+            pass
+    return "steamos"
+
+
+def path(user):
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user):
+        raise ValueError("bad user name")
+    return f"{STATE}/{user}.json"
+
+
+class Locked:
+    """The user's record under an exclusive lock (one check at a time per user)."""
+
+    def __init__(self, user):
+        self.p = path(user)
+
+    def __enter__(self):
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+        self.lk = open(f"{STATE}/.lock", "w")
+        fcntl.flock(self.lk, fcntl.LOCK_EX)
+        try:
+            self.rec = json.load(open(self.p))
+        except (OSError, ValueError):
+            self.rec = None
+        return self
+
+    def save(self):
+        tmp = self.p + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(self.rec, f)
+        os.replace(tmp, self.p)
+
+    def remove(self):
+        if os.path.exists(self.p):
+            os.remove(self.p)
+
+    def __exit__(self, *a):
+        self.lk.close()
+
+
+def digest(pin, salt, prm):
+    return hashlib.scrypt(pin.encode(), salt=bytes.fromhex(salt), n=prm["n"], r=prm["r"], p=prm["p"],
+                          maxmem=128 << 20).hex()
+
+
+def wait_left(rec, now):
+    return max(0, int(rec.get("until", 0) - now))
+
+
+def check(user, pin, now=None):
+    """'ok', 'no', 'wait <s>', 'off' or 'none' (no PIN set)."""
+    now = time.time() if now is None else now
+    with Locked(user) as s:
+        rec = s.rec
+        if not rec:
+            return "none"
+        if rec.get("off"):
+            return "off"
+        if wait_left(rec, now):
+            return f"wait {wait_left(rec, now)}"
+        if hmac.compare_digest(digest(pin, rec["salt"], rec["scrypt"]), rec["hash"]):
+            rec.update(fails=0, until=0)
+            s.save()
+            return "ok"
+        rec["fails"] = rec.get("fails", 0) + 1
+        if rec["fails"] >= OFF_AFTER:
+            rec["off"] = True
+        elif rec["fails"] >= FREE_TRIES:
+            rec["until"] = now + min(MAX_WAIT, FIRST_WAIT * 2 ** (rec["fails"] - FREE_TRIES))
+        s.save()
+        return "off" if rec.get("off") else "no"
+
+
+def reset(user):
+    with Locked(user) as s:
+        if s.rec and (s.rec.get("fails") or s.rec.get("off")):
+            s.rec.update(fails=0, until=0, off=False)
+            s.save()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# the service: one request per connection (systemd Accept=yes), "check <user>\n<pin>\n" or "reset <user>\n"
+
+def serve():
+    conn = socket.socket(fileno=0)
+    uid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+    conn.settimeout(5)
+    data = b""
+    try:   # "check" sends two lines, "reset" one
+        while len(data) < 256 and data.count(b"\n") < (2 if data.startswith(b"check ") else 1):
+            b = conn.recv(256)
+            if not b:
+                break
+            data += b
+    except OSError:
+        return
+    lines = data.decode(errors="replace").split("\n")
+    op, _, user = lines[0].partition(" ")
+    try:
+        target = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        conn.sendall(b"none\n")
+        return
+    if uid != 0 and uid != target:
+        conn.sendall(b"denied\n")
+        return
+    if op == "check" and len(lines) > 1 and PIN_RE.fullmatch(lines[1]):
+        r = check(user, lines[1])
+        if r not in ("ok", "none"):
+            print(f"PIN for {user} refused: {r}", file=sys.stderr)
+        conn.sendall(r.encode() + b"\n")
+    elif op == "reset" and uid == 0:
+        reset(user)
+        conn.sendall(b"ok\n")
+    else:
+        conn.sendall(b"denied\n")
+
+
+def ask(msg):
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(5)
+    c.connect(SOCK)
+    c.sendall(msg.encode())
+    return c.makefile().readline().strip()
+
+
+def pam():
+    """pam_exec with expose_authtok: the typed value on stdin. Exit 0 only for the right PIN."""
+    if os.environ.get("PAM_TYPE") != "auth":
+        return 1
+    user = os.environ.get("PAM_USER", "")
+    tok = sys.stdin.buffer.read(64).split(b"\0")[0].decode(errors="replace").strip("\n")
+    if not PIN_RE.fullmatch(tok):
+        return 1          # not a PIN: the password check behind this line decides
+    try:
+        return 0 if ask(f"check {user}\n{tok}\n") == "ok" else 1
+    except OSError:
+        return 1
+
+
+def pam_reset():
+    if os.environ.get("PAM_TYPE") == "account" and os.geteuid() == 0:
+        try:
+            ask(f"reset {os.environ.get('PAM_USER', '')}\n")
+        except OSError:
+            pass
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# administration (root)
+
+def need_root():
+    if os.geteuid():
+        die("run as root (sudo)")
+
+
+def cmd_set(user):
+    need_root()
+    pwd.getpwnam(user)
+    a = getpass.getpass(f"New PIN for {user} (6-12 digits): ")
+    if not PIN_RE.fullmatch(a):
+        die("a PIN is 6 to 12 digits")
+    if len(set(a)) == 1 or a in "0123456789012" or a in "9876543210987":
+        die("too simple (all the same digit, or counting up or down)")
+    if getpass.getpass("Again: ") != a:
+        die("the two PINs differ")
+    salt = secrets.token_hex(16)
+    with Locked(user) as s:
+        s.rec = {"salt": salt, "scrypt": SCRYPT, "hash": digest(a, salt, SCRYPT), "fails": 0, "until": 0,
+                 "off": False, "set": int(time.time())}
+        s.save()
+    print(f"PIN set for {user}: the login screen and the lock screen take it from now on")
+
+
+def cmd_clear(user):
+    need_root()
+    with Locked(user) as s:
+        s.remove()
+    print(f"PIN for {user} removed")
+
+
+def cmd_reset(user):
+    need_root()
+    reset(user)
+    print(f"PIN lockout for {user} cleared")
+
+
+def cmd_status(user):
+    try:
+        rec = json.load(open(path(user)))
+    except PermissionError:
+        die("run as root (sudo)")
+    except (OSError, ValueError):
+        print(f"{user}: no PIN")
+        return
+    now = time.time()
+    state = "off (log in with the password)" if rec.get("off") else \
+        f"refused for {wait_left(rec, now)} s more" if wait_left(rec, now) else "usable"
+    print(f"{user}: PIN set {time.strftime('%Y-%m-%d', time.localtime(rec.get('set', 0)))}, {state}, "
+          f"wrong PINs since the last success: {rec.get('fails', 0)}")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        print(__doc__)
+        return 2
+    op, user = a[0], (a[1] if len(a) > 1 else None)
+    if op == "pam":
+        return pam()
+    if op == "pam-reset":
+        return pam_reset()
+    if op == "serve":
+        serve()
+        return 0
+    cmds = {"set": cmd_set, "clear": cmd_clear, "reset": cmd_reset, "status": cmd_status}
+    if op not in cmds:
+        print(__doc__)
+        return 2
+    cmds[op](user or default_user())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

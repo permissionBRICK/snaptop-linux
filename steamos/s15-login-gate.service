@@ -1,0 +1,7 @@
+[Unit]
+Description=Allow one automatic login for a Game Mode/Desktop Mode switch
+Documentation=file:///usr/local/sbin/s15-login-gate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s15-login-gate arm

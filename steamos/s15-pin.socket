@@ -1,0 +1,11 @@
+[Unit]
+Description=Login PIN check (s15-pin, docs/login.md)
+
+[Socket]
+ListenStream=/run/s15-pin.sock
+SocketMode=0666
+Accept=yes
+MaxConnections=16
+
+[Install]
+WantedBy=sockets.target

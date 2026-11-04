@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for switches between Game Mode and Desktop Mode (one automatic login each, docs/login.md)
+
+[Path]
+# steamos-manager writes one of these right before it ends the session for a switch (older and newer naming)
+PathChanged=/etc/sddm.conf.d/zzt-steamos-temp-login.conf
+PathChanged=/etc/sddm.conf.d/zzt-holo-temp-login.conf
+Unit=s15-login-gate.service
+
+[Install]
+WantedBy=paths.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Login PIN check (s15-pin, docs/login.md)
+
+[Service]
+ExecStart=/usr/local/sbin/s15-pin serve
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+TimeoutStartSec=10
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/s15-pin
+StateDirectory=s15-pin
+StateDirectoryMode=0700
