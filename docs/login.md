@@ -5,9 +5,9 @@ SteamOS logs in automatically: at boot, after a logout, and whenever a session e
 the laptop has the data. `steamos/login-lock.sh` puts a password in front of it, as Windows does after BitLocker's
 TPM unlock.
 
-> **State 2026-11-04:** tested on the laptop: login screen at boot, both mode switches without it, the lock screen
-> (Meta+L, unlock with the password), the boot hardening (TPM unlock on the normal path, PCR 15 measured). The PIN
-> is installed; its test with a real PIN is pending.
+> **State 2026-11-04:** tested on the laptop with SteamOS 0.5.3 and 0.5.7: login screen at boot, both mode switches
+> without it, the lock screen (Meta+L; unlock with password or PIN), the PIN lockout, the boot hardening (TPM unlock
+> on the normal path, PCR 15 measured, a second unseal refused), speaker sound across mode switches.
 
 ## Setting it up
 

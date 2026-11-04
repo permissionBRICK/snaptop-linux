@@ -4,10 +4,12 @@
 partition, adapts it to the laptop and switches to it at the next restart. The external setup (Windows, BIOS,
 partitions, encryption, `S15BOOT`, the firmware boot entry) stays as it is.
 
-> **State 2026-11-04:** tested on a VM against Valve's servers (server query, bundle signature, delta download,
-> Valve's state carry-over rules, boot-entry rotation for confirm and rollback) and on the laptop: installed, Steam's
-> check through the hook, staging 0.5.3 -> 0.5.7 started from the hook. The first switch to a new version on the
-> laptop is still to come.
+> **State 2026-11-04:** tested on the laptop: 0.5.3 -> 0.5.7 staged from Steam's hook (15 minutes, a full 4.3 GB
+> download because the first update has no seed), restart into it, TPM unlock, confirm after 3 minutes; 0.5.3 stays
+> as the previous system. Rollback was tested on a VM (boot-entry rotation), not yet on the laptop. Found and fixed
+> on the way: the relay/VPN files and links to units enabled in the old image layer were not carried over (now:
+> `/etc/openvpn` on the keep list, enabled units kept, own files via `/etc/atomic-update.conf.d/`), and 0.5.7's
+> hibernation swap file fails on btrfs (masked).
 
 ## Why not Valve's updater
 
