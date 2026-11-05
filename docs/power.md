@@ -56,21 +56,36 @@ Open leads for the floor:
 - Keyboard backlight was at level 1 during the test.
 - Windows reaches about 0.5 W screen-off idle on this platform.
 
-## Screen-on idle on SteamOS 0.5.7 (2026-11-05)
+## Idle on SteamOS 0.5.7 (2026-11-05)
 
-In use (Desktop Mode, Steam client, Firefox, Obsidian open; 25 % brightness, 60 Hz, keyboard light at level 1,
-Wi-Fi power save on) the battery reported 6.3 W, and Plasma estimated about 9 hours. The CPU side is idle: 0.7 % busy,
-nearly all CPU time in the deepest core idle state, clusters entering their idle states, GPU at 300 MHz. Found:
+On battery, nothing on USB, Wi-Fi connected, Desktop Mode untouched, 25 % brightness, 60 Hz; `s15-powerlog` every
+5 s, 5 min per phase (first 45 s dropped), screen kept on by `kde-inhibit`:
 
-- The keyboard light was on (0.8 W at level 1 in the screen-off A/B above). Windows (ASUS's software) turns it off
-  after a few seconds without typing on battery; `s15-kbd-idle` now does the same (30 s, [steamos.md](steamos.md#keyboard-colour)).
-- The memory bus vote is about 4.9 GB/s average (`interconnect_summary`, `ebi`), 3.2 GB/s of it from the four USB
-  controllers (1 GB/s each on three of them), which hold their votes because runtime PM is off while awake
-  (`s15-usb-sleep`, above). The display needs about 1.6 GB/s. A lower vote lets the DDR clock drop.
-- The panel supports Panel Self Refresh (DPCD `0x070` = `01`, PSR1, on `drm_dp_aux` of `aea0000`, the eDP
-  controller). msm has PSR behind `msm.psr_enabled=1` (off by default, read at module load). Not tried yet; with a
-  static image it lets the display controller and the eDP link idle, as Windows does.
-- CPU clocks: at idle a cap changes nothing (the cores sleep); under light load it might. Not measured yet.
+| Phase | Power |
+|---|---|
+| baseline (Steam client running, keyboard light off) | 5.16 W |
+| keyboard light at level 1 (white) | 7.09 W (**+1.9 W**) |
+| CPU clocks capped at 1.92 GHz | 5.13 W (no change: the cores idle at 710-998 MHz anyway) |
+| baseline again | 5.11 W |
+
+Screen off (a second run, 4 min each): 1.43 W with the Steam client running, 1.37 W after closing it (-0.06 W).
+
+- 5.1 W is about 11 h on the 56 Wh the battery holds now. The 6.3 W measured in use earlier that day (Plasma estimated
+  9 h) had the keyboard light on: it costs almost 2 W with the screen on, more than the 0.8 W of the screen-off test
+  above. `s15-kbd-idle` turns it off after 30 s without input on battery ([steamos.md](steamos.md#keyboard-colour)),
+  as ASUS's software does on Windows. White lights all three LED colours; a single colour should cost less.
+- A CPU cap does not help at idle; it could only matter under load.
+- Screen content matters on the OLED panel: the plain desktop (Meta+D) drew 4.1 W against 5.1 W with the windows open
+  in the first run (same brightness, no Steam client).
+- USB runtime PM while awake (plain desktop, 4 min each): 4.09 W always on, 3.99 W with the four controllers and
+  their xHCI hosts on `auto` (all suspended after their 5 s autosuspend delay; the memory bus average vote fell from
+  4.85 to 1.61 GB/s, 3.2 GB/s of it the controllers' own), 4.10 W on again. So about -0.1 W with the screen on
+  (-0.3 W screen off, above), and still blocked by the missing wakeup on plug-in (`s15-usb-sleep`).
+- Panel Self Refresh: the panel supports PSR1 (DPCD `0x070` = `01`, eDP controller `aea0000`) and msm has it behind
+  `msm.psr_enabled=1` (`/etc/modprobe.d`: msm is blacklisted in the initramfs and loads from the system on a TPM
+  boot). Tried 2026-11-05: the login screen flashed on and off, the desktop showed once or twice and then stayed
+  black; the kernel logged "driver disabled vblank in self-refresh" with a warning trace as soon as
+  `self_refresh_active=1`. Not usable in msm on 7.3; the option was removed.
 
 ## Battery charge limit
 
