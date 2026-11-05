@@ -145,4 +145,32 @@ Type=Application
 StartupNotify=false
 EOF2
 chmod 0755 "$D/Return.desktop" "$D/WiFi.desktop"; chown -R 1000:1000 "$D" 2>/dev/null || true
+# Battery and Bluetooth stay visible in the system tray. Both hide themselves in the tray's overflow when they have
+# nothing to report: on AC with the battery not charging (the normal state with a charge limit), no Bluetooth device
+# connected. A Plasma update script runs once per user at the next Plasma start (also after a new user's default
+# panel is created); a later change in the tray settings stays.
+U="$R/usr/share/plasma/shells/org.kde.plasma.desktop/contents/updates"
+install -d "$U"
+cat > "$U/s15-systray-always-shown.js" <<'EOF3'
+// snaptop-linux: show Power and Battery and Bluetooth always in the system tray (docs/steamos.md)
+const always = ["org.kde.plasma.battery", "org.kde.plasma.bluetooth"];
+const asList = v => Array.isArray(v) ? v : (v ? String(v).split(",").filter(s => s.length) : []);
+function showAlways(obj) {
+    obj.currentConfigGroup = ["General"];
+    const shown = asList(obj.readConfig("shownItems", []));
+    const hidden = asList(obj.readConfig("hiddenItems", [])).filter(i => !always.includes(i));
+    for (const i of always) if (!shown.includes(i)) shown.push(i);
+    obj.writeConfig("shownItems", shown);
+    obj.writeConfig("hiddenItems", hidden);
+    obj.reloadConfig();
+}
+for (const cont of desktops().concat(panels())) {
+    for (const systray of cont.widgets("org.kde.plasma.systemtray")) {
+        // Plasma 6.6 keeps the tray's item lists in the widget's own General group; older versions in an inner
+        // containment (SystrayContainmentId)
+        const inner = desktopById(Number(systray.readConfig("SystrayContainmentId", 0)));
+        showAlways(inner || systray);
+    }
+}
+EOF3
 echo "desktop mode adapted in $R"

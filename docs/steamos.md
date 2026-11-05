@@ -176,6 +176,12 @@ on the laptop just bounced back to Game Mode, and later showed a black screen wi
   sudo desktop-net/uninstall.sh                           # removes exactly the installed files
   ```
 
+- **Battery and Bluetooth always in the tray:** both applets hide themselves in the tray's overflow when they have
+  nothing to report (on AC with the battery not charging, the normal state with a charge limit; no Bluetooth device
+  connected). A Plasma update script (`s15-systray-always-shown.js`, run once per user at the next Plasma start, also
+  for a new user's default panel) sets them to "Always shown"; a later change in the tray settings stays. Plasma 6.6
+  keeps the tray's item lists in the tray widget's own `General` group, older versions in an inner containment; the
+  script handles both.
 - **OpenVPN connections:** the image has no `openvpn` and no OpenVPN plugin for NetworkManager, so NetworkManager
   reports missing support for OpenVPN connections, even where Plasma's OpenVPN editor is present.
   `steamos/install-nm-openvpn.sh` (run by the setup, so by `install.sh` and for every update) installs `openvpn` from
