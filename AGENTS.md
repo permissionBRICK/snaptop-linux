@@ -23,7 +23,7 @@ what you are about to do before anything that writes to disk, and report results
   `(Get-Disk -Number <n>).LargestFreeExtent` shows the free space (at least 64 GB). Then the user changes the BIOS
   (Secure Boot off, Fast Boot off) and boots a live ARM64 Linux from USB (docs/live-system.md).
 - **In the live Linux** (normal case): `uname -m` is `aarch64`, `/sys/firmware/devicetree/base/model` names the
-  Vivobook S 15. You need network (`nmcli device wifi connect <ssid> --ask`, or USB Ethernet on the *right* USB-C
+  Vivobook S 15. You need network (`nmcli device wifi connect <ssid> --ask`, or USB Ethernet on a USB-C
   port) and root (`sudo`; on Ubuntu's live session it needs no password).
 - **In the installed SteamOS**: user `steamos`, Desktop Mode by default; for later kernels see docs/steamos.md.
 
