@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Give SteamOS Windows' Bluetooth pairing keys, so a device works in both systems (docs/steamos.md, "Bluetooth
+devices in both systems").
+
+A device keeps one key per host address; Windows and SteamOS share the laptop's address, so the last pairing wins.
+Pair the device in SteamOS, then in Windows, run windows\\Export-BluetoothKeys.ps1 there (it writes
+s15-bt-keys.reg onto S15BOOT), start SteamOS and run this as root. It writes Windows' keys into SteamOS's existing
+pairing of the same device (BlueZ, /var/lib/bluetooth/<adapter>/<device>/info), restarts bluetoothd and deletes the
+file. Devices that are not paired in SteamOS are only listed; an LE device that took a new address when it was
+paired in Windows (Logitech: the last byte counts up) has its SteamOS pairing moved to that address. bluetoothd is
+stopped while the files change; a copy of /var/lib/bluetooth is kept in /var/lib/s15-bt-backup/ first. Keys are never
+printed. LE devices also need Bluetooth privacy off (Privacy = off in /etc/bluetooth/main.conf, set by the setup): they
+reconnect by directed advertising to the laptop's real address, as Windows uses it.
+
+  s15-bt-import [--dry-run] [--keep-file] [file]     (default: s15-bt-keys.reg on S15BOOT)
+
+Mapping (Windows registry -> BlueZ):
+  classic   Keys\\<adapter> "<device>"=hex:16 bytes      -> [LinkKey] Key (same byte order)
+  LE        Keys\\<adapter>\\<device> LTK                -> [PeripheralLongTermKey] + [SlaveLongTermKey] Key for LE
+                                                            Secure Connections (EDIV, ERand 0), else [LongTermKey]
+            KeyLength (dword) / EDIV (dword)            -> EncSize / EDiv (decimal)
+            ERand (hex(b): 8 bytes, little endian)       -> Rand (decimal)
+            IRK                                          -> [IdentityResolvingKey] Key if SteamOS has none or the
+                                                            pairing moved; else it must match (the device's own key)
+"""
+import configparser
+import datetime
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+BT = "/var/lib/bluetooth"
+BACKUP = "/var/lib/s15-bt-backup"
+ESP = "/dev/disk/by-partlabel/S15BOOT"
+NAME = "s15-bt-keys.reg"
+MAC12 = re.compile(r"[0-9a-f]{12}")
+
+
+def mac(m12):
+    return ":".join(m12[i:i + 2] for i in range(0, 12, 2)).upper()
+
+
+def hexbytes(v):
+    """'hex:aa,bb,...' / 'hex(b):...' -> bytes"""
+    return bytes(int(b, 16) for b in v.split(":", 1)[1].split(",") if b)
+
+
+def parse_reg(raw):
+    """{adapter: {"classic": {dev: bytes}, "le": {dev: {name: value}}}} from a `reg export` file."""
+    text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8-sig")
+    text = re.sub(r"\\\r?\n\s*", "", text)          # continued lines
+    out, cur = {}, None
+    for line in text.splitlines():
+        line = line.strip()
+        m = re.match(r"^\[.*\\Keys\\([0-9a-f]{12})(?:\\([0-9a-f]{12}))?\]$", line, re.I)
+        if m:
+            a, d = m.group(1).lower(), (m.group(2) or "").lower()
+            out.setdefault(a, {"classic": {}, "le": {}})
+            cur = (a, d)
+            if d:
+                out[a]["le"].setdefault(d, {})
+            continue
+        if line.startswith("["):
+            cur = None
+            continue
+        m = re.match(r'^"([^"]+)"=(.*)$', line)
+        if not m or not cur:
+            continue
+        name, val = m.group(1), m.group(2)
+        a, d = cur
+        if not d and MAC12.fullmatch(name.lower()) and val.startswith("hex:"):
+            out[a]["classic"][name.lower()] = hexbytes(val)
+        elif d:
+            if val.startswith("dword:"):
+                out[a]["le"][d][name] = int(val[6:], 16)
+            elif val.startswith("hex"):
+                out[a]["le"][d][name] = hexbytes(val)
+    return out
+
+
+def load(path):
+    c = configparser.RawConfigParser(delimiters=("=",), strict=False, interpolation=None)
+    c.optionxform = str
+    c.read(path)
+    return c
+
+
+def save(c, path):
+    buf = io.StringIO()
+    c.write(buf, space_around_delimiters=False)
+    tmp = path + ".s15tmp"
+    with open(tmp, "w") as f:
+        f.write(buf.getvalue().rstrip("\n") + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def setv(c, sec, key, val):
+    if not c.has_section(sec):
+        c.add_section(sec)
+    c.set(sec, key, val)
+
+
+LTK_GROUPS = ("LongTermKey", "PeripheralLongTermKey", "SlaveLongTermKey")
+
+
+def is_le(c):
+    return "LE" in c.get("General", "SupportedTechnologies", fallback="") or \
+        any(c.has_section(g) for g in LTK_GROUPS)
+
+
+def set_le_keys(c, keys):
+    """Windows' LE bond into BlueZ's layout. BlueZ keeps an LE Secure Connections key (EDIV and Rand 0) as
+    [PeripheralLongTermKey] + [SlaveLongTermKey] (the same key for both roles), a legacy key from the device as
+    [LongTermKey]. Older LTK sections go: a stale key matching first would break the encryption."""
+    er = keys.get("ERand", b"")
+    rand = int.from_bytes(er, "little") if isinstance(er, bytes) else int(er)
+    ediv = keys.get("EDIV", 0)
+    sc = ediv == 0 and rand == 0
+    # Authenticated (MITM-protected) is what the pairing achieved; Windows' AuthReq is only what was asked for. Keep
+    # SteamOS's value from its pairing of the same device (same method), else assume unauthenticated (Just Works).
+    prev = [int(c.get(g, "Authenticated", fallback="-1")) for g in LTK_GROUPS if c.has_section(g)]
+    prev = [v for v in prev if (v >= 2) == sc and v in (0, 1, 2, 3)]
+    auth = prev[0] if prev else (2 if sc else 0)
+    for g in LTK_GROUPS:
+        c.remove_section(g)
+    for g in (("PeripheralLongTermKey", "SlaveLongTermKey") if sc else ("LongTermKey",)):
+        for k, v in (("Key", keys["LTK"].hex().upper()), ("Authenticated", str(auth)),
+                     ("EncSize", str(keys.get("KeyLength", 16))), ("EDiv", str(ediv)), ("Rand", str(rand))):
+            setv(c, g, k, v)
+
+
+def main():
+    a = sys.argv[1:]
+    dry, keep = "--dry-run" in a, "--keep-file" in a
+    files = [x for x in a if not x.startswith("--")]
+    if os.geteuid():
+        sys.exit("s15-bt-import: run as root (sudo)")
+    mnt = None
+    try:
+        if files:
+            path = files[0]
+        else:
+            mnt = tempfile.mkdtemp(prefix="s15-bt-")
+            subprocess.run(["mount", ESP, mnt], check=True)
+            path = os.path.join(mnt, NAME)
+        if not os.path.exists(path):
+            sys.exit(f"s15-bt-import: {path} not found (run windows\\Export-BluetoothKeys.ps1 in Windows first)")
+        reg = parse_reg(open(path, "rb").read())
+        plan = []          # (adapter, device, config, old device address or None)
+        local = {d.lower().replace(":", "") for d in os.listdir(BT) if re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", d)}
+        for ad, devs in sorted(reg.items()):
+            if ad not in local:
+                print(f"adapter {mac(ad)} (Windows) is not this system's adapter ({', '.join(map(mac, local))}): skipped")
+                continue
+            A = f"{BT}/{mac(ad)}"
+            mine = [d for d in os.listdir(A) if re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", d)
+                    and os.path.exists(f"{A}/{d}/info")]
+            win = {mac(d) for d in list(devs["classic"]) + list(devs["le"])}
+            items = [(d, "classic", k) for d, k in devs["classic"].items()] + \
+                    [(d, "LE", v) for d, v in devs["le"].items()]
+            for dev, kind, keys in sorted(items):
+                D, old, note = mac(dev), None, ""
+                if D not in mine and kind == "LE":
+                    # Some devices (Logitech) take a new address with every pairing, counting up the last byte:
+                    # one LE pairing in SteamOS that differs only there and is not in Windows is the same device.
+                    cand = [d for d in mine if d[:14] == D[:14] and d not in win and is_le(load(f"{A}/{d}/info"))]
+                    if len(cand) == 1:
+                        old = cand[0]
+                        note = f", moved from {old} (the device took a new address when it was paired in Windows)"
+                if D not in mine and not old:
+                    print(f"  {D}  {kind:7}  not paired in SteamOS: pair it there once, then again in Windows, "
+                          "export and import")
+                    continue
+                c = load(f"{A}/{old or D}/info")
+                name = c.get("General", "Name", fallback="?")
+                before = {s: dict(c.items(s)) for s in c.sections()}
+                if kind == "classic":
+                    setv(c, "LinkKey", "Key", keys.hex().upper())
+                    if not c.has_option("LinkKey", "Type"):
+                        setv(c, "LinkKey", "Type", "4")
+                    if not c.has_option("LinkKey", "PINLength"):
+                        setv(c, "LinkKey", "PINLength", "0")
+                else:
+                    if "LTK" not in keys:
+                        print(f"  {D}  LE       {name}: no LTK in Windows' entry, skipped")
+                        continue
+                    set_le_keys(c, keys)
+                    irk = keys.get("IRK")
+                    have = c.get("IdentityResolvingKey", "Key", fallback="")
+                    if irk and (old or not have):
+                        setv(c, "IdentityResolvingKey", "Key", irk.hex().upper())   # a new identity comes with it
+                    elif irk and have.upper() == irk.hex().upper():
+                        note += ", device identity key matches"
+                    elif irk and have.upper() == irk[::-1].hex().upper():
+                        note += ", device identity key matches (reversed in Windows)"
+                    elif irk:
+                        note += ", WARNING: device identity key differs from SteamOS's (left as it is)"
+                if not old and {s: dict(c.items(s)) for s in c.sections()} == before:
+                    print(f"  {D}  {kind:7}  {name}: already the same keys")
+                    continue
+                plan.append((A, D, c, old))
+                print(f"  {D}  {kind:7}  {name}: {'would take' if dry else 'takes'} Windows' keys{note}")
+        if not plan:
+            print("nothing to change")
+        elif not dry:
+            dst = f"{BACKUP}/{datetime.datetime.now():%Y%m%d-%H%M%S}"
+            os.makedirs(BACKUP, mode=0o700, exist_ok=True)
+            shutil.copytree(BT, dst, symlinks=True)
+            print(f"backup of {BT}: {dst}")
+            # bluetoothd writes these files itself; it must not run while they change
+            subprocess.run(["systemctl", "stop", "bluetooth.service"], check=False)
+            try:
+                for A, D, c, old in plan:
+                    if old:
+                        shutil.copytree(f"{A}/{old}", f"{A}/{D}", symlinks=True)
+                        shutil.rmtree(f"{A}/{old}")
+                        if os.path.exists(f"{A}/cache/{old}"):
+                            os.replace(f"{A}/cache/{old}", f"{A}/cache/{D}")
+                    save(c, f"{A}/{D}/info")
+            finally:
+                subprocess.run(["systemctl", "start", "bluetooth.service"], check=False)
+            print(f"{len(plan)} device(s) updated, bluetoothd restarted")
+        if not dry and not keep:
+            os.remove(path)
+            print(f"{path} deleted")
+    finally:
+        if mnt:
+            subprocess.run(["umount", mnt], check=False)
+            os.rmdir(mnt)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

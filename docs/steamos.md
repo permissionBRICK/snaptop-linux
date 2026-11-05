@@ -226,6 +226,33 @@ measurements change and Windows asks for the recovery key.
 - EFI variables on X1E go through the TrustZone app `uefisecapp` (the S15 is on the kernel's allowlist). Linux
   registers them some seconds after boot, after systemd has mounted `efivarfs`; remount it before `efibootmgr`.
 
+## Bluetooth devices in both systems
+
+A Bluetooth device keeps one pairing key per host address, and Windows and SteamOS share the laptop's address, so
+pairing in one system breaks the pairing in the other. Giving SteamOS Windows' keys makes one pairing serve both:
+
+1. Pair the device in SteamOS, then in Windows (the device keeps the last one).
+2. In Windows, in an elevated PowerShell: `windows\Export-BluetoothKeys.ps1`. Windows keeps the keys in a registry
+   branch only SYSTEM can read; the script exports it through a short-lived SYSTEM task to `s15-bt-keys.reg` on
+   `S15BOOT`, the partition both systems read (unencrypted until the import deletes it).
+3. In SteamOS: `sudo s15-bt-import` (`--dry-run` first shows what it would change). It writes Windows' keys into
+   SteamOS's pairing of each device (BlueZ, `/var/lib/bluetooth/<adapter>/<device>/info`), with bluetoothd stopped
+   and a copy of `/var/lib/bluetooth` in `/var/lib/s15-bt-backup/`, and deletes the file. Devices paired only in
+   Windows are listed, not added.
+
+Details:
+- Classic devices (headsets): the link key is copied as is. LE devices (mice, presenters): Windows' `LTK`,
+  `KeyLength`, `EDIV` and `ERand` (8 bytes, little endian) become BlueZ's LE Secure Connections key
+  (`[PeripheralLongTermKey]`/`[SlaveLongTermKey]`, as BlueZ stores it) or, for legacy pairing, `[LongTermKey]`.
+  Tested 2026-11-05 with an OpenRun Pro 2 headset and a Logi M650 L mouse.
+- Logitech devices take a new address with every pairing (the last byte counts up). An LE pairing in SteamOS that
+  differs only there, and is not one of Windows' devices, is moved to the new address.
+- Bluetooth LE privacy is off (`Privacy = off` in `/etc/bluetooth/main.conf`, set by the setup; SteamOS's image has
+  `device`). An LE device paired in Windows reconnects by directed advertising to the laptop's real address, as
+  Windows uses it; with SteamOS's rotating private address the controller ignored it and the mouse never
+  reconnected. The laptop is then as visible to other Bluetooth devices as it is in Windows.
+- Re-pairing a device later in either system starts over: pair in Windows last, export, import.
+
 ## Switching between Windows and SteamOS
 
 Both directions only set the firmware's one-time boot entry (UEFI `BootNext`) and restart, so Windows stays the

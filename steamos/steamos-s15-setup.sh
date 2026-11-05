@@ -187,6 +187,11 @@ R="$R" bash "$HERE/steamos-s15-desktop.sh"
 say "standby: send EC dark wakes back to sleep; Plasma suspends after 15 min idle on battery"
 install -D -m0755 "$HERE/s15-ec-darkwake" "$R/usr/lib/systemd/system-sleep/s15-ec-darkwake"
 install -D -m0755 "$HERE/s15-sleep-radios" "$R/usr/lib/systemd/system-sleep/s15-sleep-radios"
+# Bluetooth pairings shared with Windows (docs/steamos.md): takes the keys windows\Export-BluetoothKeys.ps1 wrote
+install -D -m0755 "$HERE/s15-bt-import" "$R/usr/local/sbin/s15-bt-import"
+# Bluetooth LE privacy off, as in Windows: an LE device paired in Windows reconnects by directed advertising to the
+# laptop's real address, which the controller ignores while SteamOS uses a rotating private one (Privacy = device).
+[ ! -f "$R/etc/bluetooth/main.conf" ] || sed -i 's/^Privacy = .*/Privacy = off/' "$R/etc/bluetooth/main.conf"
 install -D -m0755 "$HERE/s15-sync-state" "$R/usr/lib/systemd/system-sleep/s15-sync-state"     # instead of fw_devlink.sync_state=timeout
 install -D -m0755 "$HERE/s15-wifi-resume" "$R/usr/lib/systemd/system-sleep/s15-wifi-resume"
 install -D -m0755 "$HERE/s15-input-wait" "$R/usr/local/bin/s15-input-wait"          # used by s15-ec-darkwake

@@ -92,7 +92,7 @@ cd snaptop-linux && claude "Read AGENTS.md and install SteamOS on this laptop."
 
 ```
 install.sh    one-shot installer (run in the live system)
-windows/      Prepare-S15.ps1 (BitLocker, partition, firmware export), reboot-to-SteamOS shortcut
+windows/      Prepare-S15.ps1 (BitLocker, partition, firmware export), reboot-to-SteamOS shortcut, Bluetooth key export
 steamos/      image download, firmware/UCM fetch, SteamOS adaptations, boot partition, standby/Wi-Fi/input helpers
 kernel/       build.sh (native or cross), config, our patches
 desktop-net/  Plasma Wi-Fi/Bluetooth applets built against the image
