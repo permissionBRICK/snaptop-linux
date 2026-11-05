@@ -85,7 +85,14 @@ Screen off (a second run, 4 min each): 1.43 W with the Steam client running, 1.3
   `msm.psr_enabled=1` (`/etc/modprobe.d`: msm is blacklisted in the initramfs and loads from the system on a TPM
   boot). Tried 2026-11-05: the login screen flashed on and off, the desktop showed once or twice and then stayed
   black; the kernel logged "driver disabled vblank in self-refresh" with a warning trace as soon as
-  `self_refresh_active=1`. Not usable in msm on 7.3; the option was removed.
+  `self_refresh_active=1`. On a second boot the screen showed a frame on every change and went black when idle.
+  While black, the panel (Samsung ATNA56AC03, DT-compatible with the ATNA33XC20 of the sc7280 Chromebooks msm's PSR
+  was written for) reported PSR status `0x2008` = 0 (inactive) and no error (`0x2006`/`0x2007` = 0), with
+  `DP_PSR_EN_CFG` (`0x170`) = 1, `SET_POWER` D0 and the backlight unchanged; the driver logged no PSR timeout. So
+  the source turns the link off but the panel never enters PSR: the PSR-enter VSC SDP does not reach it or is not
+  accepted, probably a difference of the X1E DP controller. Parked; a first test would keep the main link on during
+  PSR (`0x170` bit 1) to see whether the panel enters PSR at all. Also note: the panel asks for link training on
+  PSR exit (`0x071` bit 0 = 0), which msm does not do.
 
 ## Battery charge limit
 
