@@ -54,7 +54,7 @@ ESP_DEV = "/dev/disk/by-partlabel/S15BOOT"
 KEEP_S15 = "/etc/atomic-update.conf.d/s15.conf"
 # /var paths that belong to the image, not to the state (Valve's holo-sync-var excludes, plus ours)
 VAR_EXCLUDES = ["/boot/", "/lib/dkms/", "/lib/modules/", "/lib/pacman/", "/lib/NetworkManager/", "/lost+found/",
-                "/lib/overlays/etc/", "/lib/s15-desktop-net.files"]
+                "/lib/overlays/etc/", "/lib/s15-desktop-net.files", "/lib/s15-nm-openvpn.*"]
 UPPER = "var/lib/overlays/etc/upper"
 FREE_MIN = 30 << 30             # bytes free on the partition before staging (image + version + headroom)
 LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
@@ -613,6 +613,8 @@ def verify_version(root, kv):
     need(os.path.getsize(f"{root}/boot/initramfs-s15.img") > 5 << 20 if os.path.exists(f"{root}/boot/initramfs-s15.img") else False, "initramfs")
     need(os.path.exists(f"{root}/usr/lib/firmware/qcom/x1e80100/ASUSTeK/vivobook-s15/qcadsp8380.mbn"), "ASUS firmware")
     need(os.path.exists(f"{root}/usr/share/alsa/ucm2/Qualcomm/x1e80100/ASUS-Vivobook-S15.conf"), "S15 UCM profile")
+    need(os.path.exists(f"{root}/usr/lib/NetworkManager/VPN/nm-openvpn-service.name")
+         and os.path.exists(f"{root}/usr/bin/openvpn"), "OpenVPN for NetworkManager")
     need(has("/usr/lib/steamos/gamescope-session", "--backend drm"), "gamescope DRM backend")
     need(os.path.islink(f"{root}/etc/systemd/system/steamos-boot.service"), "Frame units masked")
     need(os.path.exists(f"{root}/usr/local/sbin/s15-luks-reseal"), "s15-luks-reseal")

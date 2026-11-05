@@ -307,6 +307,10 @@ say "camera libraries and PipeWire plugin"
 install -m0755 "$HERE/install-camera.sh" "$R/var/tmp/s15-install-camera.sh"
 chroot "$R" bash /var/tmp/s15-install-camera.sh
 rm "$R/var/tmp/s15-install-camera.sh"
+say "OpenVPN for NetworkManager"
+install -m0755 "$HERE/install-nm-openvpn.sh" "$R/var/tmp/s15-install-nm-openvpn.sh"
+chroot "$R" bash /var/tmp/s15-install-nm-openvpn.sh
+rm "$R/var/tmp/s15-install-nm-openvpn.sh"
 chroot "$R" depmod "$KV"
 # From a live system, autodetect would look at the live kernel's view of the hardware; INITRAMFS_ALL_DRIVERS=1
 # (install.sh) builds this first image with all boot drivers instead. Later kernels (install-kernel.sh) use autodetect.

@@ -79,13 +79,14 @@ version come from `/opt/snaptop-linux`; for fixes from a newer checkout use `--r
 4. Copies it into a new btrfs subvolume `.s15-os/<build>` on the SteamOS partition.
 5. Adapts it with `steamos-s15-setup.sh`: kernel, modules, DTBs, firmware and UCM come from the running system, so
    neither a kernel build nor the Windows firmware export is needed. Then the Plasma applets the new image lacks
-   (`desktop-net`, at the image's KDE versions; 0.5.7 brings its own Wi-Fi applet, so only Bluetooth is built) and
-   the camera libraries (`install-camera.sh`, inside setup).
+   (`desktop-net`, at the image's KDE versions; 0.5.7 brings its own Wi-Fi applet, so only Bluetooth is built), the
+   camera libraries (`install-camera.sh`) and OpenVPN for NetworkManager (`install-nm-openvpn.sh`), both inside
+   setup. Packages installed by hand with `pacman` are not carried over: they live in the old version's `/usr`.
 6. Carries the system state over (next section), then re-applies the login password setup (`login-lock.sh
    apply-root`) so the new version never starts with the automatic login.
 7. Builds the initramfs inside the new version with its `/etc` overlay mounted (it needs the kept console keymap
    for the disk passphrase), checks the adaptations that matter (modules, firmware, UCM, gamescope DRM backend,
-   masked Frame units, LUKS in the initramfs, login gate, `/home` mount); a Valve change that broke one of the
+   masked Frame units, LUKS in the initramfs, login gate, `/home` mount, OpenVPN plugin); a Valve change that broke one of the
    setup script's edits stops the update here.
 8. Writes the boot entry "SteamOS (S15) - update <version>" (`s15-next.conf`, files in `S15BOOT/EFI/S15/next/`),
    re-seals the TPM for it ([encryption.md](encryption.md)) and sets systemd-boot's one-time entry

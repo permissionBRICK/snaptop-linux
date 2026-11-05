@@ -173,6 +173,15 @@ on the laptop just bounced back to Game Mode, and later showed a black screen wi
   sudo desktop-net/uninstall.sh                           # removes exactly the installed files
   ```
 
+- **OpenVPN connections:** the image has no `openvpn` and no OpenVPN plugin for NetworkManager, so NetworkManager
+  reports missing support for OpenVPN connections, even where Plasma's OpenVPN editor is present.
+  `steamos/install-nm-openvpn.sh` (run by the setup, so by `install.sh` and for every update) installs `openvpn` from
+  the image's own package repository and builds NetworkManager-openvpn 1.12.3 (GNOME's release tarball, checksum
+  pinned, without the GNOME editor). A `.ovpn` profile can then be imported in the network settings or with
+  `nmcli connection import type openvpn file <profile>.ovpn`. Certificates and keys belong in `/etc/openvpn`, which
+  an update keeps ([updates.md](updates.md#what-an-update-keeps)); NetworkManager's connections are kept anyway.
+  Remove: `sudo xargs -a /var/lib/s15-nm-openvpn.files rm -f && sudo pacman -R openvpn`.
+
 ## Keyboard colour
 
 `steamos-s15-keyboard.sh` sets the keyboard RGB per session: rainbow in Game Mode (the EC's own effect), solid

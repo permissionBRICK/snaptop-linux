@@ -52,6 +52,7 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | Area | Status | Notes |
 |---|---|---|
 | SteamOS (Steam Frame image) | works | Game Mode (gamescope on DRM), Desktop Mode (Plasma Wayland), Steam login, audio, NTFS/exFAT USB drives automount. |
+| OpenVPN (NetworkManager) | works | `openvpn` and NetworkManager-openvpn installed by the setup (`steamos/install-nm-openvpn.sh`); a split-tunnel profile was imported and connected from the Plasma applet on 0.5.3 (installed by hand then). On 0.5.7 installed, connection not re-tested yet. |
 | Wi-Fi/Bluetooth in Desktop Mode | works | Tray applets and settings pages (plasma-nm, bluedevil) built for the image by `desktop-net/` show up in the tray. Joining a new password-protected network from the applet is not tested yet. |
 | Native ARM64 Steam client | works | Valve's Frame build. |
 | Old 32-bit Windows games | works | Proton 11 (ARM64) + FEX. FlatOut 2 runs smoothly with DSOAL and native d3dx9; see [games](games.md). |
