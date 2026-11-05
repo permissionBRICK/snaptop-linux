@@ -27,7 +27,7 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | Wi-Fi (WCN7850, ath12k) | works | Wi-Fi 7, 160 MHz, 1.9 Gbit/s link to a WPA2/WPA3 router. NetworkManager with iwd; the firmware can get stuck (see known issues, `s15-wifi-reset`). |
 | Bluetooth | works | Controller comes up with the correct public address. A Shokz OpenRun Pro 2 headset paired and plays over A2DP (SBC/SBC-XQ); its microphone works over HFP (mSBC, 16 kHz): WirePlumber switches to the headset profile while an app records and back to A2DP afterwards. Pairings can be shared with Windows (`s15-bt-import`, [steamos.md](steamos.md#bluetooth-devices-in-both-systems)). |
 | USB-A | works | 5 Gbps. |
-| USB-C (USB 3, PD charging, dock) | works | Both ports: hub, Ethernet (`cdc_ncm`), card reader and USB drives on a USB-C dock, PD charging through the dock (2026-11-05: both ports, across several boots and restarts). A restart with a busy dock crashed the next boot until `s15-reboot-usb-quiesce` ([known issues](known-issues.md)). |
+| USB-C (USB 3, PD charging, dock) | works | Both ports: hub, Ethernet (`cdc_ncm`), card reader and USB drives on a USB-C dock, PD charging through the dock (2026-11-05: both ports, across several boots and restarts). A restart with a busy dock crashed the next boot until the restart hook stopped the USB controllers (`s15-reboot-same-os`) ([known issues](known-issues.md)). |
 | USB-C DP alt mode | untested | The port advertises DP. |
 | HDMI | works | Through the Parade PS185 DP-to-HDMI converter (DP2): an Acer XF240H ran at 1920x1080@120 in Game Mode and next to the panel in Desktop Mode. Audio over HDMI not set up. |
 | USB4 / Thunderbolt | no | No USB4 router driver for X1E. |

@@ -21,27 +21,31 @@ if [ -n "$W" ]; then efibootmgr -q -n "$W" && echo "BootNext = $W (Windows Boot 
 systemctl reboot
 EOS
 chmod 0755 "$R/usr/local/sbin/s15-reboot-to-windows"
-# A plain reboot from SteamOS comes back to SteamOS: at the very end of a reboot (systemd-shutdown hook, after
-# the unmounts) set BootNext to the entry we booted from, unless something already chose one ("Reboot to
-# Windows"). Power-off and cold boots keep the firmware default (Windows Boot Manager first).
+# At the very end of a restart (systemd-shutdown hook, after the unmounts), in this order:
+# 1. A plain reboot from SteamOS comes back to SteamOS: set BootNext to the entry we booted from, unless something
+#    already chose one ("Reboot to Windows"). Power-off and cold boots keep the firmware default (Windows Boot Manager
+#    first). The write goes through the firmware's TrustZone service; read it back and retry.
+# 2. A restart with a busy USB device (a dock's network adapter) crashed the next boot: the firmware does not reset
+#    the USB controllers on a warm restart, their DMA ran on into the new kernel, and the IOMMU, the display and the
+#    EC's I2C bus hung until the EC reset the machine (docs/known-issues.md). Halt the controllers (unbind the xHCI
+#    hosts, then their DWC3 controllers, which also powers down the USB PHYs), as Windows does on shutdown.
+# One script: systemd-shutdown runs its hooks in parallel, and with the USB step in a second hook a restart once
+# lost its BootNext and started Windows.
 install -d "$R/usr/lib/systemd/system-shutdown"
+rm -f "$R/usr/lib/systemd/system-shutdown/s15-reboot-usb-quiesce"
 cat > "$R/usr/lib/systemd/system-shutdown/s15-reboot-same-os" <<'EOS'
 #!/bin/sh
 [ "$1" = reboot ] || exit 0
 mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
-efibootmgr 2>/dev/null | grep -q '^BootNext:' && exit 0
-cur=$(efibootmgr 2>/dev/null | sed -n 's/^BootCurrent: //p')
-[ -n "$cur" ] && efibootmgr -q -n "$cur"
-exit 0
-EOS
-chmod 0755 "$R/usr/lib/systemd/system-shutdown/s15-reboot-same-os"
-# A restart with a busy USB device (a dock's network adapter) crashed the next boot: the firmware does not reset the
-# USB controllers on a warm restart, their DMA ran on into the new kernel, and the IOMMU, the display and the EC's
-# I2C bus hung until the EC reset the machine (docs/known-issues.md). Halt the controllers before a restart (unbind
-# the xHCI hosts, then their DWC3 controllers, which also powers down the USB PHYs), as Windows does on shutdown.
-cat > "$R/usr/lib/systemd/system-shutdown/s15-reboot-usb-quiesce" <<'EOS'
-#!/bin/sh
-[ "$1" = reboot ] || exit 0
+if ! efibootmgr 2>/dev/null | grep -q '^BootNext:'; then
+  cur=$(efibootmgr 2>/dev/null | sed -n 's/^BootCurrent: //p')
+  for i in 1 2 3; do
+    [ -n "$cur" ] || break
+    efibootmgr -q -n "$cur" 2>/dev/null
+    efibootmgr 2>/dev/null | grep -q "^BootNext: $cur" && break
+    sleep 1
+  done
+fi
 for drv in xhci-hcd dwc3-qcom; do
   D=/sys/bus/platform/drivers/$drv
   [ -d "$D" ] || continue
@@ -52,7 +56,7 @@ for drv in xhci-hcd dwc3-qcom; do
 done
 exit 0
 EOS
-chmod 0755 "$R/usr/lib/systemd/system-shutdown/s15-reboot-usb-quiesce"
+chmod 0755 "$R/usr/lib/systemd/system-shutdown/s15-reboot-same-os"
 cat > "$R/etc/systemd/system/s15-reboot-to-windows.service" <<'EOS'
 [Unit]
 Description=Reboot into Windows once (UEFI BootNext)
