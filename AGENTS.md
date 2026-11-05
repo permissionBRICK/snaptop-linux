@@ -48,7 +48,6 @@ what you are about to do before anything that writes to disk, and report results
 |---|---|
 | `efibootmgr` fails or the entry is missing after install | EFI variables on X1E go through the TrustZone app uefisecapp and register a few seconds after boot. `install-esp.sh` remounts efivarfs; if it still fails it prints the `efibootmgr -c ...` command to run later from SteamOS. Until then: ESC at power-on, or boot the stick and rerun only `steamos/install-esp.sh /mnt/steam <S15BOOT dev>` with the SteamOS partition mounted at `/mnt/steam`. |
 | Overlay mount error in the applet build | The build overlay cannot sit on another overlay; `install.sh` gives it a tmpfs. Keep that when running `desktop-net/build.sh` by hand. |
-| Live system freezes when a USB-C dock/adapter is plugged into the **left** USB-C port | Known xHCI problem on that port. Unplug; use the right port. |
 | Wi-Fi scans fail (`ath12k ... scan start failure`) or connects time out | Firmware stalls; in SteamOS `s15-wifi-reset` (driver reload) and the watchdog handle it. In the live system: `modprobe -r ath12k_wifi7 && modprobe ath12k_wifi7`, or a reboot. |
 | Disconnects every ~30 s on some access points (`DISASSOC_LOW_ACK`) | Wi-Fi power save; SteamOS turns it off per network automatically (`s15-wifi-powersave`). |
 | `C: can shrink by at most ...` in Prepare-S15.ps1 | Unmovable files; free space in Windows or pass a smaller `-LinuxSizeGB` (min 64). |

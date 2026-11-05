@@ -9,8 +9,7 @@ distributions install the tools listed in `install.sh` by hand).
 - **Ubuntu Desktop for ARM64** (26.04 LTS or newer) supports Snapdragon X Elite laptops in its generic ARM64 ISO and
   picks the device tree by itself. We have not run its live session on this model ourselves; if it does not boot,
   see below. Write the ISO to a stick with balenaEtcher or Rufus (DD mode), or `dd` on Linux.
-- Network: Wi-Fi (ath12k; the firmware is in linux-firmware), or a USB Ethernet adapter on the **right** USB-C port.
-  The left USB-C port charges but its USB data path fails under Linux (see [known issues](known-issues.md)).
+- Network: Wi-Fi (ath12k; the firmware is in linux-firmware), or a USB Ethernet adapter on a USB-C port.
 - 16 GB of RAM are enough: `install.sh` keeps the SteamOS image and the kernel build on the NVMe, not in RAM.
 
 ## BIOS settings (F2 at power-on)

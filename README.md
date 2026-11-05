@@ -10,7 +10,7 @@ FEX for Windows games, a Plasma desktop and a Steam Deck-style Game Mode:
 - display 2880x1620 @ 120 Hz, 8 bpc; Adreno GPU with Vulkan 1.4 (Turnip); HDMI
 - CPU frequency scaling, EC fan control, battery/charging, standby at about 0.15-0.2 W (roughly two weeks)
 - speakers and microphones, both cameras, keyboard with backlight and RGB colour, touchpad, Fn keys
-- Wi-Fi and Bluetooth (with tray applets in Desktop Mode), OpenVPN connections, USB-A, the right USB-C port with docks
+- Wi-Fi and Bluetooth (with tray applets in Desktop Mode), OpenVPN connections, USB-A, both USB-C ports with docks (Ethernet, hub, card reader, charging)
 - dual boot next to BitLocker-protected Windows, one-click reboot in both directions
 - the firmware TPM 2.0 (own driver, [docs/tpm.md](docs/tpm.md)); optional disk encryption that the TPM unlocks
   like BitLocker, only on the normal boot path, re-sealed automatically after kernel updates
@@ -20,7 +20,7 @@ FEX for Windows games, a Plasma desktop and a Steam Deck-style Game Mode:
 - SteamOS updates from Valve's servers, installed next to the running version with our adaptations and a fallback
   to the previous one ([docs/updates.md](docs/updates.md))
 
-Not yet: NPU, USB4/Thunderbolt, USB devices on the left USB-C port, light sensor; Secure Boot must be off.
+Not yet: NPU, USB4/Thunderbolt, light sensor; Secure Boot must be off.
 Details: [docs/status.md](docs/status.md), [docs/known-issues.md](docs/known-issues.md).
 
 > **State 2026-11-02.** Tested on one laptop. Every step was tested there, but the combined one-shot flow below
@@ -29,7 +29,7 @@ Details: [docs/status.md](docs/status.md), [docs/known-issues.md](docs/known-iss
 
 ## Install
 
-You need: the laptop with Windows, a USB stick (8 GB+), Wi-Fi (or USB Ethernet on the **right** USB-C port) and
+You need: the laptop with Windows, a USB stick (8 GB+), Wi-Fi (or USB Ethernet on a USB-C port) and
 about 1-1.5 hours, mostly unattended.
 
 1. **Windows** — download this repository (ZIP), then in an **elevated** PowerShell in its folder:
