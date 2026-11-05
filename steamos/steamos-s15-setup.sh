@@ -108,7 +108,8 @@ for u in steamvr-program-ble.service steamvr-v4l2loopback.service steamvr-set-ke
          deckard-power-monitor.service deckard-fpga-resume.service deckard-boot-images.service \
          adbd.service adbd-post.service usb-gadget.service usb-gadget.target usb-ncm-gadget@.service \
          usb-ncm-dnsmasq@.service steamos-boot.service efi.mount esp.mount home.mount persist.mount \
-         systemd-repart.service set-bluetooth-mac-address.service swapfile.service home-swapfile.swap; do
+         systemd-repart.service set-bluetooth-mac-address.service swapfile.service home-swapfile.swap \
+         iio-sensor-proxy.service; do
   ln -sfn /dev/null "$R/etc/systemd/system/$u"
 done
 for u in steamvr.service steamvr-logs.service steamvr-proxmicmute.service steamvr-v4l2cam.service \
