@@ -193,6 +193,11 @@ white in Desktop Mode, and the last one again after standby. Colours are `s15-kb
 `plasma-workspace.target`) start a user unit that starts the root unit `s15-kbd-mode@<mode>.service`, which a polkit
 rule allows the desktop user to start. Brightness stays on the Fn key.
 
+On battery the light goes off after 30 s without a key press or touchpad touch and comes back with the next one, at
+the level it had (as ASUS's software does on Windows; the light costs about 0.8 W at level 1, see
+[power.md](power.md)). `s15-kbd-idle.service` watches the built-in keyboard and touchpad; `IDLE_OFF_BATTERY` and
+`IDLE_OFF_AC` in `/etc/s15-kbd-mode.conf` set the seconds (0: never; default 30 and 0).
+
 ## Display
 
 - 2880x1620 @ 120 Hz, 8 bpc with our kernel patch ([kernel](kernel.md)).

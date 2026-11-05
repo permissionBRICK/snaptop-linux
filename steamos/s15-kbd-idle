@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Keyboard light off after a while without input, as ASUS's software does on Windows (docs/power.md: the light
+costs about 0.8 W at level 1). The next key press or touchpad touch restores the level it had; a level the user
+picks with the Fn key stays the one that is restored. Config in /etc/s15-kbd-mode.conf:
+  IDLE_OFF_BATTERY=30   seconds without input on battery (0: never)
+  IDLE_OFF_AC=0         the same on AC
+Input counts from the built-in keyboard and touchpad (I2C HID). The service reads them in batches (at most one wakeup
+per second while typing) and sleeps without a timer while the light is off or on AC.
+"""
+import glob
+import os
+import select
+import signal
+import sys
+import time
+
+CONF = "/etc/s15-kbd-mode.conf"
+BUS_I2C = "0018"
+AC_RECHECK = 60          # seconds between power-source checks on AC (no input is read then)
+
+
+def led():
+    found = sorted(glob.glob("/sys/class/leds/*::kbd_backlight"))
+    return found[0] if found else None
+
+
+def battery():
+    for p in sorted(glob.glob("/sys/class/power_supply/*")):
+        try:
+            if open(f"{p}/type").read().strip() != "Battery":
+                continue
+            if os.path.exists(f"{p}/scope") and open(f"{p}/scope").read().strip() == "Device":
+                continue          # a mouse's or headset's battery
+            return p
+        except OSError:
+            pass
+    return None
+
+
+def conf():
+    c = {"IDLE_OFF_BATTERY": 30, "IDLE_OFF_AC": 0}
+    try:
+        for line in open(CONF):
+            k, sep, v = line.strip().partition("=")
+            if sep and k in c:
+                c[k] = int(v.strip().strip("\"'") or 0)
+    except (OSError, ValueError):
+        pass
+    return c
+
+
+class Light:
+    def __init__(self, path):
+        self.path = path
+
+    def get(self):
+        return int(open(f"{self.path}/brightness").read())
+
+    def set(self, v):
+        with open(f"{self.path}/brightness", "w") as f:
+            f.write(str(v))
+
+
+def open_inputs():
+    fds = []
+    for ev in sorted(glob.glob("/sys/class/input/event*")):
+        try:
+            if open(f"{ev}/device/id/bustype").read().strip() != BUS_I2C:
+                continue
+            fds.append(os.open(f"/dev/input/{os.path.basename(ev)}", os.O_RDONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+    return fds
+
+
+def drain(fds):
+    """Read what is pending; False if a device went away."""
+    ok = True
+    for fd in fds:
+        try:
+            while os.read(fd, 4096):
+                pass
+        except BlockingIOError:
+            pass
+        except OSError:
+            ok = False
+    return ok
+
+
+def main():
+    path = led()
+    if not path:
+        print("no keyboard light (*::kbd_backlight)", file=sys.stderr)
+        return 0
+    light, bat = Light(path), battery()
+    fds = open_inputs()
+    if not fds:
+        print("no built-in keyboard or touchpad found", file=sys.stderr)
+        return 1
+    saved = None                          # level to restore after we switched the light off
+
+    def restore(*_):
+        if saved is not None and light.get() == 0:
+            light.set(saved)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, restore)
+    signal.signal(signal.SIGINT, restore)
+    print(f"keyboard light {os.path.basename(path)}, {len(fds)} input devices, battery {bat}", flush=True)
+
+    def on_battery():
+        try:
+            return bat is not None and open(f"{bat}/status").read().strip() == "Discharging"
+        except OSError:
+            return False
+
+    last = time.monotonic()
+    while True:
+        if saved is not None:             # light off: wait for input, no timer
+            r, _, _ = select.select(fds, [], [])
+            ok = drain(fds)
+            if light.get() == 0:          # else the Fn key or the EC changed it meanwhile
+                light.set(saved)
+            saved, last = None, time.monotonic()
+            if not ok:
+                fds = open_inputs()
+            continue
+        c = conf()
+        timeout = c["IDLE_OFF_BATTERY"] if on_battery() else c["IDLE_OFF_AC"]
+        if timeout <= 0:                  # never on this power source: only watch for a change of source
+            time.sleep(AC_RECHECK)
+            last = time.monotonic()
+            continue
+        left = last + timeout - time.monotonic()
+        if left <= 0:
+            level = light.get()
+            if level > 0:
+                light.set(0)
+                saved = level
+            else:
+                last = time.monotonic()   # off anyway; check again later
+            continue
+        r, _, _ = select.select(fds, [], [], left)
+        if r:
+            ok = drain(fds)
+            last = time.monotonic()
+            if not ok:
+                fds = open_inputs()
+            time.sleep(1)                 # batch: one wakeup per second at most while typing
+            drain(fds)
+            last = time.monotonic()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

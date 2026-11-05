@@ -56,6 +56,22 @@ Open leads for the floor:
 - Keyboard backlight was at level 1 during the test.
 - Windows reaches about 0.5 W screen-off idle on this platform.
 
+## Screen-on idle on SteamOS 0.5.7 (2026-11-05)
+
+In use (Desktop Mode, Steam client, Firefox, Obsidian open; 25 % brightness, 60 Hz, keyboard light at level 1,
+Wi-Fi power save on) the battery reported 6.3 W, and Plasma estimated about 9 hours. The CPU side is idle: 0.7 % busy,
+nearly all CPU time in the deepest core idle state, clusters entering their idle states, GPU at 300 MHz. Found:
+
+- The keyboard light was on (0.8 W at level 1 in the screen-off A/B above). Windows (ASUS's software) turns it off
+  after a few seconds without typing on battery; `s15-kbd-idle` now does the same (30 s, [steamos.md](steamos.md#keyboard-colour)).
+- The memory bus vote is about 4.9 GB/s average (`interconnect_summary`, `ebi`), 3.2 GB/s of it from the four USB
+  controllers (1 GB/s each on three of them), which hold their votes because runtime PM is off while awake
+  (`s15-usb-sleep`, above). The display needs about 1.6 GB/s. A lower vote lets the DDR clock drop.
+- The panel supports Panel Self Refresh (DPCD `0x070` = `01`, PSR1, on `drm_dp_aux` of `aea0000`, the eDP
+  controller). msm has PSR behind `msm.psr_enabled=1` (off by default, read at module load). Not tried yet; with a
+  static image it lets the display controller and the eDP link idle, as Windows does.
+- CPU clocks: at idle a cap changes nothing (the cores sleep); under light load it might. Not measured yet.
+
 ## Standby policy
 
 Standby is meant to be plain suspend-to-RAM, not Modern Standby: nothing runs, nothing radio-related stays on, and

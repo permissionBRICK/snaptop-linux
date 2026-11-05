@@ -17,7 +17,7 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | CPU frequency scaling | works | SCMI perf, 3 policies, 0.71-3.42 GHz, schedutil. `scmi-cpufreq` does not autoload: load it via `modules-load.d`. Debian's 7.2 kernel lacks `CONFIG_ARM_SCMI_CPUFREQ`. |
 | Keyboard, touchpad | works | I2C HID. |
 | Fn row, hotkeys | works | `hid-asus-ec` (community patch): volume, brightness, mic mute, emoji, Super+P, Fn-lock, PROG keys. |
-| Keyboard backlight | works | Fn key cycles off/1/2/3 (confirmed in Desktop Mode), via the EC (`asus::kbd_backlight`). |
+| Keyboard backlight | works | Fn key cycles off/1/2/3 (confirmed in Desktop Mode), via the EC (`asus::kbd_backlight`). Off after 30 s without input on battery (`s15-kbd-idle`). |
 | Keyboard backlight colour | works | `s15-kbd-color <rrggbb> [solid\|breathe\|rainbow\|strobe] [speed]` sends the EC's keyboard-RGB command (0x51 on the EC's I2C address 0x76; format from github.com/justririll/x1e-sleep). Solid colours confirmed. Brightness stays on the Fn key. |
 | Speakers (2x WSA8845) | works | Community patches + DT overlay + UCM profile. Left/right confirmed. We switch off the LPASS WSA macro compander (it made short sounds start loud and fade). No speaker protection (keep volume reasonable). |
 | Internal microphones | works | Captured signal confirmed. |
