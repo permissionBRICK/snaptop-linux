@@ -36,7 +36,8 @@ Install a new payload in SteamOS: `sudo steamos/install-kernel.sh <payload>` (ke
    - `ps883x` USB-C retimer DP pin F fix
    - reverts of the LPASS macro PM-clock conversion (audio)
 3. **Our patches** in `kernel/patches/`, among them 8 bpc on the panel (`0001`, below), the firmware TPM driver
-   (`0011`, [tpm](tpm.md)) and two boot fixes for the TPM unlock (`0012`, `0013`, below).
+   (`0011`, [tpm](tpm.md)), two boot fixes for the TPM unlock (`0012`, `0013`, below) and the SoundWire resume
+   fix (`0014`, below).
 4. **DT overlay** from the same community repo (`overlay/build-overlay.sh --dtbo-only`): audio (WSA8845 speakers,
    SoundWire, mics), RGB and IR cameras, and optionally the EC node. `build.sh` merges it into the mainline DTB
    with `fdtoverlay`, and also sets `rotation = <180>` on the HM1092 node (`camera@24`), which the overlay misses.
@@ -56,6 +57,27 @@ if (!data_rate_khz)
 
 Check: `cat /sys/kernel/debug/dri/0/eDP-1/dp_debug` shows `bpp = 24`. A proper upstream fix would compute the
 bpp after link training; this patch is the minimal workaround.
+
+## Our patch: SoundWire resume (speakers silent after login)
+
+`0014` (`soundwire: qcom`): the speaker amplifiers (WSA884x) dropped off their SoundWire bus at random right after
+login ("SWR bus clsh detected", amplifiers `UNATTACHED`, the speaker PCM running silently) and came back seconds to
+many minutes later. The LPASS macros release their clock votes in runtime suspend (`0002`, `0008`, needed for CX
+collapse in standby), so the controller's clock is gone while the bus sits in clock stop, and the clock-stop exit on
+runtime resume fails at random; a burst of short streams at session start (PipeWire, the Steam client; more of them
+since SteamOS 0.5.7) hits it. Fedora's kernel for this laptop reverts the 7.3 macro clock change for the same
+symptom; the Omarchy kernel fixes the same failure on Glymur's speaker controllers by re-enumerating. `0014` does the
+latter on X1E80100 buses with WSA amplifiers (only `swr0`, `6b10000` here): no clock stop, and runtime resume resets
+the controller and re-enumerates the amplifiers, as probe does (a few ms before the first sound after idle).
+
+Not on the WCD938x buses (`swr1`/`swr2`): a first version did it on all four controllers, and the internal
+microphones then recorded pure zeros. The bus reset also loses the codec's setup, its driver does not restore it, and
+the microphones get their bias from the WCD938x. `soundwire_qcom.reenumerate_on_resume=0` (never) or `=1` (every
+bus) overrides the automatic choice for comparison.
+
+Tested 2026-11-05 (module built against the running kernel): click on the first volume key press after login, no
+bus clash, microphones recording; the speaker bus re-enumerates both amplifiers on each wake, the microphone bus does
+not.
 
 ## Our patches: boot fixes for the TPM unlock
 

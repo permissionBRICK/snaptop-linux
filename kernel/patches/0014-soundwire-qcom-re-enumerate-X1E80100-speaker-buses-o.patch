@@ -1,0 +1,102 @@
+From 9741a44984c539c2787cff3d81be85a7a43a4f19 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 13:51:09 +0000
+Subject: [PATCH] soundwire: qcom: re-enumerate X1E80100 speaker buses on
+ runtime resume
+
+On the ASUS Vivobook S 15 (X1E80100) the speaker amplifiers (WSA884x)
+intermittently drop off their SoundWire bus right after login: "qcom_swrm_irq_handler:
+SWR bus clsh detected", the amplifiers stay UNATTACHED and the speakers are silent
+while the PCM keeps running, until a later resume happens to re-enumerate them
+(seconds to many minutes).
+
+The LPASS macros release their macro/dcodec clock votes in runtime suspend (needed
+for CX collapse in system sleep), so the clock feeding the SoundWire controller is
+gone while the bus is in clock stop. Exiting clock stop on runtime resume then fails
+at random; a burst of short streams at session start (PipeWire, the Steam client)
+triggers it. The same failure was found on Glymur's WSA controllers (Omarchy kernel,
+"soundwire: qcom: re-enumerate v3.1.0 controllers on runtime resume"); a reset with
+full enumeration, as at probe, has always brought every amplifier up.
+
+On X1E80100 buses with WSA883x/WSA884x amplifiers (found among the bus's DT
+children), mark clock stop as unsupported: runtime suspend skips the clock stop and
+runtime resume soft-resets the controller, re-initialises it and waits for
+enumeration. Not on the WCD938x buses: there the reset also loses the codec's setup
+and its driver does not restore it, so the microphones (bias from the WCD938x)
+recorded silence. reenumerate_on_resume=0/1 overrides the automatic choice.
+---
+ drivers/soundwire/qcom.c | 37 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+index dc2400a17..6d8c81900 100644
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -184,6 +184,35 @@ enum {
+ 	SWRM_OFFSET_DP_SAMPLECTRL2_BANK,
+ };
+ 
++/*
++ * X1E80100: once the LPASS macros have dropped their clocks in runtime suspend, exiting clock stop on runtime
++ * resume leaves the WSA speaker amplifiers UNATTACHED at random (bus clash, speakers silent while the stream runs).
++ * Reset the controller and re-enumerate instead, which probe has always done reliably. Only on buses with WSA
++ * amplifiers: a bus reset also loses the WCD938x codec's setup (silent microphones), and its driver does not
++ * restore it.
++ */
++static int reenumerate_on_resume = -1;
++module_param(reenumerate_on_resume, int, 0444);
++MODULE_PARM_DESC(reenumerate_on_resume,
++		 "Reset and re-enumerate on runtime resume instead of using clock stop (-1: auto, X1E80100 buses with WSA amplifiers; 0: never; 1: always)");
++
++/* WSA883x/WSA884x speaker amplifiers (SoundWire mfg 0x0217, part 0x0202/0x0204) among the bus's DT children */
++static bool qcom_swrm_has_wsa_amps(struct device_node *np)
++{
++	struct device_node *child;
++	const char *c;
++
++	for_each_available_child_of_node(np, child) {
++		if (of_property_read_string(child, "compatible", &c))
++			continue;
++		if (strstr(c, "02170204") || strstr(c, "02170202")) {
++			of_node_put(child);
++			return true;
++		}
++	}
++	return false;
++}
++
+ struct qcom_swrm_ctrl {
+ 	struct sdw_bus bus;
+ 	struct device *dev;
+@@ -221,6 +250,7 @@ struct qcom_swrm_ctrl {
+ 	u32 slave_status;
+ 	u32 wr_fifo_depth;
+ 	bool clock_stop_not_supported;
++	bool no_clock_stop;
+ };
+ 
+ struct qcom_swrm_data {
+@@ -664,7 +694,8 @@ static int qcom_swrm_enumerate(struct sdw_bus *bus)
+ 
+ 		sdw_extract_slave_id(bus, addr, &id);
+ 		found = false;
+-		ctrl->clock_stop_not_supported = false;
++		/* no_clock_stop: reset and re-enumerate on runtime resume, as at probe */
++		ctrl->clock_stop_not_supported = ctrl->no_clock_stop;
+ 		/* Now compare with entries */
+ 		list_for_each_entry_safe(slave, _s, &bus->slaves, node) {
+ 			if (sdw_compare_devid(slave, id) == 0) {
+@@ -1641,6 +1672,10 @@ static int qcom_swrm_probe(struct platform_device *pdev)
+ 	prop->default_row = data->default_rows;
+ 
+ 	ctrl->reg_read(ctrl, SWRM_COMP_HW_VERSION, &ctrl->version);
++	ctrl->no_clock_stop = reenumerate_on_resume > 0 ||
++		(reenumerate_on_resume < 0 && of_machine_is_compatible("qcom,x1e80100") &&
++		 qcom_swrm_has_wsa_amps(dev->of_node));
++	ctrl->clock_stop_not_supported = ctrl->no_clock_stop;
+ 
+ 	ret = devm_request_threaded_irq(dev, ctrl->irq, NULL,
+ 					qcom_swrm_irq_handler,
+-- 
+2.43.0
+
