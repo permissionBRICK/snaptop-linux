@@ -74,7 +74,9 @@ for s in plasma-plasmashell plasma-ksplash plasma-ksmserver plasma-kcminit plasm
          plasma-polkit-agent plasma-kglobalaccel plasma-kscreen plasma-xdg-desktop-portal-kde plasma-krunner \
          plasma-kactivitymanagerd plasma-dolphin plasma-ksystemstats plasma-restoresession plasma-baloorunner; do
   install -d "$U/$s.service.d"
-  printf '[Service]\nEnvironment=QT_QPA_PLATFORM=wayland\nEnvironment=XDG_SESSION_TYPE=wayland\nEnvironment=XDG_CURRENT_DESKTOP=KDE\nEnvironment=XDG_SESSION_DESKTOP=KDE\nUnsetEnvironment=GAMESCOPE_WAYLAND_DISPLAY\n' > "$U/$s.service.d/99-s15-wayland.conf"
+  # "wayland;xcb": apps started from Plasma inherit it; an X11-only Qt app (a Flatpak without the Wayland socket,
+  # e.g. Thincast) falls back to Xwayland instead of aborting with "no Qt platform plugin could be initialized".
+  printf '[Service]\nEnvironment=QT_QPA_PLATFORM=wayland;xcb\nEnvironment=XDG_SESSION_TYPE=wayland\nEnvironment=XDG_CURRENT_DESKTOP=KDE\nEnvironment=XDG_SESSION_DESKTOP=KDE\nUnsetEnvironment=GAMESCOPE_WAYLAND_DISPLAY\n' > "$U/$s.service.d/99-s15-wayland.conf"
 done
 
 S="$R/usr/bin/steamos-session-select"

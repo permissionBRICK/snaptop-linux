@@ -145,7 +145,10 @@ on the laptop just bounced back to Game Mode, and later showed a black screen wi
 - `s15-prepare-plasma --switch` runs from `steamos-session-select` before the switch and also unsets
   `DISPLAY`/`WAYLAND_DISPLAY`; inside the Plasma start (user unit `s15-plasma-env.service`) it must **not** unset
   them. Doing so was the cause of the black screen.
-- Plasma user units get `QT_QPA_PLATFORM=wayland` and friends.
+- Plasma user units get `QT_QPA_PLATFORM=wayland;xcb` and friends. Apps started from Plasma inherit it; with plain
+  `wayland`, Qt apps without access to the Wayland socket (Flatpaks that only allow X11, such as the Thincast RDP
+  client) did nothing when started (Qt aborts: "no Qt platform plugin could be initialized"); with the fallback
+  they run on Xwayland.
 - A "Return to Gaming Mode" desktop icon (the image has none).
 - **60 Hz on battery, 120 Hz on AC**, like Windows (user service `s15-refresh-on-battery`, about 0.7 W less at idle):
   it follows UPower's power-supply events, so it switches as soon as the charger is plugged in or out, and right
