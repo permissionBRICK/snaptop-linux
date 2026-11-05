@@ -14,17 +14,6 @@
   recovery key ready).
 - **Wrong resolution offered in Game Mode.** Steam treats the eDP panel as external and offers "Native" =
   1920x1080 to games; to be verified with the native-mode gamescope arguments.
-- **Left USB-C port (port 0, `a600000.usb`): USB devices do not work, and plugging one in can freeze the machine.**
-  Charging works on it. A powered USB-C dock (Genesys hub, ASIX AX88179B Ethernet, SD reader) fails on the left
-  port: the first descriptor read times out (`-110`) or "Enable Slot" times out, then "Abort failed to stop command
-  ring ... HC died". While the xHCI driver waits for the dead controller with the lock held, CPU 1 reports a
-  hard lockup for several seconds (black screen, no input, Wi-Fi drops); unplugging the device ends it. The dead
-  xHCI then makes every suspend fail (`platform_pm_suspend returns -22`). The same dock works on the **right** USB-C
-  port (port 1, `a800000.usb`): Ethernet as `cdc_ncm`, the hub and the SD reader enumerate. It fails on the left port
-  also before the forced `sync_state` (~31 s into boot) and with `pd_ignore_unused`, so it is not an unused power
-  domain being switched off. Differences between the ports in the DT: port 0's QMP PHY gets `RPMH_CXO_CLK` as its
-  reference clock, ports 1 and 2 their TCSR `CLKREF_EN`; each port has its own PS8833 retimer. Unbinding
-  `dwc3-qcom` for the dead controller hung the machine for minutes.
 - **QUP serial engines broken by the forced `sync_state` (fixed by moving it):** with `fw_devlink.sync_state=timeout`,
   about 1 boot in 5 went wrong at the moment of the forced `sync_state()` (~31-34 s): I2C bus 7 (EC and keyboard)
   `geni_i2c ... Timeout cancel_m_cmd`, the EC Tj feed `-110`, the Bluetooth UART timing out, once also a GPU
@@ -66,6 +55,14 @@
   (`Control port TX status (ack=0)`), although the password is right. `s15-wifi-reset` (reload `ath12k_wifi7`)
   recovers it; `s15-wifi-watchdog` does that automatically when a connect hangs or the scan list stays empty.
 - **GPU fault** in No Man's Sky after a while (Turnip; try `TU_DEBUG=sysmem`, newer Mesa).
+- **Restart with a USB-C dock crashed the next boot** (2026-11-05, a dock with Ethernet, either port): only
+  SteamOS -> SteamOS restarts; cold starts and restarts into or out of Windows were fine. The next boot's display
+  stalled ("ctl 1 reset failure", "vblank wait timed out"), a CPU hung in the IOMMU (`arm_smmu_iotlb_sync`) while
+  xHCI released a transfer, the I2C bus of the EC timed out, and the EC reset the machine because it got no SoC
+  temperature (the firmware's crash screen). The firmware does not reset the USB controllers on a warm restart, so
+  the dock's network DMA ran on into the new kernel. Workaround: the shutdown hook `s15-reboot-usb-quiesce`
+  (`steamos-s15-dualboot.sh`) unbinds the xHCI and DWC3 controllers before every restart; several restarts with
+  the dock attached since then went through.
 - **Reboot hang:** twice the machine stopped after "Reached target reboot.target" and needed a forced power-off.
   Possibly the EFI `ResetSystem` path through the firmware; `efi=noruntime` is a candidate test (it also
   disables EFI variables, so only as a test).
@@ -78,6 +75,7 @@
 
 | Problem | Cause | Fix |
 |---|---|---|
+| Left USB-C port (port 0, `a600000.usb`): a USB-C dock did not enumerate (descriptor read `-110`, "Enable Slot" timeout, "Abort failed to stop command ring ... HC died"), hard lockups of several seconds, every suspend failing afterwards; unbinding `dwc3-qcom` for the dead controller hung the machine (seen up to 2026-11-02) | Not found; not an unused power domain (also before the forced `sync_state` and with `pd_ignore_unused`) | Not reproducible since: on 2026-11-05 the same kind of dock ran on port 0 for hours across several boots (Ethernet, hub, card reader), after the kernel and boot changes since (`sync_state` moved, x1e-sleep patches) |
 | No sound at all on SteamOS | Frame WirePlumber spatializer needs SteamVR | `node.stream.enable-spatial-audio = false` |
 | Speakers silent with our first kernel | `RESET_GPIO`/`GPIO_SHARED_PROXY` dropped by localmodconfig | Full Debian module set ([kernel](kernel.md)) |
 | Banding in gradients | msm DP picked 6 bpc | Our 8 bpc patch |
@@ -87,7 +85,7 @@
 | Desktop Mode bounced back to Game Mode | Frame `plasma.desktop` starts the VR session | `steamos-s15-desktop.sh` |
 | Desktop Mode black screen with cursor | Display variables unset inside the Plasma start | `--switch` only from `steamos-session-select` |
 | Switching to Game Mode takes about a minute (black screen, text cursor) | Desktop autostart ran `steam -deckard` (branch `linux_arm64_beta_*`), Game Mode `-steamdeck` (`steamdeck_stable`): Steam downloaded the other client build on every switch | Desktop Steam starts with `-steamdeck -steamos3` too (user autostart/menu overrides) |
-| Screen flickering on and off every few seconds after plugging in the charger during standby | The USB-C xHCI on the left port had died (see Open), so every suspend failed at once with `-EINVAL`, and the dark-wake hook suspended again every few seconds | The dark-wake hook no longer retries a failed suspend and backs off after three wakes in two minutes; the xHCI death itself is open |
+| Screen flickering on and off every few seconds after plugging in the charger during standby | The USB-C xHCI on the left port had died (left USB-C port, above), so every suspend failed at once with `-EINVAL`, and the dark-wake hook suspended again every few seconds | The dark-wake hook no longer retries a failed suspend and backs off after three wakes in two minutes; the xHCI death itself is open |
 | No Wi-Fi/Bluetooth applet or settings in Desktop Mode | The Frame image has no `plasma-nm`/`bluedevil` | `desktop-net/` builds and installs them |
 | Services enabled at runtime (e.g. the Wi-Fi watchdog timer) not started after a reboot | Our initramfs lacked Valve's `etc_overlay` hook, so systemd's `etc.mount` mounted the `/etc` overlay only after the unit graph was loaded | initramfs hook `sd-s15-etc-overlay` (earlier `s15_etc_overlay`) mounts it before systemd starts |
 | Awake for 7 hours in the bag after an EC dark wake | The dark-wake hook counted touchpad interrupts after the resume as "input" and stayed awake; then Steam blocked Plasma's idle timer | With the lid closed the hook always suspends again; `s15-input-wait` (real key presses) for the lid-open case; `s15-lid-watchdog` |
