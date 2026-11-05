@@ -185,6 +185,48 @@ python3 "$HERE/fix-mictracker.py" "$R/etc/wireplumber/scripts/microphone-tracker
 say "Desktop Mode: real Plasma Wayland session instead of the Frame VR desktop"
 R="$R" bash "$HERE/steamos-s15-desktop.sh"
 
+say "battery: keep the charge limit across restarts"
+# The battery is managed by the ADSP firmware, which forgets a charge limit set from Linux at every boot (qcom_battmgr
+# only reads a persistent one from PMIC nvmem cells, which this laptop's DT does not have). Plasma's setting writes
+# charge_control_*_threshold; s15-charge-limit saves the limit when the service stops (shutdown) and sets it again
+# when the battery appears (udev), about 20 s into the boot. END=100 (no limit) removes the saved limit.
+cat > "$R/usr/local/sbin/s15-charge-limit" <<'EOS'
+#!/bin/sh
+# s15-charge-limit save|restore - battery charge limit across restarts (docs/power.md)
+B=/sys/class/power_supply/qcom-battmgr-bat
+F=/var/lib/s15-charge-limit
+num() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+case "$1" in
+save)
+  [ -r "$B/charge_control_end_threshold" ] || exit 0
+  s=$(cat "$B/charge_control_start_threshold"); e=$(cat "$B/charge_control_end_threshold")
+  num "$s" && num "$e" || exit 0
+  if [ "$e" -ge 55 ] && [ "$e" -lt 100 ]; then printf 'START=%s\nEND=%s\n' "$s" "$e" > "$F.tmp" && mv "$F.tmp" "$F"
+  elif [ "$e" -eq 100 ]; then rm -f "$F"
+  fi ;;                        # 0: the firmware got no limit this boot; keep what was saved
+restore)
+  [ -r "$F" ] || exit 0
+  START=; END=; . "$F"
+  num "$START" && num "$END" || exit 0
+  echo "$END" > "$B/charge_control_end_threshold" && echo "$START" > "$B/charge_control_start_threshold"
+  echo "charge limit set: start $START %, stop $END %" ;;
+*) echo "usage: s15-charge-limit save|restore"; exit 2 ;;
+esac
+EOS
+chmod 0755 "$R/usr/local/sbin/s15-charge-limit"
+cat > "$R/etc/systemd/system/s15-charge-limit.service" <<'EOS'
+[Unit]
+Description=Battery charge limit across restarts (restore now, save at shutdown)
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/s15-charge-limit restore
+ExecStop=/usr/local/sbin/s15-charge-limit save
+EOS
+printf '%s\n' '# Battery charge limit across restarts (s15-charge-limit, docs/power.md)' \
+  'ACTION=="add", SUBSYSTEM=="power_supply", KERNEL=="qcom-battmgr-bat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="s15-charge-limit.service"' \
+  > "$R/etc/udev/rules.d/94-s15-charge-limit.rules"
+
 say "standby: send EC dark wakes back to sleep; Plasma suspends after 15 min idle on battery"
 install -D -m0755 "$HERE/s15-ec-darkwake" "$R/usr/lib/systemd/system-sleep/s15-ec-darkwake"
 install -D -m0755 "$HERE/s15-sleep-radios" "$R/usr/lib/systemd/system-sleep/s15-sleep-radios"

@@ -72,6 +72,22 @@ nearly all CPU time in the deepest core idle state, clusters entering their idle
   static image it lets the display controller and the eDP link idle, as Windows does.
 - CPU clocks: at idle a cap changes nothing (the cores sleep); under light load it might. Not measured yet.
 
+## Battery charge limit
+
+Plasma's power settings ("Charge limit") write `charge_control_start_threshold` and `charge_control_end_threshold`
+of `qcom-battmgr-bat`; the driver accepts a start of 50-95 % and a stop of 55-100 %, and the start has to be at
+least 1 % below the stop. Plasma lets both be equal (e.g. 80/80), but the firmware rejects a gap of 0 and the driver
+still reports success, so the start silently stays at its old value; 79/80 works. The battery is managed by the
+ADSP firmware, which forgets a limit set from Linux at every boot: `qcom_battmgr` only reads a persistent limit from
+PMIC nvmem cells (`charge_limit_*`), which this laptop's DT does not have, so after a restart the thresholds read 0
+(no limit). `s15-charge-limit.service` keeps it: a udev rule starts it when the battery appears (about 20 s into the
+boot, once the ADSP runs) and it sets the saved limit; when it stops at shutdown it saves the current one to
+`/var/lib/s15-charge-limit`. A stop threshold of 100 % (no limit) removes the saved limit. A limit changed shortly
+before a hard reset is lost (it is saved at shutdown only).
+
+With the limit reached on AC the battery reports "Not charging"; Plasma's battery applet would then move into the
+tray's hidden items, so the desktop setup sets it to "Always shown" ([steamos.md](steamos.md#desktop-mode)).
+
 ## Standby policy
 
 Standby is meant to be plain suspend-to-RAM, not Modern Standby: nothing runs, nothing radio-related stays on, and

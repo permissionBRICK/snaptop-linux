@@ -31,7 +31,7 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | USB-C DP alt mode | untested | The port advertises DP. |
 | HDMI | works | Through the Parade PS185 DP-to-HDMI converter (DP2): an Acer XF240H ran at 1920x1080@120 in Game Mode and next to the panel in Desktop Mode. Audio over HDMI not set up. |
 | USB4 / Thunderbolt | no | No USB4 router driver for X1E. |
-| Battery, charging | works | `qcom_battmgr` (cycle count, capacity, PD charging). |
+| Battery, charging | works | `qcom_battmgr` (cycle count, capacity, PD charging). Charge limit from Plasma's settings, kept across restarts by `s15-charge-limit` ([power](power.md#battery-charge-limit)). |
 | Lid switch | works | |
 | Suspend (s2idle/"deep") | works | Lid close and resume tested. With `qcom_hamoa_ec.allow_suspend=1` the EC is told about standby and the power LED pulses like on Windows. Drain not measured yet. |
 | Fans (EC) | works (experimental) | Community `qcom-hamoa-ec` S15 support + experimental EC overlay (the `-ec` DTB): fans follow the SoC temperature from 33 thermal zones; up to about 6600 RPM under full load. |
