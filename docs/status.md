@@ -16,7 +16,7 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | GPU Adreno X1-85 | works | Mesa Turnip (Vulkan 1.4) and freedreno (GL 4.5+/GLES 3.2). Needs `qcdxkmsuc8380.mbn` from Windows. One game hit a GPU fault, see known issues. |
 | CPU frequency scaling | works | SCMI perf, 3 policies, 0.71-3.42 GHz, schedutil. `scmi-cpufreq` does not autoload: load it via `modules-load.d`. Debian's 7.2 kernel lacks `CONFIG_ARM_SCMI_CPUFREQ`. |
 | Keyboard, touchpad | works | I2C HID. |
-| Fn row, hotkeys | works | `hid-asus-ec` (community patch): volume, brightness, mic mute, emoji, Super+P, Fn-lock, PROG keys. |
+| Fn row, hotkeys | works | `hid-asus-ec` (community patch): volume, brightness, mic mute, emoji, Super+P, Fn-lock, PROG keys. Fn lock re-sent at session start and after standby (media keys first by default, `FN_LOCK`). |
 | Keyboard backlight | works | Fn key cycles off/1/2/3 (confirmed in Desktop Mode), via the EC (`asus::kbd_backlight`). Off after 30 s without input on battery (`s15-kbd-idle`). |
 | Keyboard backlight colour | works | `s15-kbd-color <rrggbb> [solid\|breathe\|rainbow\|strobe] [speed]` sends the EC's keyboard-RGB command (0x51 on the EC's I2C address 0x76; format from github.com/justririll/x1e-sleep). Solid colours confirmed. Brightness stays on the Fn key. |
 | Speakers (2x WSA8845) | works | Community patches + DT overlay + UCM profile. Left/right confirmed. We switch off the LPASS WSA macro compander (it made short sounds start loud and fade). No speaker protection (keep volume reasonable). |
@@ -52,7 +52,7 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | Area | Status | Notes |
 |---|---|---|
 | SteamOS (Steam Frame image) | works | Game Mode (gamescope on DRM), Desktop Mode (Plasma Wayland), Steam login, audio, NTFS/exFAT USB drives automount. |
-| OpenVPN (NetworkManager) | works | `openvpn` and NetworkManager-openvpn installed by the setup (`steamos/install-nm-openvpn.sh`); a split-tunnel profile was imported and connected from the Plasma applet on 0.5.3 (installed by hand then). On 0.5.7 installed, connection not re-tested yet. |
+| OpenVPN (NetworkManager) | works | `openvpn` and NetworkManager-openvpn installed by the setup (`steamos/install-nm-openvpn.sh`); a split-tunnel profile was imported and connected from the Plasma applet (0.5.3, and 0.5.7 after the update). |
 | Wi-Fi/Bluetooth in Desktop Mode | works | Tray applets and settings pages (plasma-nm, bluedevil) built for the image by `desktop-net/` show up in the tray. Joining a new password-protected network from the applet is not tested yet. |
 | Native ARM64 Steam client | works | Valve's Frame build. |
 | Old 32-bit Windows games | works | Proton 11 (ARM64) + FEX. FlatOut 2 runs smoothly with DSOAL and native d3dx9; see [games](games.md). |

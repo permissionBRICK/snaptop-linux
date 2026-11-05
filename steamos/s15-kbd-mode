@@ -2,7 +2,10 @@
 # Keyboard RGB per session: s15-kbd-mode game|desktop|resume
 # Colours from /etc/s15-kbd-mode.conf (GAME=..., DESKTOP=... as s15-kbd-color arguments). "resume" re-applies the
 # last mode (the EC may reset the effect in standby). Brightness stays on the Fn key.
-GAME="ffffff rainbow 3"; DESKTOP="ffffff solid"
+# Fn lock: hid-asus-ec's fn_lock (1 = F1-F12 first, 0 = media keys first) is what the driver last sent; the keyboard
+# follows each command, but after a boot it was found in F-key mode while the driver still said 0, so the first
+# Fn+Esc only "repaired" the mismatch. Every run re-sends the driver's value; FN_LOCK sets it once per boot.
+GAME="ffffff rainbow 3"; DESKTOP="ffffff solid"; FN_LOCK=0
 [ -f /etc/s15-kbd-mode.conf ] && . /etc/s15-kbd-mode.conf
 case "$1" in
   game) args=$GAME ;;
@@ -13,3 +16,8 @@ esac
 for i in $(seq 1 30); do ls /sys/bus/i2c/devices/*-0076/driver >/dev/null 2>&1 && break; sleep 1; done
 # shellcheck disable=SC2086
 /usr/local/bin/s15-kbd-color $args >/dev/null && echo "$1" > /run/s15-kbd-mode
+for f in /sys/bus/hid/drivers/hid-asus-ec/*/fn_lock; do
+  [ -w "$f" ] || continue
+  if [ ! -e /run/s15-fn-lock-set ] && [ -n "$FN_LOCK" ]; then v=$FN_LOCK; touch /run/s15-fn-lock-set; else v=$(cat "$f"); fi
+  echo "$v" > "$f"
+done

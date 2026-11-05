@@ -8,6 +8,8 @@ install -D -m0755 "$HERE/s15-kbd-color" "$R/usr/local/bin/s15-kbd-color"
 install -D -m0755 "$HERE/s15-kbd-mode" "$R/usr/local/sbin/s15-kbd-mode"
 install -D -m0755 "$HERE/s15-kbd-idle" "$R/usr/local/sbin/s15-kbd-idle"
 [ -f "$R/etc/s15-kbd-mode.conf" ] || printf '# s15-kbd-color arguments per session\nGAME="ffffff rainbow 3"\nDESKTOP="ffffff solid"\n' > "$R/etc/s15-kbd-mode.conf"
+grep -q '^FN_LOCK=' "$R/etc/s15-kbd-mode.conf" ||
+  printf '# Fn lock at boot: 0 = media keys first (Fn+F1..F12 for F-keys), 1 = F1-F12 first; Fn+Esc toggles\nFN_LOCK=0\n' >> "$R/etc/s15-kbd-mode.conf"
 grep -q '^IDLE_OFF_' "$R/etc/s15-kbd-mode.conf" ||
   printf '# keyboard light off after this many seconds without input (0: never); s15-kbd-idle\nIDLE_OFF_BATTERY=30\nIDLE_OFF_AC=0\n' >> "$R/etc/s15-kbd-mode.conf"
 cat > "$R/etc/systemd/system/s15-kbd-idle.service" <<'EOS'

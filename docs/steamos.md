@@ -198,6 +198,11 @@ the level it had (as ASUS's software does on Windows; the light costs about 0.8 
 [power.md](power.md)). `s15-kbd-idle.service` watches the built-in keyboard and touchpad; `IDLE_OFF_BATTERY` and
 `IDLE_OFF_AC` in `/etc/s15-kbd-mode.conf` set the seconds (0: never; default 30 and 0).
 
+Fn lock (Fn+Esc): the EC only reports the key press; `hid-asus-ec` flips its own value (`fn_lock` in sysfs: 1 = F1-F12
+first, 0 = media keys first) and sends it, and the keyboard follows. After a boot the keyboard was found in F-key
+mode while the driver said 0, so the first Fn+Esc did nothing visible. `s15-kbd-mode` re-sends the driver's value at
+every session start and after standby, and sets `FN_LOCK` from `/etc/s15-kbd-mode.conf` once per boot (default 0).
+
 ## Display
 
 - 2880x1620 @ 120 Hz, 8 bpc with our kernel patch ([kernel](kernel.md)).
