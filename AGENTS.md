@@ -51,6 +51,7 @@ what you are about to do before anything that writes to disk, and report results
 | Wi-Fi scans fail (`ath12k ... scan start failure`) or connects time out | Firmware stalls; in SteamOS `s15-wifi-reset` (driver reload) and the watchdog handle it. In the live system: `modprobe -r ath12k_wifi7 && modprobe ath12k_wifi7`, or a reboot. |
 | Disconnects every ~30 s on some access points (`DISASSOC_LOW_ACK`) | Wi-Fi power save; SteamOS turns it off per network automatically (`s15-wifi-powersave`). |
 | `C: can shrink by at most ...` in Prepare-S15.ps1 | Unmovable files; free space in Windows or pass a smaller `-LinuxSizeGB` (min 64). |
+| Black screen at every boot of SteamOS (after a crash or forced power-off) | A btrfs tree log the kernel cannot replay (mixed block groups, docs/known-issues.md#btrfs-tree-log). `notreelog` and the initramfs check `s15-btrfs-logcheck` prevent and handle it; `journalctl -b -u s15-btrfs-logcheck`. By hand from the live system: `cryptsetup open` (the user types the passphrase), `btrfs rescue zero-log /dev/mapper/<name>`. |
 | Windows asks for the BitLocker recovery key | BitLocker was not suspended before a BIOS change. The user enters the key; afterwards suspend it before further BIOS changes. |
 
 ## Checking the installed system (in SteamOS, as root)

@@ -13,7 +13,12 @@ if [ "$(blkid -o value -s TYPE /dev/disk/by-partlabel/SNAPSTEAM-NVME 2>/dev/null
   U=$(cryptsetup luksUUID /dev/disk/by-partlabel/SNAPSTEAM-NVME)
   ROOT="root=/dev/mapper/root rd.luks.name=$U=root rd.luks.options=$U=discard,tpm2-device=auto,tpm2-measure-pcr=yes"
 fi
-ARGS="$ROOT rw rootfstype=btrfs rootflags=noatime,compress=zstd:1 qcom_hamoa_ec.allow_suspend=1"
+# notreelog on a file system with mixed block groups (made from Valve's image; install.sh formats without them): the
+# kernel cannot replay some tree logs there, so fsync commits instead of logging (docs/known-issues.md#btrfs-tree-log).
+RF=noatime,compress=zstd:1
+RDEV=$(findmnt -no SOURCE "$R" | sed 's/\[.*//')
+btrfs inspect-internal dump-super "$RDEV" 2>/dev/null | grep MIXED_GROUPS >/dev/null && RF=$RF,notreelog
+ARGS="$ROOT rw rootfstype=btrfs rootflags=$RF qcom_hamoa_ec.allow_suspend=1"
 ARGS="$ARGS nvme.quirks=1344:5413:simple_suspend pcie_port_pm=force pcie_aspm.policy=powersupersave quiet loglevel=3"
 # systemd.gpt_auto=0: no partitions are mounted or used as swap just because of their GPT type (docs/encryption.md).
 ARGS="$ARGS systemd.show_status=auto systemd.gpt_auto=0"

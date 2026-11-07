@@ -1,0 +1,20 @@
+#!/bin/bash
+# mkinitcpio install hook (systemd initramfs): before the root file system is mounted, replay a btrfs tree log in a
+# test mount, and drop it if the kernel cannot replay it (s15-btrfs-logcheck, docs/known-issues.md#btrfs-tree-log).
+build() {
+    add_binary btrfs
+    add_file /usr/local/sbin/s15-btrfs-logcheck /usr/local/sbin/s15-btrfs-logcheck 0755
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=Replay or drop a btrfs tree log on the root file system (s15-btrfs-logcheck)' \
+        'DefaultDependencies=no' \
+        'After=initrd-root-device.target' \
+        'Before=sysroot.mount' \
+        '[Service]' \
+        'Type=oneshot' \
+        'RemainAfterExit=yes' \
+        'ExecStart=/usr/local/sbin/s15-btrfs-logcheck' \
+        | add_file - /usr/lib/systemd/system/s15-btrfs-logcheck.service 0644
+    add_symlink /usr/lib/systemd/system/initrd-root-fs.target.wants/s15-btrfs-logcheck.service ../s15-btrfs-logcheck.service
+}
+help() { echo "systemd initramfs: replay or drop a btrfs tree log before the root is mounted"; }

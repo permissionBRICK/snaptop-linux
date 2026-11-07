@@ -619,6 +619,7 @@ def verify_version(root, kv):
     need(os.path.islink(f"{root}/etc/systemd/system/steamos-boot.service"), "Frame units masked")
     need(os.path.exists(f"{root}/usr/local/sbin/s15-luks-reseal"), "s15-luks-reseal")
     need(os.path.exists(f"{root}/etc/mkinitcpio-s15.conf"), "mkinitcpio-s15.conf")
+    need(has("/etc/mkinitcpio-s15.conf", "s15-btrfs-logcheck"), "btrfs tree-log check in the initramfs")
     if os.path.exists("/var/lib/s15-luks/reseal.key"):
         need(has("/etc/mkinitcpio-s15.conf", "sd-encrypt"), "LUKS in the initramfs")
     if login_lock_on():

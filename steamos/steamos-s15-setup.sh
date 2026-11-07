@@ -331,7 +331,10 @@ say "initramfs for $KV (systemd; boot drivers, DSPs and display, keyboard, TPM, 
 # docs/steamos.md#initramfs. The install hooks are files in steamos/initcpio/; the busybox variant's /etc overlay hook
 # (s15_etc_overlay) is replaced by sd-s15-etc-overlay.
 mkdir -p "$R/etc/initcpio/install"
-for h in s15 s15-dsp s15-display sd-s15-etc-overlay; do install -m0644 "$HERE/initcpio/$h" "$R/etc/initcpio/install/$h"; done
+for h in s15 s15-dsp s15-display s15-btrfs-logcheck sd-s15-etc-overlay; do install -m0644 "$HERE/initcpio/$h" "$R/etc/initcpio/install/$h"; done
+# Before the root is mounted: replay a btrfs tree log left by a crash, or drop it if the kernel cannot replay it
+# (docs/known-issues.md#btrfs-tree-log).
+install -D -m0755 "$HERE/s15-btrfs-logcheck" "$R/usr/local/sbin/s15-btrfs-logcheck"
 # Display takeover (docs/known-issues.md): in the initramfs the display driver starts only next to a passphrase
 # prompt, which meanwhile blinks the Caps Lock light (hook s15-display); in SteamOS the check logs a failed takeover
 # and the driver's state snapshot is kept.

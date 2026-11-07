@@ -98,6 +98,7 @@ IR illuminator is a separate component.
 | `kms`, `s15-display` | The display driver (msm) is in the image but only loaded when a passphrase is requested, next to the prompt and without delaying it (`s15-prompt-display.service`); meanwhile the Caps Lock light blinks (`s15-prompt-signal.service`). See below. |
 | `keyboard`, `sd-vconsole`, `i2c_hid_of`, `hid_asus_ec` | Internal keyboard, console keymap and font (`/etc/vconsole.conf`) for a passphrase prompt. The keymap is global for all consoles, so SteamOS's own `systemd-vconsole-setup` is masked. |
 | `tpm_qcom_crb`, `sd-encrypt` | Firmware TPM and LUKS, for an encrypted root ([tpm.md](tpm.md)); idle without `crypttab`/`rd.luks`. |
+| `s15-btrfs-logcheck` | Before the root is mounted: replays a btrfs tree log left by a crash, or drops it if the kernel cannot replay it ([known-issues.md](known-issues.md#btrfs-tree-log)). |
 | `sd-s15-etc-overlay` | Mounts SteamOS's `/etc` overlay before switch-root, so units enabled at runtime start at boot. |
 
 Why the DSPs start this early: the firmware's framebuffer (efifb) does not survive the kernel's cleanup of unused
@@ -133,7 +134,9 @@ Gotchas on this image:
 - Do not test initramfs changes with a read-write root: a forced power-off of a hung boot once left a btrfs tree log
   that the kernel could not replay (`tree-log.c` transaction abort, -22), so every later boot stopped before the root
   was mounted (black screen, invisible emergency shell). `btrfs rescue zero-log` from a live system fixed it. Test
-  entries use `rootflags=...,notreelog` or a root that does not exist.
+  entries use `rootflags=...,notreelog` or a root that does not exist. The cause is the file system's mixed block
+  groups; the normal entries now carry `notreelog` too, and `s15-btrfs-logcheck` drops a log the kernel cannot
+  replay ([known-issues.md](known-issues.md#btrfs-tree-log)).
 
 ## Desktop Mode
 

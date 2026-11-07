@@ -1,0 +1,45 @@
+#!/bin/sh
+# Runs in the initramfs before the root file system is mounted (initcpio hook s15-btrfs-logcheck,
+# docs/known-issues.md#btrfs-tree-log). A crash or forced power-off within ~30 s of an fsync leaves a btrfs tree log,
+# which the next mount replays. On a file system with mixed block groups (an installation made from Valve's image)
+# the kernel cannot replay a log that holds two parts of one preallocated extent (journald's files): the mount fails
+# with "failed to recover log tree(s)" (-22), and every boot would stop there. This mounts the root once to replay the
+# log; only when the kernel reports that it cannot, the log is dropped (btrfs rescue zero-log): the fsynced writes of
+# the last seconds before the crash are lost, the committed file system is intact. Without a log it does nothing.
+# Usage: s15-btrfs-logcheck [device]   (default: root= of the kernel command line)
+dev=$1
+if [ -z "$dev" ]; then
+  root=
+  for w in $(cat /proc/cmdline); do
+    case $w in root=*) root=${w#root=} ;; esac
+  done
+  case $root in
+    PARTLABEL=*) dev=/dev/disk/by-partlabel/${root#PARTLABEL=} ;;
+    PARTUUID=*) dev=/dev/disk/by-partuuid/${root#PARTUUID=} ;;
+    LABEL=*) dev=/dev/disk/by-label/${root#LABEL=} ;;
+    UUID=*) dev=/dev/disk/by-uuid/${root#UUID=} ;;
+    /dev/*) dev=$root ;;
+    *) exit 0 ;;
+  esac
+fi
+[ -b "$dev" ] || exit 0
+lr=$(btrfs inspect-internal dump-super "$dev" 2>/dev/null | sed -n 's/^log_root[[:space:]][[:space:]]*\([0-9][0-9]*\)$/\1/p')
+case $lr in '' | 0) exit 0 ;; esac
+echo "tree log at $lr on $dev (the last boot did not shut down cleanly): replaying it"
+m=/run/s15-btrfs-logcheck
+mkdir -p "$m"
+n=$(dmesg | wc -l)
+if mount -t btrfs -o noatime,subvolid=5 "$dev" "$m"; then
+  umount "$m"
+  rmdir "$m"
+  echo "replayed"
+  exit 0
+fi
+rmdir "$m"
+if dmesg | tail -n "+$((n + 1))" | grep -qi 'failed to recover log tree'; then
+  echo "the kernel cannot replay the log: dropping it (btrfs rescue zero-log)"
+  btrfs rescue zero-log "$dev"
+else
+  echo "the test mount failed for another reason; the log is left as it is"
+fi
+exit 0

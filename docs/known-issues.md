@@ -64,6 +64,10 @@
   (`steamos-s15-dualboot.sh`) unbinds the xHCI and DWC3 controllers before every restart, after setting BootNext;
   several restarts with the dock attached went through. (As a separate hook it ran in parallel with the BootNext
   one, and once a restart lost its BootNext and started Windows.)
+- **First boot after Windows went down (2026-11-07):** started with the "Reboot to SteamOS" shortcut, it reached
+  SteamOS (journal flushed ~7 s after the kernel started) and went down within the next ~30 s with a black screen.
+  What happened after the flush was lost with its tree log ([below](#btrfs-tree-log)); before it nothing stands
+  out. Cause unknown; watch whether it recurs.
 - **Reboot hang:** twice the machine stopped after "Reached target reboot.target" and needed a forced power-off.
   Possibly the EFI `ResetSystem` path through the firmware; `efi=noruntime` is a candidate test (it also
   disables EFI variables, so only as a test).
@@ -71,6 +75,41 @@
   Windows reaches about 0.5 W.
 - Headphone jack, DP alt mode, Iris video decode, face login with the IR camera: untested.
 - NPU (an experimental llama.cpp path exists, not tried), ambient light sensor: no Linux support yet.
+
+## Btrfs tree log
+
+A crash or forced power-off within about 30 s of an fsync, before btrfs commits, leaves a tree log that the next
+mount replays. The SteamOS partition of the first installation was made from Valve's image and has **mixed block
+groups** (`btrfs inspect-internal dump-super` lists `MIXED_GROUPS`; nodesize 4096); `install.sh` formats without
+them. On such a file system the kernel cannot replay a log that holds two parts of one preallocated extent, and
+journald writes exactly that (it preallocates its files and writes into them, so a regular and a prealloc item point
+to the same extent). The mount then fails: `Transaction aborted (error -22)`, `WARNING ... tree-log.c ...
+process_one_buffer`, `failed to recover log trees`. During the replay the kernel takes the logged data extents out
+of the free space cache, on mixed block groups only (`btrfs_exclude_logged_extents`), and the second item of the
+same extent finds its range already gone. Reproduced with kernels 6.8 and 7.2 on a small test file system (mixed
+block groups, fragmented free space, a preallocated file half written, fsync, crash copy): the replay fails; the same
+without preallocation, or on a file system without mixed block groups, replays.
+
+It happened twice: on 2026-11-03 (forced power-off of a hung initramfs test) and on 2026-11-07 (the first boot after
+Windows went down, above). Each time every later boot stopped before the root was mounted: a black screen (no display
+driver yet on a TPM boot) with an invisible emergency shell. The committed file system was intact both times
+(`btrfs check` clean); dropping the log (`btrfs rescue zero-log`) lost only the last seconds of the crashed boot.
+
+Now:
+
+- `notreelog` in `rootflags` on file systems with mixed block groups (`install-esp.sh`; `s15-os-update` keeps the
+  flags of the current entry): fsync commits instead of writing a log, so a crash leaves nothing to replay. The
+  kernel confirms it at boot: `BTRFS info (device dm-0): disabling tree log`.
+- The initramfs hook `s15-btrfs-logcheck` runs before the root is mounted. If the root file system has a tree log, it
+  mounts it once to replay it; only when the kernel reports that it cannot recover the log, it drops it (`btrfs
+  rescue zero-log`). `journalctl -b -u s15-btrfs-logcheck` shows what it did; without a log it prints nothing.
+  Tested on test file system images (replayable log replayed and kept, unreplayable log dropped, then the mount
+  works) and on the laptop (no log).
+- By hand from a live system ([encryption.md](encryption.md)): look first without writing (`cryptsetup open
+  --readonly ...`, `btrfs inspect-internal dump-super` shows `log_root` other than 0, `mount -o ro,rescue=nologreplay`,
+  `btrfs check --readonly`), then open it normally and `btrfs rescue zero-log /dev/mapper/<name>`.
+- Not done: a kernel fix (the exclusion would have to skip ranges it already took out) and a file system without
+  mixed block groups (needs the ~30 GB of data copied somewhere else and back).
 
 ## Resolved (for reference)
 
