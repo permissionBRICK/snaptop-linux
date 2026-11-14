@@ -1,0 +1,46 @@
+From e9c1fdfda922c91c05464156d1577e07945d82e4 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 15:43:40 +0000
+Subject: [PATCH] clk: qcom: gcc-x1e80100: keep the display AXI clock until the
+ display driver takes it
+
+The firmware leaves the display engine scanning out its boot framebuffer (the vendor logo) when it starts the
+kernel. The unused-clock pass at late_initcall_sync switches gcc_disp_hf_axi_clk off long before the display clock
+controller and the display driver, both modules, have probed, i.e. in the middle of a scanout.
+
+On the ASUS Vivobook S 15 (X1E80100) everything after that point ran several times slower until the display driver
+reset the display engine about 20 s into the boot: unpacking the rest of the initramfs, the module loads, the NVMe
+bring-up, the TPM unlock, userspace. Measured with the same kernel: initramfs 7.6-9.4 s instead of 2.0 s, userspace
+(to the display manager) 13.0 s instead of 3.5 s, whole boot 29-31 s instead of 13.7 s. clk_ignore_unused had the
+same effect, pd_ignore_unused had none, and holding only this clock (a simple-framebuffer node with it as its clock)
+was enough. The most likely mechanism: the display engine is a real-time client of the memory controller, and with
+its memory path cut it keeps signalling underflow ("danger"), which throttles every other client. The screen also
+went black at that moment.
+
+Mark the clock CLK_IGNORE_UNUSED. The display driver takes it over at probe and switches it off in runtime suspend,
+so idle and standby are unchanged once the driver is loaded.
+
+Not upstream.
+---
+ drivers/clk/qcom/gcc-x1e80100.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/clk/qcom/gcc-x1e80100.c b/drivers/clk/qcom/gcc-x1e80100.c
+index 8c146d62c..2ba4b1ecf 100644
+--- a/drivers/clk/qcom/gcc-x1e80100.c
++++ b/drivers/clk/qcom/gcc-x1e80100.c
+@@ -2998,6 +2998,11 @@ static struct clk_branch gcc_disp_hf_axi_clk = {
+ 		.enable_mask = BIT(0),
+ 		.hw.init = &(const struct clk_init_data) {
+ 			.name = "gcc_disp_hf_axi_clk",
++			/*
++			 * The firmware leaves the display engine scanning out its boot framebuffer.
++			 * Keep its memory path until the display driver (a module) takes the clock.
++			 */
++			.flags = CLK_IGNORE_UNUSED,
+ 			.ops = &clk_branch2_ops,
+ 		},
+ 	},
+-- 
+2.43.0
+

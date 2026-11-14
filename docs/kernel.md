@@ -36,8 +36,8 @@ Install a new payload in SteamOS: `sudo steamos/install-kernel.sh <payload>` (ke
    - `ps883x` USB-C retimer DP pin F fix
    - reverts of the LPASS macro PM-clock conversion (audio)
 3. **Our patches** in `kernel/patches/`, among them 8 bpc on the panel (`0001`, below), the firmware TPM driver
-   (`0011`, [tpm](tpm.md)), two boot fixes for the TPM unlock (`0012`, `0013`, below) and the SoundWire resume
-   fix (`0014`, below).
+   (`0011`, [tpm](tpm.md)), two boot fixes for the TPM unlock (`0012`, `0013`, below), the SoundWire resume
+   fix (`0014`, below) and the display memory clock at boot (`0015`, below; halves the boot time).
 4. **DT overlay** from the same community repo (`overlay/build-overlay.sh --dtbo-only`): audio (WSA8845 speakers,
    SoundWire, mics), RGB and IR cameras, and optionally the EC node. `build.sh` merges it into the mainline DTB
    with `fdtoverlay`, and also sets `rotation = <180>` on the HM1092 node (`camera@24`), which the overlay misses.
@@ -78,6 +78,32 @@ bus) overrides the automatic choice for comparison.
 Tested 2026-11-05 (module built against the running kernel): click on the first volume key press after login, no
 bus clash, microphones recording; the speaker bus re-enumerates both amplifiers on each wake, the microphone bus does
 not.
+
+## Our patch: the display's memory clock at boot (boot twice as fast)
+
+`0015` (`clk: qcom: gcc-x1e80100`): the firmware hands over with the display engine still scanning out its boot
+framebuffer (the ASUS logo). The kernel's unused-clock pass at about 0.25 s switched `gcc_disp_hf_axi_clk`, the
+display's path to memory, off under that scanout, long before the display clock controller and `msm` (modules) load.
+From then on the whole machine ran several times slower until `msm` reset the display engine about 20 s into the
+boot: the rest of the initramfs unpacking, every module load, the NVMe bring-up, the TPM unlock, userspace. The
+screen also went black at that moment. Most likely mechanism: the display engine is a real-time client of the memory
+controller and, with its memory path cut, keeps signalling underflow ("danger"), which throttles every other client.
+
+| 2026-11-14, same kernel otherwise | Kernel | Initramfs | Userspace | Boot (`systemd-analyze`) |
+|---|---|---|---|---|
+| before | 1.0 s | 7.6-9.4 s | 12.6-13.0 s | 29-31 s |
+| `clk_ignore_unused` | 0.38 s | (passphrase test) | 3.5 s | - |
+| `pd_ignore_unused` | 1.0 s | 8.8 s | 13.6 s | 31.2 s |
+| DT simple-framebuffer holding only this clock | 0.38 s | 2.0 s | 3.5 s | 13.7 s |
+| `0015` (kernel #7) | 0.38 s | 2.0 s | 3.9 s | 13.9 s |
+
+`0015` marks the clock `CLK_IGNORE_UNUSED`; `msm` takes it over at probe and switches it off in runtime suspend, so
+idle and standby are unchanged. The simple-framebuffer node would have worked without a kernel change but hardcodes
+the firmware framebuffer (`0xe4800000`, 2880x1615); after a firmware change the console would draw into RAM.
+
+With it, `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y`: the text console takes the EFI framebuffer only when text
+is printed, so with `quiet` the firmware's logo stays on screen until `msm` takes over (about 4 s after the kernel
+starts).
 
 ## Our patches: boot fixes for the TPM unlock
 

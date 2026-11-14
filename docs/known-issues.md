@@ -40,8 +40,14 @@
   failing frames), and the Caps Lock light blinks while the passphrase is requested. Cause still to be found with
   the saved snapshots. Whether a charger on a USB-C hub plays a part is open (the
   hung boots had one; boots with the hub but no charger were fine).
-- **Boot time:** about 14.5 s from a restart to the login screen (23 s with the busybox initramfs, ~30 s with GRUB):
-  firmware ~7 s, systemd-boot 0.8 s, kernel and initramfs ~4 s, userspace ~3 s ([steamos.md](steamos.md#initramfs)).
+  Possibly gone with kernel patch `0015` ([kernel.md](kernel.md), 2026-11-14): until then the display engine lost its
+  memory clock in the middle of the firmware's scanout, about 20 s before `msm` took it over. To be confirmed by
+  `s15-display-check` finding no failed first frame over many boots.
+- **Boot time:** about 14 s from a restart to the login screen (2026-11-14, kernel #7 with `0015`): firmware ~7 s,
+  systemd-boot 0.8 s, kernel 0.4 s, initramfs 2.0 s (TPM unlock included), userspace 3.9 s
+  ([steamos.md](steamos.md#initramfs)). It had crept back to ~30 s after `msm` left the initramfs: the machine ran
+  throttled until `msm` reset the display engine, which then happened ~20 s into the boot instead of ~3.5 s
+  ([kernel.md](kernel.md), patch `0015`). Before: 23 s with the busybox initramfs, ~30 s with GRUB.
 - **Volume keys in Game Mode:** they work in Desktop Mode; in Game Mode the volume overlay appears only
   sometimes and the volume does not change. Under investigation (key events vs. the sink Steam controls).
 - **Wi-Fi power save and some access points:** with power save on, two access points (UniFi-type, 2.4 GHz)
