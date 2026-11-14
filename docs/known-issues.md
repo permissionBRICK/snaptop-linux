@@ -66,7 +66,7 @@
   stalled ("ctl 1 reset failure", "vblank wait timed out"), a CPU hung in the IOMMU (`arm_smmu_iotlb_sync`) while
   xHCI released a transfer, the I2C bus of the EC timed out, and the EC reset the machine because it got no SoC
   temperature (the firmware's crash screen). The firmware does not reset the USB controllers on a warm restart, so
-  the dock's network DMA ran on into the new kernel. Workaround: the shutdown hook `s15-reboot-same-os`
+  the dock's network DMA ran on into the new kernel. Workaround: the shutdown hook `s15-next-boot-same-os`
   (`steamos-s15-dualboot.sh`) unbinds the xHCI and DWC3 controllers before every restart, after setting BootNext;
   several restarts with the dock attached went through. (As a separate hook it ran in parallel with the BootNext
   one, and once a restart lost its BootNext and started Windows.)

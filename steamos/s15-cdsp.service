@@ -1,0 +1,11 @@
+[Unit]
+Description=Start the compute DSP (not in the initramfs, docs/steamos.md#initramfs)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for r in /sys/class/remoteproc/remoteproc*; do [ "$(cat $r/name)" = cdsp ] && [ "$(cat $r/state)" = offline ] && echo start > $r/state; done; true'
+
+[Install]
+WantedBy=multi-user.target

@@ -285,6 +285,13 @@ install -D -m0755 "$HERE/s15-power-key-mark" "$R/usr/lib/systemd/system-sleep/s1
 # Hibernation (docs/power.md#hibernation): inert until hibernate.sh enable (swap file, resume options).
 install -D -m0755 "$HERE/s15-hibernate" "$R/usr/lib/systemd/system-sleep/s15-hibernate"
 install -D -m0755 "$HERE/s15-hibernate-initrd" "$R/usr/local/sbin/s15-hibernate-initrd"
+# CoreSight (on-chip debug tracing) is unused; its AMBA devices flood the log with clock warnings on every
+# runtime suspend after a resume from hibernation.
+printf 'blacklist %s\n' coresight coresight_etm4x coresight_tmc coresight_funnel coresight_replicator \
+  coresight_cti coresight_stm coresight_tpdm coresight_tpda coresight_dummy > "$R/etc/modprobe.d/s15-no-coresight.conf"
+# The compute DSP is not started in the initramfs (initcpio hook s15-dsp); start it once the root is mounted.
+install -m0644 "$HERE/s15-cdsp.service" "$R/etc/systemd/system/s15-cdsp.service"
+ln -sfn /etc/systemd/system/s15-cdsp.service "$R/etc/systemd/system/multi-user.target.wants/s15-cdsp.service"
 install -m0644 "$HERE/s15-hibernate-swap.service" "$R/etc/systemd/system/s15-hibernate-swap.service"
 # systemd 256+ freezes user sessions before the sleep hooks run; s15-hibernate stops the ADSP, which removes the
 # sound card and waits until PipeWire closed it, so a frozen PipeWire blocks it for good.

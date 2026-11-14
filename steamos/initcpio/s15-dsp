@@ -1,7 +1,9 @@
 #!/bin/bash
-# mkinitcpio install hook: boot the ADSP and CDSP from the initramfs. The display driver (msm) waits for the
-# USB-C/DisplayPort chain behind the ADSP (pmic_glink); only with the DSPs up does the display come on before the
-# root filesystem is mounted, e.g. for a LUKS passphrase prompt. SMEM needs the hardware spinlock, smp2p needs SMEM.
+# mkinitcpio install hook: boot the ADSP from the initramfs. The display driver (msm) waits for the USB-C/DisplayPort
+# chain behind the ADSP (pmic_glink); only with it up does the display come on before the root filesystem is mounted,
+# e.g. for a LUKS passphrase prompt. SMEM needs the hardware spinlock, smp2p needs SMEM.
+# Not the compute DSP: nothing in the initramfs uses it, and stopping it again before a resume from hibernation took
+# 8.5 s there (s15-hibernate-initrd). Without its firmware here it stays offline until s15-cdsp.service starts it.
 # Firmware names come from this machine's devicetree; the files are the ones copied from Windows (docs/firmware.md).
 # A DSP whose driver loads in the initramfs but whose firmware is not in it never starts (remoteproc does not retry
 # after switch-root), so without all firmware files the hook adds nothing and the DSPs start from the root as before.
@@ -10,6 +12,7 @@ build() {
     for n in /sys/firmware/devicetree/base/soc@0/remoteproc@*; do
         [[ -f $n/firmware-name ]] || continue
         [[ $(tr -d '\0' < "$n/status" 2>/dev/null) == disabled ]] && continue
+        tr '\0' '\n' < "$n/compatible" | grep -q -- '-adsp-pas$' || continue
         while IFS= read -r -d '' f; do fw+=("$f"); done < "$n/firmware-name"
     done
     if (( ${#fw[@]} == 0 )); then
@@ -25,4 +28,4 @@ build() {
         ucsi_glink qcom_battmgr
     for f in "${fw[@]}"; do add_file "/usr/lib/firmware/$f"; done
 }
-help() { echo "Vivobook S15: ADSP/CDSP with firmware in the initramfs (display available before the root filesystem)"; }
+help() { echo "Vivobook S15: ADSP with firmware in the initramfs (display available before the root filesystem)"; }

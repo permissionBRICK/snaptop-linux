@@ -142,8 +142,8 @@ label or UUID) at `/run/s15-os/top`, and `/home` from there (two lines in its `/
 | SteamOS (S15) - previous system \<version\> | `EFI/S15/prev-os/*` | the version before the last update |
 | SteamOS (S15) - update \<version\> | `EFI/S15/next/*` | a staged version, until it is confirmed |
 
-- A restart after staging boots the new version once. Windows stays first at power-on; a restart (not a power-off)
-  sets BootNext to SteamOS so it comes back.
+- A restart after staging boots the new version once. Windows stays first at power-on; every clean shutdown from
+  SteamOS (restart or power-off) sets BootNext to SteamOS so it comes back.
 - If the new version does not reach the login screen for 3 minutes (crash, hang, power cut), the next start is the
   old default again; `status` shows it as "did not confirm".
 - After a confirmed update that misbehaves later: hold Space at power-on, choose "previous system", then

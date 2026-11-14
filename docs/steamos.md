@@ -94,7 +94,7 @@ IR illuminator is a separate component.
 | Hook / module | Why |
 |---|---|
 | `s15` | Clock, interconnect, PHY, PCIe/NVMe, USB and USB storage drivers for the root filesystem. |
-| `s15-dsp` | Starts the ADSP and CDSP with their firmware from the initramfs. The display driver waits for the USB-C/DisplayPort chain behind the ADSP (`pmic_glink`); without the DSPs it could only start after the root filesystem. |
+| `s15-dsp` | Starts the ADSP with its firmware from the initramfs. The display driver waits for the USB-C/DisplayPort chain behind the ADSP (`pmic_glink`); without it the display could only start after the root filesystem. The compute DSP (CDSP) is left out (nothing there uses it, and stopping it again before a resume from hibernation took 8.5 s); `s15-cdsp.service` starts it once the root is mounted. |
 | `kms`, `s15-display` | The display driver (msm) is in the image but only loaded when a passphrase is requested, next to the prompt and without delaying it (`s15-prompt-display.service`); meanwhile the Caps Lock light blinks (`s15-prompt-signal.service`). See below. |
 | `keyboard`, `sd-vconsole`, `i2c_hid_of`, `hid_asus_ec` | Internal keyboard, console keymap and font (`/etc/vconsole.conf`) for a passphrase prompt. The keymap is global for all consoles, so SteamOS's own `systemd-vconsole-setup` is masked. |
 | `tpm_qcom_crb`, `sd-encrypt` | Firmware TPM and LUKS, for an encrypted root ([tpm.md](tpm.md)); idle without `crypttab`/`rd.luks`. |
@@ -276,9 +276,11 @@ default and BitLocker is not involved.
 - **SteamOS → Windows:** `steamos-s15-dualboot.sh` installs `s15-reboot-to-windows.service` (sets BootNext to
   Windows Boot Manager, then reboots), a polkit rule that lets the desktop user start exactly that service
   without a password, a "Reboot to Windows" desktop icon and a "Reboot to Windows" entry in the Game Mode library.
-- **Reboots stay in the same OS:** a plain reboot from SteamOS comes back to SteamOS (systemd-shutdown hook
-  `s15-reboot-same-os` sets BootNext to the entry it booted from, unless one was already chosen). Windows
-  restarts stay in Windows because it is first in BootOrder. Power-off and cold boots use the firmware default.
+- **SteamOS comes back after every clean shutdown:** restart, power-off (menu, power key, the power-off at 5 %
+  battery) and halt from SteamOS all set BootNext to the entry it booted from, unless one was already chosen
+  ("Reboot to Windows"); systemd-shutdown hook `s15-next-boot-same-os`. Only a crash, a hang or a forced power-off
+  leaves it unset, and the firmware default, Windows, starts as the fallback. Windows restarts stay in Windows
+  because it is first in BootOrder.
 - **Windows → SteamOS:** run `windows\Install-RebootShortcut.ps1` once elevated. It creates a scheduled task
   (current user, highest privileges, on demand) that runs `Reboot-ToSteamOS.ps1` (`bcdedit /set {fwbootmgr}
   bootsequence <SteamOS entry>`, then restart), and a desktop shortcut that starts the task, so there is no UAC
