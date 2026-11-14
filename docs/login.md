@@ -153,6 +153,7 @@ shows the state; `sudo /opt/snaptop-linux/steamos/install-face.sh status` the in
 | Game Mode | Steam's own PIN; no face. |
 | 5 face scans in a row without success | Face is refused until a login with the password or PIN, or a password unlock of the lock screen (`sudo s15-face reset` clears it). |
 | Account locked by wrong passwords (`pam_faillock`) | Face is refused too. Face failures do not count towards that lockout. |
+| No IR camera in your Biopass settings | Face is refused (`s15-face camera ir` or `rgb` sets it). |
 
 Cameras (`s15-face camera`, writes `camera` and `anti_spoofing.ir_camera` in Biopass's settings, as libcamera
 camera ids: both cameras share their video nodes, so the app's device list cannot tell them apart):
@@ -178,7 +179,8 @@ time, and the camera light is on while either does.
   its own) are skipped. The two cameras are told apart by their libcamera ids, and only one streams at a time.
   libcamera 0.8.0 is built with its CPU software ISP (no GPU access needed).
 - `s15-face` (pam_exec) gates Biopass: `pam-empty` (login screen: empty field only) and `pam-gate` (lock screen,
-  sudo/polkit), each counting a scan; `pam-ok` and the login screen's account phase (`pam-account`) reset the count;
+  sudo/polkit), each counting a scan, and both refusing unless your Biopass settings name an IR camera (without
+  one, a photo on a phone could pass); `pam-ok` and the login screen's account phase (`pam-account`) reset the count;
   the account phase also records the first login since boot in `/run/s15-face/<user>` (gone at the next boot).
 - PAM lines (`login-lock.sh face-pam`, only while face unlock is installed and the login password is on):
   `/etc/pam.d/sddm` gets four auth lines after the PIN line (gate, `pam_faillock preauth`, Biopass, `pam_deny`: a
@@ -224,8 +226,10 @@ Same camera, same IR light, much less behind it:
   failed scans.
 - Keyring: Biopass can store your login password sealed by the TPM, to unlock a keyring after a face login. Not used
   here: SteamOS has no keyring PAM module, and our lines do not hand a password on (no `authtok`). Its seal is bound
-  only to PCR 7 (the Secure Boot state), which says little with Secure Boot off as on this laptop: any system booted
-  on it could unseal it. Do not save your password in the app.
+  at most to PCR 7 (the Secure Boot state), which says little with Secure Boot off as on this laptop: any system
+  booted on it that can read the sealed file (`/var/lib/biopass`; on an encrypted install only with the disk
+  passphrase) can unseal your password. The TPM is also Windows' ([tpm.md](tpm.md)). Do not save your password in
+  the app.
 - The disk encryption and its TPM unlock are not involved: face unlock never runs before the first password or PIN
   login after a boot.
 

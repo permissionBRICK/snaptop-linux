@@ -9,8 +9,9 @@
 #   s15-face pam-account  SDDM, account phase (root): a login succeeded; from now on face may be used until the next
 #                         boot, and the count of failed scans starts again
 # The gates let Biopass run only after a login at the login screen since boot (the first login after a boot takes
-# the password or the PIN), and refuse after 5 face scans in a row without a success, until the next password or
-# PIN login or a password unlock of the lock screen (or s15-face reset).
+# the password or the PIN) and with an IR camera in the user's Biopass settings (without one, a photo on a phone
+# could pass), and refuse after 5 face scans in a row without a success, until the next password or PIN login or a
+# password unlock of the lock screen (or s15-face reset).
 #
 #   s15-face status [user]
 #   s15-face reset [user]               (root) clear the count of failed scans
@@ -33,13 +34,37 @@ default_user() {
   echo "${u:-steamos}"
 }
 
-# Both gates: PAM auth phase, a login since boot, fewer than MAX_FAILS scans without a success. Counts this scan.
+# The user's Biopass settings name an IR camera and use no camera profiles (they would override it). Read without
+# following links and only if the user owns the file, also when run as root (login screen).
+ir_configured() {
+  python3 -I - "$1" "$(getent passwd "$1" | cut -d: -f6)/$CONF" <<'EOF'
+import os, pwd, sys, yaml
+user, path = sys.argv[1:]
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    st = os.fstat(fd)
+    if st.st_uid != pwd.getpwnam(user).pw_uid or st.st_size > 1 << 20:
+        sys.exit(1)
+    face = ((yaml.safe_load(os.fdopen(fd).read()) or {}).get("methods") or {}).get("face") or {}
+except (OSError, KeyError, yaml.YAMLError, AttributeError):
+    sys.exit(1)
+ir = (face.get("anti_spoofing") or {}).get("ir_camera")
+sys.exit(0 if isinstance(ir, str) and ir.strip() and not face.get("camera_profiles") else 1)
+EOF
+}
+
+# Both gates: PAM auth phase, a login since boot, an IR camera set, fewer than MAX_FAILS scans without a success.
+# Counts this scan.
 gate() {
   local u=${PAM_USER:-} f fails
   [ "${PAM_TYPE:-}" = auth ] && valid_user "$u" || exit 1
   f=$STATE/$u
   if [ ! -f "$f" ] || [ -L "$f" ]; then
     log "$u: face refused: no login with the password or PIN since boot (${PAM_SERVICE:-?})"
+    exit 1
+  fi
+  if ! ir_configured "$u"; then
+    log "$u: face refused: no IR camera in the Biopass settings (s15-face camera ir|rgb) (${PAM_SERVICE:-?})"
     exit 1
   fi
   exec 9<"$f"; flock 9
