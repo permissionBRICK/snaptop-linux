@@ -13,6 +13,8 @@
 # disable: automatic login, SteamOS's screen lock and password settings again. The boot hardening stays.
 # apply-root <dir>: the login parts of enable for a SteamOS root that is not running (s15-os-update puts them into a new
 #   SteamOS version before its first boot; the password itself comes with /etc/shadow).
+# face-pam: the PAM lines of face unlock (Biopass, steamos/install-face.sh, docs/login.md#face-unlock) as its state
+#   asks: present while it is installed and the login password is on, removed otherwise. install-face.sh calls it.
 # Nothing here restarts the running session; the login screen appears at the next boot or logout.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -38,6 +40,24 @@ KG=/etc/xdg/kdeglobals
 GREETER_AUDIO="pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service"
 FL_BEGIN='# s15-login-lock begin (docs/login.md)'
 FL_END='# s15-login-lock end'
+# Face unlock (docs/login.md#face-unlock): Biopass as an alternative to the password on the login screen (Enter on an
+# empty field; a typed password or PIN never waits for the camera) and on the lock screen (kscreenlocker's
+# kde-fingerprint service, next to the password); sudo and polkit only after install-face.sh admin on. s15-face is the
+# gate: never the first login after a boot, at most 5 scans without a success. Single-spaced lines (Valve's files
+# align with several spaces), so they are removed exactly and the files are as before byte for byte.
+FACE_DIR=/var/lib/s15-face
+FACE_KNOWN=$HERE/face-pam.sha256
+FACE_MARK='# snaptop-linux face unlock (docs/login.md#face-unlock, steamos/login-lock.sh face-pam)'
+FACE_EMPTY='auth [success=ok default=3] pam_exec.so quiet expose_authtok /usr/local/sbin/s15-face pam-empty'
+FACE_PREAUTH='auth requisite pam_faillock.so preauth'
+FACE_BIOPASS='auth [success=done default=ignore] libbiopass_pam.so'
+FACE_DENY='auth requisite pam_deny.so'
+FACE_ACCT='account optional pam_exec.so quiet /usr/local/sbin/s15-face pam-account'
+FACE_OK='auth optional pam_exec.so quiet /usr/local/sbin/s15-face pam-ok'
+FACE_GATE='auth requisite pam_exec.so quiet /usr/local/sbin/s15-face pam-gate'
+FACE_LOCK='auth [success=1 default=ignore] libbiopass_pam.so'
+FACE_ADMIN='auth [success=ok default=2] pam_exec.so quiet /usr/local/sbin/s15-face pam-gate'
+FACE_POLKIT_DROPIN=/etc/systemd/system/polkit-agent-helper@.service.d/s15-face.conf
 LUKS=no
 [ -f /var/lib/s15-luks/reseal.key ] && [ "$(findmnt -no SOURCE /)" = /dev/mapper/root ] && LUKS=yes
 
@@ -144,6 +164,135 @@ install_login() {  # $1: root directory, "" for the running system
     > "$R/etc/systemd/system/polkit-agent-helper@.service.d/s15-faillock.conf"
   sed -i "\%^$FL_BEGIN\$%,\%^$FL_END\$%d" "$R$FL"
   printf '%s\n' "$FL_BEGIN" 'deny = 10' 'unlock_time = 600' 'dir = /var/lib/faillock' "$FL_END" >> "$R$FL"
+  face_pam "$R"
+}
+
+face_lines() { printf '%s\n' "$FACE_EMPTY" "$FACE_PREAUTH" "$FACE_BIOPASS" "$FACE_DENY" "$FACE_ACCT" "$FACE_OK" \
+  "$FACE_GATE" "$FACE_LOCK" "$FACE_ADMIN"; }
+ours() { printf '%s\n' "$PIN_AUTH" "$PIN_ACCT" "$PAM_LINE"; face_lines; }
+face_installed() { [ -f "$1$FACE_DIR/build" ] && [ -f "$1/usr/lib/security/libbiopass_pam.so" ]; }
+# The file without our lines (login PIN, login gate, face unlock): Valve's own
+valve_hash() { grep -vxF -f <(ours) "$1" | sha256sum | cut -c1-64; }
+# kscreenlocker's kde-fingerprint service: Valve's file is in /usr/lib/pam.d from 0.5.7, in /etc/pam.d before
+face_kfp_source() {
+  local R=$1
+  if [ -f "$R/usr/lib/pam.d/kde-fingerprint" ]; then echo "$R/usr/lib/pam.d/kde-fingerprint"
+  elif [ -f "$R$FACE_DIR/pam-orig/kde-fingerprint" ]; then echo "$R$FACE_DIR/pam-orig/kde-fingerprint"
+  elif [ -f "$R/etc/pam.d/kde-fingerprint" ] && ! grep -qxF "$FACE_MARK" "$R/etc/pam.d/kde-fingerprint"; then
+    echo "$R/etc/pam.d/kde-fingerprint"
+  fi
+}
+
+# The PAM files the face lines depend on must be the ones they were reviewed against (steamos/face-pam.sha256). A
+# Valve update that changes one stops here (install-face.sh, and s15-os-update before a new version is used).
+face_check_valve() {
+  local R=$1 admin=$2 f name h bad=""
+  local -a check=("/etc/pam.d/sddm:$R/etc/pam.d/sddm" "/etc/pam.d/kde:$R/etc/pam.d/kde"
+                  "kde-fingerprint:$(face_kfp_source "$R")" "/etc/pam.d/system-auth:$R/etc/pam.d/system-auth")
+  [ "$admin" = yes ] && check+=("/etc/pam.d/sudo:$R/etc/pam.d/sudo" "/usr/lib/pam.d/polkit-1:$R/usr/lib/pam.d/polkit-1")
+  for f in "${check[@]}"; do
+    name=${f%%:*}; f=${f#*:}
+    if [ -z "$f" ] || [ ! -f "$f" ]; then bad+="  $name: missing"$'\n'; continue; fi
+    h=$(valve_hash "$f")
+    grep -q "^$h  $name\$" "$FACE_KNOWN" || bad+="  $name ($f): sha256 $h"$'\n'
+  done
+  [ -z "$bad" ] && return 0
+  printf 'ERROR: face unlock: Valve changed PAM files its lines were checked against:\n%s' "$bad" >&2
+  echo "Review the face lines in steamos/login-lock.sh for them and add the hashes to steamos/face-pam.sha256, or" \
+    "remove face unlock first (install-face.sh uninstall). docs/login.md#face-unlock" >&2
+  exit 1
+}
+
+face_pam_remove() {  # $1: root; leaves the files as they were before face_pam_add
+  local R=$1 f
+  for f in "$R/etc/pam.d/sddm" "$R/etc/pam.d/kde" "$R/etc/pam.d/sudo"; do
+    [ -f "$f" ] && grep -qxF -f <(face_lines) "$f" || continue
+    grep -vxF -f <(face_lines) "$f" > "$f.s15-face" && cat "$f.s15-face" > "$f" && rm -f "$f.s15-face"
+  done
+  for f in "$R/etc/pam.d/kde-fingerprint" "$R/etc/pam.d/polkit-1"; do
+    [ -f "$f" ] && grep -qxF "$FACE_MARK" "$f" && rm -f "$f"
+  done
+  # 0.5.3 has Valve's kde-fingerprint in /etc/pam.d: put it back
+  if [ -f "$R$FACE_DIR/pam-orig/kde-fingerprint" ] && [ ! -e "$R/etc/pam.d/kde-fingerprint" ] &&
+     [ ! -f "$R/usr/lib/pam.d/kde-fingerprint" ]; then
+    cp -p "$R$FACE_DIR/pam-orig/kde-fingerprint" "$R/etc/pam.d/kde-fingerprint"
+  fi
+  rm -f "$R$FACE_POLKIT_DROPIN"
+  rmdir "$R/etc/systemd/system/polkit-agent-helper@.service.d" 2>/dev/null || true
+}
+
+# Put lines before/after the first line matching an ERE, or in place of it (replace); die if there is none.
+pam_insert() {  # before|after|replace file ere line...
+  local where=$1 f=$2 ere=$3 add; shift 3
+  grep -qE -- "$ere" "$f" || die "$f: no line matching $ere"
+  add=$(printf '%s\n' "$@")
+  awk -v where="$where" -v ere="$ere" -v add="$add" '
+    !done && $0 ~ ere { if (where == "after") print; print add; if (where == "before") print; done = 1; next }
+    { print }' "$f" > "$f.s15-face"
+  cat "$f.s15-face" > "$f"; rm -f "$f.s15-face"
+}
+
+face_pam_add() {  # $1: root, $2: yes = sudo and polkit too
+  local R=$1 admin=$2 k src
+  face_check_valve "$R" "$admin"
+  # login screen: before the password, on an empty field only; a successful login allows face until the next boot
+  pam_insert before "$R/etc/pam.d/sddm" '^auth[[:space:]]+include[[:space:]]+system-login$' \
+    "$FACE_EMPTY" "$FACE_PREAUTH" "$FACE_BIOPASS" "$FACE_DENY"
+  pam_insert after "$R/etc/pam.d/sddm" '^account[[:space:]]+include[[:space:]]+system-login$' "$FACE_ACCT"
+  [ "$(grep -cxF -f <(face_lines) "$R/etc/pam.d/sddm")" = 5 ] || die "$R/etc/pam.d/sddm: face lines not added"
+  # lock screen: kscreenlocker runs kde-fingerprint next to the password service (kde). Valve's file with Biopass in
+  # place of fprintd; Biopass's "nothing to try" (PAM_IGNORE) must fail here, so the deny line follows it.
+  src=$(face_kfp_source "$R")
+  if [ "$src" = "$R/etc/pam.d/kde-fingerprint" ]; then
+    install -d -m0700 "$R$FACE_DIR/pam-orig"; cp -p "$src" "$R$FACE_DIR/pam-orig/kde-fingerprint"
+    src=$R$FACE_DIR/pam-orig/kde-fingerprint
+  fi
+  k=$R/etc/pam.d/kde-fingerprint
+  { sed -n '1p' "$src"; echo "$FACE_MARK"; sed '1d' "$src"; } > "$k.new"
+  pam_insert replace "$k.new" '^-auth[[:space:]]+required[[:space:]]+pam_fprintd.so$' \
+    "$FACE_GATE" "$FACE_LOCK" "$FACE_DENY" "$FACE_OK"
+  chmod 0644 "$k.new"; mv -f "$k.new" "$k"
+  # a password unlock of the lock screen allows face scans again
+  pam_insert after "$R/etc/pam.d/kde" '^auth[[:space:]]+include[[:space:]]+system-local-login$' "$FACE_OK"
+  [ "$admin" = yes ] || return 0
+  # sudo and polkit dialogs (opt-in): face first, the password when it fails
+  pam_insert before "$R/etc/pam.d/sudo" '^auth[[:space:]]+include[[:space:]]+system-auth$' \
+    "$FACE_ADMIN" "$FACE_PREAUTH" "$FACE_BIOPASS"
+  [ ! -e "$R/etc/pam.d/polkit-1" ] || die "$R/etc/pam.d/polkit-1 exists and is not ours"
+  k=$R/etc/pam.d/polkit-1
+  { sed -n '1p' "$R/usr/lib/pam.d/polkit-1"; echo "$FACE_MARK"; sed '1d' "$R/usr/lib/pam.d/polkit-1"; } > "$k.new"
+  pam_insert before "$k.new" '^auth[[:space:]]+include[[:space:]]+system-auth$' \
+    "$FACE_ADMIN" "$FACE_PREAUTH" "$FACE_BIOPASS"
+  chmod 0644 "$k.new"; mv -f "$k.new" "$k"
+  # polkit's password helper is sandboxed (no devices, no netlink, no /home); Biopass needs the cameras, udev and the
+  # user's Biopass files (read only).
+  install -d "$R/etc/systemd/system/polkit-agent-helper@.service.d"
+  printf '%s\n' '[Service]' '# docs/login.md#face-unlock (install-face.sh admin on): Biopass in polkit dialogs' \
+    'PrivateDevices=no' 'DeviceAllow=char-video4linux rw' 'DeviceAllow=char-media rw' 'DeviceAllow=/dev/udmabuf rw' \
+    'RestrictAddressFamilies=AF_UNIX AF_NETLINK' 'ProtectHome=read-only' > "$R$FACE_POLKIT_DROPIN"
+}
+
+# Face lines as the state asks: installed and login password on (in a new version: s15-os-update re-applies the login
+# setup only when it is on). Always removed first, so the result does not depend on what was there.
+face_pam() {  # $1: root, "" for the running system
+  local R=$1 admin=no
+  face_pam_remove "$R"
+  face_installed "$R" || return 0
+  [ -f "$R$FACE_DIR/admin" ] && admin=yes
+  face_pam_add "$R" "$admin"
+  echo "  face unlock: login screen (Enter on an empty password field), lock screen" \
+    "$([ $admin = yes ] && echo '; sudo and polkit dialogs')"
+}
+
+face_pam_cmd() {
+  if grep -q 's15-login-gate check' "$PAMF" && grep -q 's15-pin pam$' /etc/pam.d/sddm; then
+    face_pam ""
+  else
+    face_pam_remove ""
+    face_installed "" && echo "  face unlock is installed but needs the login password first: login-lock.sh enable"
+  fi
+  systemctl daemon-reload
+  return 0
 }
 
 apply_root() {
@@ -183,6 +332,7 @@ enable() {
 }
 
 disable() {
+  face_pam_remove ""
   sed -i '/s15-login-gate check/d' "$PAMF"
   systemctl disable --now s15-login-gate.path 2>/dev/null || true
   sed -i '/s15-pin pam/d' /etc/pam.d/sddm /etc/pam.d/kde 2>/dev/null || true
@@ -206,6 +356,13 @@ status() {
   echo "screen lock: $(grep -E '^(Autolock|LockOnResume)=' "$KSL" 2>/dev/null | tr '\n' ' ')$(grep -h '^action/lock_screen=' "$KG" 2>/dev/null)"
   echo "faillock: $(grep -E '^(deny|unlock_time|dir) *=' "$FL" | tr -s ' ' | tr '\n' ' ')"
   echo "PIN: $(grep -c 's15-pin pam$' /etc/pam.d/sddm /etc/pam.d/kde 2>/dev/null | tr '\n' ' ')socket $(systemctl is-active s15-pin.socket 2>/dev/null); $(/usr/local/sbin/s15-pin status "$U" 2>&1)"
+  if face_installed ""; then
+    echo "face unlock: installed ($(cat "$FACE_DIR/build")), PAM lines: $(grep -scxF -f <(face_lines) /etc/pam.d/sddm \
+      /etc/pam.d/kde /etc/pam.d/kde-fingerprint /etc/pam.d/sudo /etc/pam.d/polkit-1 | tr '\n' ' ')"
+    /usr/local/sbin/s15-face status "$U" 2>&1 | sed 's/^/  /'
+  else
+    echo "face unlock: not installed (steamos/install-face.sh)"
+  fi
   echo "encrypted: $LUKS"
   if [ "$LUKS" = yes ]; then
     kernel_fixes || true
@@ -215,6 +372,6 @@ status() {
 }
 
 case "${1:-}" in
-  enable) enable ;; disable) disable ;; status) status ;; apply-root) apply_root "${2:-}" ;;
-  *) echo "usage: $0 enable|disable|status|apply-root <dir>"; exit 2 ;;
+  enable) enable ;; disable) disable ;; status) status ;; apply-root) apply_root "${2:-}" ;; face-pam) face_pam_cmd ;;
+  *) echo "usage: $0 enable|disable|status|apply-root <dir>|face-pam"; exit 2 ;;
 esac

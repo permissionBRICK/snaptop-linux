@@ -58,6 +58,8 @@ Optional: encrypt the SteamOS partition with TPM unlock from the live system ([d
 then set a login password in SteamOS (`passwd`, then `sudo /opt/snaptop-linux/steamos/login-lock.sh enable`,
 [docs/login.md](docs/login.md)).
 Encryption without a login password only protects the SSD taken out of the laptop.
+With the login password on, face unlock with the IR camera can be added (`steamos/install-face.sh`,
+[docs/login.md](docs/login.md#face-unlock); built and checked offline, not yet tested on the laptop).
 
 Optional: `games/` adds Windows games to Steam with Proton ARM64 and the fixes old games need ([docs/games.md](docs/games.md)).
 
@@ -84,7 +86,7 @@ cd snaptop-linux && claude "Read AGENTS.md and install SteamOS on this laptop."
 | [docs/power.md](docs/power.md) | Idle and standby power, the standby setup, measuring |
 | [docs/tpm.md](docs/tpm.md) | The firmware TPM: driver, what Linux must not change |
 | [docs/encryption.md](docs/encryption.md) | LUKS2 encryption with TPM unlock (PCR 0+2+4+9+15, only the normal boot path), passphrase fallback, automatic re-sealing |
-| [docs/login.md](docs/login.md) | Login password: login screen at boot, mode switches without it, screen lock, failed-password lockout |
+| [docs/login.md](docs/login.md) | Login password: login screen at boot, mode switches without it, screen lock, failed-password lockout, optional face unlock with the IR camera |
 | [docs/games.md](docs/games.md) | Windows games: Proton ARM64, FEX, DSOAL, native d3dx9 |
 | [docs/known-issues.md](docs/known-issues.md) | Open problems and resolved ones |
 
@@ -96,6 +98,7 @@ windows/      Prepare-S15.ps1 (BitLocker, partition, firmware export), reboot-to
 steamos/      image download, firmware/UCM fetch, SteamOS adaptations, boot partition, standby/Wi-Fi/input helpers
 kernel/       build.sh (native or cross), config, our patches
 desktop-net/  Plasma Wi-Fi/Bluetooth applets built against the image
+face/         face unlock: our Biopass patches for the IR camera and the build against the image
 games/        Steam shortcut writer, Proton prefix tweaks, DSOAL fetcher, tool mover
 power/        power logger, report, sleep log hook
 tools/        hardware diagnostics
@@ -104,7 +107,7 @@ docs/
 
 Nothing here contains firmware or Valve/Microsoft binaries. Scripts download upstream sources at pinned revisions
 and checksums (kernel tag, community patches, linux-firmware, alsa-ucm-conf, KDE releases, the Steam Frame image
-build) or take files you export from your own Windows.
+build, Biopass and its dependencies) or take files you export from your own Windows.
 
 ## Credits
 
@@ -120,6 +123,7 @@ This builds on other people's work:
 - [hashtagbasit/SteamOS-ARM-Port](https://github.com/hashtagbasit/SteamOS-ARM-Port): the casync rootfs extractor
   and the Desktop Mode approach for the Frame image on non-headset hardware.
 - Valve: SteamOS for the Steam Frame, the ARM64 Steam client, Proton 11 (ARM64) and FEX integration.
+- [Biopass](https://github.com/phucvinh57/biopass) (TickLab): face unlock for Linux PAM, which our face unlock builds on.
 - [FEX-Emu](https://github.com/FEX-Emu/FEX), [Wine](https://www.winehq.org/), [kcat/dsoal](https://github.com/kcat/dsoal)
   and OpenAL Soft, KDE (Plasma, plasma-nm, bluedevil).
 
@@ -127,5 +131,6 @@ This builds on other people's work:
 
 [GPL-2.0-only](LICENSE), the license of the Linux kernel. The kernel patches by other authors keep their
 authorship and Signed-off-by lines; `steamos/steamos-s15-desktop.sh` is adapted from SteamOS-ARM-Port (GPL-2.0).
+The patches in `face/patches/` change Biopass and are under its license (MIT), like Biopass itself.
 Everything the scripts download (kernel, community patches and modules, firmware, UCM files, SteamOS, KDE sources,
-DSOAL) keeps its own license and is not part of this repository.
+DSOAL, Biopass and its models and libraries) keeps its own license and is not part of this repository.

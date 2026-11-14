@@ -1,0 +1,182 @@
+#!/bin/bash
+# Face unlock (Biopass, docs/login.md#face-unlock): the PAM gate in front of Biopass and small helpers.
+#
+# PAM (pam_exec lines that steamos/login-lock.sh adds while face unlock is installed):
+#   s15-face pam-empty    SDDM, auth, expose_authtok: face only when Enter is pressed on an empty password field, so
+#                         a typed password or PIN never waits for the camera
+#   s15-face pam-gate     the lock screen (kde-fingerprint), and sudo/polkit if turned on (install-face.sh admin on)
+#   s15-face pam-ok       the lock screen, after a face or password unlock: reset the count of failed scans
+#   s15-face pam-account  SDDM, account phase (root): a login succeeded; from now on face may be used until the next
+#                         boot, and the count of failed scans starts again
+# The gates let Biopass run only after a login at the login screen since boot (the first login after a boot takes
+# the password or the PIN), and refuse after 5 face scans in a row without a success, until the next password or
+# PIN login or a password unlock of the lock screen (or s15-face reset).
+#
+#   s15-face status [user]
+#   s15-face reset [user]               (root) clear the count of failed scans
+#   s15-face camera ir|rgb [user]       set the cameras in the user's Biopass configuration (Biopass app closed):
+#                                       ir: the IR camera recognises and checks presence, in the dark too (default);
+#                                       rgb: the colour camera recognises, the IR camera checks presence
+#   s15-face snapshot ir|rgb [file]     one frame as Biopass sees it (default /tmp/s15-face-<camera>.png)
+#   s15-face cameras                    the cameras as Biopass's libcamera lists them
+set -u
+STATE=/run/s15-face
+MAX_FAILS=5
+TOOL=/usr/lib/s15-face/camera_capture_test
+CONF=.config/com.ticklab.biopass/config.yaml
+log() { logger -t s15-face -p auth.notice -- "$*" 2>/dev/null || true; }
+die() { echo "s15-face: $*" >&2; exit 1; }
+valid_user() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+default_user() {
+  local u
+  u=$(cat /usr/lib/sddm/sddm.conf.d/*.conf /etc/sddm.conf.d/*.conf 2>/dev/null | sed -n 's/^User=//p' | tail -1)
+  echo "${u:-steamos}"
+}
+
+# Both gates: PAM auth phase, a login since boot, fewer than MAX_FAILS scans without a success. Counts this scan.
+gate() {
+  local u=${PAM_USER:-} f fails
+  [ "${PAM_TYPE:-}" = auth ] && valid_user "$u" || exit 1
+  f=$STATE/$u
+  if [ ! -f "$f" ] || [ -L "$f" ]; then
+    log "$u: face refused: no login with the password or PIN since boot (${PAM_SERVICE:-?})"
+    exit 1
+  fi
+  exec 9<"$f"; flock 9
+  fails=$(sed -n 's/^fails=\([0-9]*\)$/\1/p' "$f"); fails=${fails:-0}
+  if [ "$fails" -ge "$MAX_FAILS" ]; then
+    log "$u: face refused: $fails scans without a success; the password or PIN unlocks it again (${PAM_SERVICE:-?})"
+    exit 1
+  fi
+  echo "fails=$((fails + 1))" > "$f" || exit 1
+  exit 0
+}
+
+ok() {
+  local u=${PAM_USER:-} f
+  [ "${PAM_TYPE:-}" = auth ] && valid_user "$u" || exit 0
+  f=$STATE/$u
+  [ -f "$f" ] && [ ! -L "$f" ] && echo "fails=0" > "$f"
+  exit 0
+}
+
+account() {
+  local u=${PAM_USER:-} f
+  [ "${PAM_TYPE:-}" = account ] && [ "$(id -u)" = 0 ] && valid_user "$u" || exit 0
+  # root-only directory: a user can update their own file but not create, replace or link one
+  install -d -m0755 "$STATE"
+  f=$STATE/$u
+  [ -L "$f" ] && rm -f "$f"
+  [ -f "$f" ] || install -m0600 -o "$u" -g "$(id -gn "$u")" /dev/null "$f"
+  echo "fails=0" > "$f"
+  exit 0
+}
+
+cameras() {
+  [ -x "$TOOL" ] || die "face unlock is not installed (steamos/install-face.sh install)"
+  LD_LIBRARY_PATH=/usr/lib/biopass LIBCAMERA_LOG_LEVELS='*:ERROR' "$TOOL" --list-devices 2>/dev/null
+}
+
+# camera id of the IR sensor (HM1092, monochrome) or the colour sensor (OV02C10)
+camera_id() {
+  local model
+  case $1 in ir) model=hm1092 ;; rgb) model=ov02c10 ;; *) die "ir or rgb" ;; esac
+  cameras | awk -v m="$model" '/^  \[[0-9]+\] / { hit = index(tolower($0), m) > 0 }
+                                hit && /^      id: / { print $2; exit }'
+}
+
+status() {
+  local u=${1:-$(default_user)} f
+  valid_user "$u" || die "bad user name"
+  f=$STATE/$u
+  if [ -f "$f" ]; then
+    echo "$u: login since boot: yes, $(sed -n 's/^fails=//p' "$f") of $MAX_FAILS failed scans since the last success"
+  else
+    echo "$u: login since boot: no (the first login after a boot takes the password or PIN)"
+  fi
+  local home; home=$(getent passwd "$u" | cut -d: -f6)
+  if [ -r "$home/$CONF" ]; then
+    python3 -I - "$home/$CONF" <<'EOF'
+import sys, yaml
+c = yaml.safe_load(open(sys.argv[1])) or {}
+f = (c.get("methods") or {}).get("face") or {}
+a = f.get("anti_spoofing") or {}
+print(f"Biopass: face {'on' if f.get('enable', True) else 'off'}, camera {f.get('camera') or 'auto'}, "
+      f"IR camera {a.get('ir_camera') or 'none'}, AI anti-spoofing {'on' if a.get('enable') else 'off'}, "
+      f"recognition threshold {(f.get('recognition') or {}).get('threshold')}")
+EOF
+  else
+    echo "Biopass: not set up for $u yet (start the Biopass app once)"
+  fi
+  echo "enrolled faces: $(find "$home/.local/share/com.ticklab.biopass/faces" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+}
+
+reset() {
+  local u=${1:-$(default_user)} f
+  [ "$(id -u)" = 0 ] || die "run as root (sudo)"
+  valid_user "$u" || die "bad user name"
+  f=$STATE/$u
+  if [ -f "$f" ]; then echo "fails=0" > "$f"; echo "$u: failed scans cleared"; else echo "$u: no login since boot"; fi
+}
+
+camera() {
+  local mode=${1:-} u=${2:-$(default_user)} ir rgb home
+  case $mode in ir|rgb) ;; *) die "usage: s15-face camera ir|rgb [user]" ;; esac
+  valid_user "$u" || die "bad user name"
+  ir=$(camera_id ir); rgb=$(camera_id rgb)
+  [ -n "$ir" ] && [ -n "$rgb" ] || die "IR or colour camera not found ($(cameras | grep -c ' id: ') cameras listed)"
+  home=$(getent passwd "$u" | cut -d: -f6)
+  [ -f "$home/$CONF" ] || die "no Biopass configuration for $u yet: start the Biopass app once, then run this again"
+  pgrep -u "$u" -x biopass >/dev/null && die "close the Biopass app first (it would write its own settings back)"
+  local run=()
+  [ "$(id -u)" = 0 ] && [ "$u" != root ] && run=(runuser -u "$u" --)
+  "${run[@]}" python3 -I - "$home/$CONF" "$mode" "$ir" "$rgb" <<'EOF' || die "configuration not changed"
+import os, sys, yaml
+path, mode, ir, rgb = sys.argv[1:]
+c = yaml.safe_load(open(path)) or {}
+face = c.setdefault("methods", {}).setdefault("face", {})
+if face.get("camera_profiles"):
+    sys.exit("s15-face: the configuration has camera profiles, which override these settings; remove them in the app")
+anti = face.setdefault("anti_spoofing", {})
+anti["ir_camera"] = ir
+if mode == "ir":
+    face["camera"] = ir
+    # the anti-spoofing models are trained on colour images; on IR frames they only reject real faces at random
+    anti["enable"] = False
+else:
+    face["camera"] = rgb
+tmp = path + ".s15-face"
+with open(tmp, "w") as f:
+    yaml.safe_dump(c, f, sort_keys=False)
+os.replace(tmp, path)
+print(f"camera: {face['camera']}\nIR camera: {ir}")
+EOF
+  echo "Enrol your face again in the Biopass app: faces from the other camera do not match."
+}
+
+snapshot() {
+  local which=${1:-} out id
+  case $which in ir|rgb) ;; *) die "usage: s15-face snapshot ir|rgb [file]" ;; esac
+  out=${2:-/tmp/s15-face-$which.png}
+  id=$(camera_id "$which"); [ -n "$id" ] || die "$which camera not found"
+  local grey=(); [ "$which" = ir ] && grey=(--grey)
+  LD_LIBRARY_PATH=/usr/lib/biopass "$TOOL" "${grey[@]}" -o "$out" "$id" 2>&1 |
+    grep -E 'Captured|Saved|rror|ailed|busy|use'
+}
+
+case "${1:-}" in
+  pam-empty)
+    # pam_exec expose_authtok: the field's value and a NUL on stdin; only an empty field may start a scan
+    b=$(head -c 1 | od -An -tx1 | tr -d ' \n')
+    [ -z "$b" ] || [ "$b" = 00 ] || exit 1
+    gate ;;
+  pam-gate) gate ;;
+  pam-ok) ok ;;
+  pam-account) account ;;
+  status) status "${2:-}" ;;
+  reset) reset "${2:-}" ;;
+  camera) camera "${2:-}" "${3:-}" ;;
+  snapshot) snapshot "${2:-}" "${3:-}" ;;
+  cameras) cameras ;;
+  *) sed -n '2,24p' "$0"; exit 2 ;;
+esac

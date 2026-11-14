@@ -23,7 +23,7 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | Internal microphones | works | Captured signal confirmed. |
 | Headphone jack | untested | |
 | RGB camera (OV02C10) | capture works | 1920x1080 @ 30 through the libcamera simple pipeline with software ISP; image is dark and noisy. The activity LED lights while it streams. Browser access also needs the [camera components](steamos.md#cameras-and-browser-access), now included in setup. |
-| IR camera (HM1092) + IR illuminator | works | 560x360 raw; our build sets `rotation = <180>`. The activity LED lights while it streams, as on Windows. Face login (howdy) untested. |
+| IR camera (HM1092) + IR illuminator | works | 560x360 raw (`R10_CSI2P`, 10-bit, black level ~30, a lit face region ~130); our build sets `rotation = <180>`. The illuminator flashes 50 ms every 100 ms by itself, so about every third frame is dark and another banded. The activity LED lights while it streams, as on Windows. Face unlock: below. |
 | Wi-Fi (WCN7850, ath12k) | works | Wi-Fi 7, 160 MHz, 1.9 Gbit/s link to a WPA2/WPA3 router. NetworkManager with iwd; the firmware can get stuck (see known issues, `s15-wifi-reset`). |
 | Bluetooth | works | Controller comes up with the correct public address. A Shokz OpenRun Pro 2 headset paired and plays over A2DP (SBC/SBC-XQ); its microphone works over HFP (mSBC, 16 kHz): WirePlumber switches to the headset profile while an app records and back to A2DP afterwards. Pairings can be shared with Windows (`s15-bt-import`, [steamos.md](steamos.md#bluetooth-devices-in-both-systems)). |
 | USB-A | works | 5 Gbps. |
@@ -43,6 +43,7 @@ Legend: **works** = tested on the machine; **untested** = should work per upstre
 | TPM | works | Qualcomm firmware TPM 2.0 in TrustZone through our driver `tpm_qcom_crb` (kernel patch 0011): `/dev/tpmrm0`, boot event log, PCRs match the log, survives suspend. Windows owns its state; see [tpm](tpm.md) before using it. |
 | Disk encryption | works | LUKS2, TPM unlock without a prompt, passphrase fallback, automatic re-sealing ([encryption](encryption.md)). Bound to PCR 0+2+4+9+15 since 2026-11-04: only the normal boot path unlocks, the volume key is measured into PCR 15. |
 | Login password | works | Login screen at boot and logout, mode switches without it, screen lock (Meta+L), optional PIN, failed-password lockouts ([login](login.md)). |
+| Face unlock (IR camera) | built, untested on the laptop | Optional, Biopass with our patches for the IR camera on the login and lock screen ([login](login.md#face-unlock)). Built for 0.5.7 and checked offline: Biopass's unit tests, the IR conversion on frames captured here, the PAM stacks with real Linux-PAM. Enrolment, unlocking and spoof tests on the laptop are open. |
 | SteamOS updates | works | Valve's builds staged as a second version from Steam's update button, with fallback ([updates](updates.md)); 0.5.3 -> 0.5.7 done. |
 | Ambient light / presence sensors | no | |
 | Video decode (Iris) | untested | In mainline since 7.0. |

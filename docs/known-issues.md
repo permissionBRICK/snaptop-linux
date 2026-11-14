@@ -2,6 +2,14 @@
 
 ## Open
 
+- **Face unlock (Biopass) is not yet tested on the laptop** ([login](login.md#face-unlock)). Open: recognition quality
+  on the 560x360 IR frames (and with glasses), how long a scan takes, whether phone screens and prints are rejected,
+  the RGB path through libcamera 0.8.0 (Biopass's bundled version; the system has 0.7.1). Known limits: the camera
+  does not work after a resume from hibernation (CAMSS, below), so face unlock is unavailable then and the password
+  or PIN is asked; after a password unlock of the lock screen, Biopass may keep the camera (and its light) on for up
+  to a few seconds until its scan ends; the IR illuminator is not synchronised with the frames (half of them dark or
+  banded; Biopass skips them, an exposure/strobe tuning in the driver could make scans faster).
+
 - **Secure Boot.** It has to be off: systemd-boot, kernel and modules are unsigned. The firmware `db` on our machine holds the Windows
   CAs ("Microsoft Windows Production PCA 2011", possibly also "Windows UEFI CA 2023"), but not the Microsoft
   third-party UEFI CA that shim is signed with, so stock shim does not boot either. Two options:

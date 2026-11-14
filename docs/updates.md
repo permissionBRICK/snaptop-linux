@@ -82,11 +82,15 @@ version come from `/opt/snaptop-linux`; for fixes from a newer checkout use `--r
    (`desktop-net`, at the image's KDE versions; 0.5.7 brings its own Wi-Fi applet, so only Bluetooth is built), the
    camera libraries (`install-camera.sh`) and OpenVPN for NetworkManager (`install-nm-openvpn.sh`), both inside
    setup. Packages installed by hand with `pacman` are not carried over: they live in the old version's `/usr`.
-6. Carries the system state over (next section), then re-applies the login password setup (`login-lock.sh
-   apply-root`) so the new version never starts with the automatic login.
+6. Carries the system state over (next section), installs face unlock again if it is installed
+   (`install-face.sh apply-root`: webkit2gtk-4.1 from the new image's repository, Biopass with the build kept in
+   `/var/lib/s15-face/cache`), then re-applies the login password setup (`login-lock.sh apply-root`, with the face
+   unlock PAM lines) so the new version never starts with the automatic login. If Valve changed a PAM file the face
+   lines were checked against, this stops the update ([login.md](login.md#face-unlock)).
 7. Builds the initramfs inside the new version with its `/etc` overlay mounted (it needs the kept console keymap
    for the disk passphrase), checks the adaptations that matter (modules, firmware, UCM, gamescope DRM backend,
-   masked Frame units, LUKS in the initramfs, login gate, `/home` mount, OpenVPN plugin); a Valve change that broke one of the
+   masked Frame units, LUKS in the initramfs, login gate, `/home` mount, OpenVPN plugin, face unlock and its PAM lines);
+   a Valve change that broke one of the
    setup script's edits stops the update here.
 8. Writes the boot entry "SteamOS (S15) - update <version>" (`s15-next.conf`, files in `S15BOOT/EFI/S15/next/`),
    re-seals the TPM for it ([encryption.md](encryption.md)) and sets systemd-boot's one-time entry

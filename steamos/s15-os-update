@@ -593,6 +593,11 @@ def login_lock_on():
         return False
 
 
+def face_on():
+    """Face unlock (Biopass, steamos/install-face.sh) is installed on the running system."""
+    return os.path.exists("/var/lib/s15-face/build")
+
+
 def verify_version(root, kv):
     """The adaptations that matter for booting and for Game Mode; a Valve change that breaks one of the setup
     script's edits stops the update here instead of after the restart."""
@@ -624,6 +629,13 @@ def verify_version(root, kv):
         need(has("/etc/mkinitcpio-s15.conf", "sd-encrypt"), "LUKS in the initramfs")
     if login_lock_on():
         need(has("/etc/pam.d/sddm-autologin", "s15-login-gate check"), "login gate (login-lock.sh)")
+    if face_on():
+        need(all(os.path.exists(root + f) for f in ("/usr/bin/biopass", "/usr/bin/biopass-helper",
+                                                    "/usr/lib/security/libbiopass_pam.so", "/usr/local/sbin/s15-face")),
+             "face unlock (install-face.sh)")
+        if login_lock_on():
+            need(has("/etc/pam.d/sddm", "libbiopass_pam.so") and has("/etc/pam.d/kde-fingerprint", "libbiopass_pam.so"),
+                 "face unlock PAM lines (login-lock.sh)")
     need(any(TOP in l and "subvolid=5" in l for l in open(f"{root}/etc/fstab")), "/home from the top level (fstab)")
     need(has("/usr/bin/steamos-polkit-helpers/steamos-update", "s15-os-update"), "Steam's update hook")
     need(not os.path.islink(f"{root}/etc/systemd/system/home.mount"), "home.mount not masked")
@@ -715,6 +727,9 @@ def stage(args):
                     run("btrfs", "subvolume", "delete", snap, capture=True)
                 open(f"{NEW}/var/lib/s15-desktop-net.files", "w").write(names + "\n")
                 carry_local(NEW)
+                if face_on():
+                    log("== face unlock (install-face.sh)")
+                    run("bash", f"{REPO}/steamos/install-face.sh", "apply-root", NEW)
                 if login_lock_on():
                     log("== login password (login-lock.sh)")
                     run("bash", f"{REPO}/steamos/login-lock.sh", "apply-root", NEW)

@@ -112,6 +112,123 @@ sudo s15-pin set       # 6-12 digits, typed twice; s15-pin clear removes it, s15
   would count against BitLocker and Windows Hello. The hash lies on the encrypted partition.
 - Game Mode has Steam's own PIN (Steam > Settings > Security); it is separate from this one.
 
+## Face unlock
+
+Optional: the login screen and Desktop Mode's lock screen also recognise your face with the IR camera, as Windows
+Hello does. It uses [Biopass](https://github.com/phucvinh57/biopass) 1.5.1 (face and fingerprint unlock for Linux
+PAM, MIT license): the app from Biopass's arm64 release, its authentication part built on the laptop with our patches
+for this IR camera (`face/patches/`, offered upstream).
+
+> **State 2026-11-14:** built for SteamOS 0.5.7 (aarch64, in the image under qemu) and checked offline: Biopass's
+> unit tests, our IR path against frames captured on the laptop, the PAM edits on the image's files. **Not yet tested
+> on the laptop** (enrolment, unlocking, spoofing).
+
+### Setting it up
+
+Needs the login password ([above](#setting-it-up)). In Konsole (Desktop Mode):
+
+```sh
+sudo /opt/snaptop-linux/steamos/install-face.sh install    # about 15 minutes the first time (it builds)
+```
+
+1. Start **Biopass** from the application menu once: it writes its settings and downloads its models. Close it.
+2. Choose the cameras (recommended: the IR camera, below), then open Biopass again and add your face under Face
+   (enrol a few times: straight, slightly turned, with and without glasses):
+   ```sh
+   sudo s15-face camera ir
+   ```
+3. Log out or restart once: the first login after a boot always takes the password or the PIN.
+
+`sudo s15-face snapshot ir` saves one frame as Biopass sees it (`/tmp/s15-face-ir.png`); `sudo s15-face status`
+shows the state; `sudo /opt/snaptop-linux/steamos/install-face.sh status` the installation.
+
+### What it does
+
+| Where | With face unlock |
+|---|---|
+| Login screen, first login after a boot | Password or PIN only. |
+| Login screen later (logout, a session that ended) | Press Enter on the **empty** password field: Biopass looks for your face, the camera light is on for a few seconds. A typed password or PIN goes straight to its check, never waits for the camera. |
+| Desktop Mode lock screen | Biopass starts when the lock screen appears (a key press or mouse move) and again after a wrong password; the password field works at the same time. The lock screen's hint says "(or scan your fingerprint on the reader)" meanwhile: Plasma has no face wording for this service. |
+| `sudo`, administrator dialogs (polkit) | Password only. Opt-in: `install-face.sh admin on` (read the security notes first). |
+| Game Mode | Steam's own PIN; no face. |
+| 5 face scans in a row without success | Face is refused until a login with the password or PIN, or a password unlock of the lock screen (`sudo s15-face reset` clears it). |
+| Account locked by wrong passwords (`pam_faillock`) | Face is refused too. Face failures do not count towards that lockout. |
+
+Cameras (`s15-face camera`, writes `camera` and `anti_spoofing.ir_camera` in Biopass's settings, as libcamera
+camera ids: both cameras share their video nodes, so the app's device list cannot tell them apart):
+
+- `ir` (recommended): the IR camera both recognises your face and checks that a face is there. The IR light makes it
+  work in the dark and the same in any room light, and a photo on a phone or monitor shows nothing in infrared.
+  Biopass's anti-spoofing models are switched off: they are trained on colour images and misjudge IR frames.
+- `rgb`: the colour camera recognises (in the room light), the IR camera only checks that it also sees a face. A
+  printed photo can pass that check. The anti-spoofing models can be turned on in the app (they also reject real
+  faces in poor light).
+
+Faces enrolled with one camera do not match the other: enrol again after switching. Only one camera streams at a
+time, and the camera light is on while either does.
+
+### How it works
+
+- Biopass's PAM module (`libbiopass_pam.so`) starts `biopass-helper` as the PAM caller (root on the login screen,
+  you on the lock screen); it reads your settings and faces as you, captures, detects (YOLOv8 face) and compares
+  (EdgeFace) on the CPU, 5 attempts within a few seconds.
+- Our patches: the IR camera delivers only raw 10-bit frames (`R10_CSI2P`, 560x360, far below full scale); they are
+  unpacked and stretched to 8-bit grey from their own black level and brightest pixels, turned upright (the camera
+  is mounted upside down and cannot flip), and the dark frames of the IR light (it flashes 50 ms every 100 ms on
+  its own) are skipped. The two cameras are told apart by their libcamera ids, and only one streams at a time.
+  libcamera 0.8.0 is built with its CPU software ISP (no GPU access needed).
+- `s15-face` (pam_exec) gates Biopass: `pam-empty` (login screen: empty field only) and `pam-gate` (lock screen,
+  sudo/polkit), each counting a scan; `pam-ok` and the login screen's account phase (`pam-account`) reset the count;
+  the account phase also records the first login since boot in `/run/s15-face/<user>` (gone at the next boot).
+- PAM lines (`login-lock.sh face-pam`, only while face unlock is installed and the login password is on):
+  `/etc/pam.d/sddm` gets four auth lines after the PIN line (gate, `pam_faillock preauth`, Biopass, `pam_deny`: a
+  failed or impossible scan fails the attempt) and one account line; `/etc/pam.d/kde-fingerprint` (kscreenlocker's
+  service next to the password) is Valve's file with Biopass in place of fprintd, followed by `pam_deny` (Biopass
+  answers "nothing to try" with `PAM_IGNORE`, which must not unlock); `/etc/pam.d/kde` gets the reset line after a
+  password unlock. Never `/etc/pam.d/sddm-autologin`. `admin on` adds lines to `/etc/pam.d/sudo`, an
+  `/etc/pam.d/polkit-1`, and a drop-in that opens polkit's sandboxed password helper to the cameras, udev and
+  `/home` (read-only).
+- Logs: `journalctl -t s15-face` (refusals), Biopass's own in `~/.local/share/com.ticklab.biopass/logs/` when debug
+  logging is on in the app.
+
+Your data stays with your user: settings in `~/.config/com.ticklab.biopass/config.yaml`, enrolled faces (cropped
+images) and models in `~/.local/share/com.ticklab.biopass/`, on the encrypted partition on an encrypted install.
+Nothing leaves the laptop; the app downloads its models from Biopass's GitHub releases.
+
+Updates: `s15-os-update` installs face unlock into each new SteamOS version (webkit2gtk-4.1 from the new image's
+repository, the build kept in `/var/lib/s15-face/cache`, rebuilt only when `face/` changes) and applies the PAM lines
+again. If Valve changed one of the PAM files the lines were checked against (`steamos/face-pam.sha256`), the update
+stops with an error naming the file: review the lines for it, or uninstall face unlock, update, and install again.
+
+Removing it: `sudo /opt/snaptop-linux/steamos/install-face.sh uninstall` removes Biopass and the PAM lines; the PAM
+files are byte for byte as before (`login-lock.sh status` and `sha256sum /etc/pam.d/*` to compare). Your faces and
+settings stay in your home until you delete the two `com.ticklab.biopass` directories; webkit2gtk-4.1 stays installed
+until the next SteamOS update (or `pacman -Rs webkit2gtk-4.1`).
+
+### Security compared with Windows Hello
+
+Same camera, same IR light, much less behind it:
+
+- Windows Hello uses a face model built for IR with liveness checks, published false-accept rates (below 1 in
+  100,000 for face), keeps the face template isolated (VBS on newer machines), and a match only releases a key held by
+  the TPM. Here Biopass's general-purpose models decide with a threshold you set, there is no measured false-accept
+  rate for this camera, the enrolled faces are image files in your home, and a match simply tells PAM "yes".
+- Any program running as you can read your enrolled faces, add a face or lower the threshold. On the login and lock
+  screen that only matters to someone who already has your session; for `sudo` and polkit (opt-in) it means such a
+  program gets administrator rights as easily as with a `sudo` without password. Keep `admin` off unless that is
+  acceptable on this machine.
+- Spoofs: a phone or monitor shows nothing in IR (to be confirmed on the laptop). With `rgb`, a printed photo that
+  the colour camera recognises also passes the IR presence check. With `ir`, a photo has to look like you in
+  infrared; an IR photo, a good mask, a twin or a look-alike can pass. Face unlock is a convenience, weaker than your
+  password: the password (or PIN) stays required after every boot, for `sudo` and polkit by default, and after 5
+  failed scans.
+- Keyring: Biopass can store your login password sealed by the TPM, to unlock a keyring after a face login. Not used
+  here: SteamOS has no keyring PAM module, and our lines do not hand a password on (no `authtok`). Its seal is bound
+  only to PCR 7 (the Secure Boot state), which says little with Secure Boot off as on this laptop: any system booted
+  on it could unseal it. Do not save your password in the app.
+- The disk encryption and its TPM unlock are not involved: face unlock never runs before the first password or PIN
+  login after a boot.
+
 ## Boot hardening (encrypted install)
 
 `enable` adds `tpm2-measure-pcr=yes` to `rd.luks.options` and `systemd.gpt_auto=0` to every boot entry on `S15BOOT`
