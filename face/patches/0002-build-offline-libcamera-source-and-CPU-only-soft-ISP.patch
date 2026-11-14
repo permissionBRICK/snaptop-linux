@@ -1,0 +1,67 @@
+From 675672b9c3c0f2b1e5767b36624144c490a85e3b Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:52:19 +0000
+Subject: [PATCH 2/2] build: offline libcamera source and a CPU-only software
+ ISP option
+
+BIOPASS_LIBCAMERA_SOURCE_DIR builds the bundled libcamera from an
+unpacked source tree instead of the git clone (offline, checksummed
+distribution builds; the other dependencies already take
+FETCHCONTENT_SOURCE_DIR_<NAME>). BIOPASS_LIBCAMERA_SOFTISP_GPU=OFF builds
+libcamera's software ISP without the EGL path, so the colour camera works
+where the PAM caller has no GPU access and no EGL libraries are needed.
+Defaults are unchanged.
+---
+ auth/BundleLibcamera.cmake | 28 ++++++++++++++++++++++++----
+ 1 file changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/auth/BundleLibcamera.cmake b/auth/BundleLibcamera.cmake
+index 3493e45..0c7394c 100644
+--- a/auth/BundleLibcamera.cmake
++++ b/auth/BundleLibcamera.cmake
+@@ -32,10 +32,29 @@ file(MAKE_DIRECTORY "${LIBCAMERA_INCDIR}")
+ # AT_SECURE, where ld.so expands an executable's $ORIGIN only into trusted dirs.
+ set(LIBCAMERA_RPATH "$ORIGIN:${LIBCAMERA_PREFIX}/${LIBCAMERA_LIBDIR}")
+ 
++# Offline builds (distribution packages) can point this at an unpacked
++# libcamera ${LIBCAMERA_VERSION} source tree instead of the git clone. The patch
++# step below edits it in place.
++set(BIOPASS_LIBCAMERA_SOURCE_DIR "" CACHE PATH "Unpacked libcamera source tree (default: git clone)")
++# GPU (EGL) debayering in libcamera's software ISP; OFF keeps the CPU path,
++# which needs no GPU access (sandboxed PAM callers) and no EGL libraries.
++option(BIOPASS_LIBCAMERA_SOFTISP_GPU "Build libcamera's GPU software ISP when EGL is found" ON)
++if(BIOPASS_LIBCAMERA_SOURCE_DIR)
++    set(_libcamera_source SOURCE_DIR ${BIOPASS_LIBCAMERA_SOURCE_DIR})
++else()
++    set(_libcamera_source
++        GIT_REPOSITORY https://gitlab.freedesktop.org/camera/libcamera.git
++        GIT_TAG        ${LIBCAMERA_VERSION}
++        GIT_SHALLOW    TRUE)
++endif()
++if(BIOPASS_LIBCAMERA_SOFTISP_GPU)
++    set(_libcamera_softisp_gpu auto)
++else()
++    set(_libcamera_softisp_gpu disabled)
++endif()
++
+ ExternalProject_Add(libcamera_ext
+-    GIT_REPOSITORY https://gitlab.freedesktop.org/camera/libcamera.git
+-    GIT_TAG        ${LIBCAMERA_VERSION}
+-    GIT_SHALLOW    TRUE
++    ${_libcamera_source}
+     # Never link gnutls/libcrypto (#176); IPAs are then unsigned and run isolated.
+     PATCH_COMMAND  ${CMAKE_COMMAND} -DLIBCAMERA_SOURCE_DIR=<SOURCE_DIR>
+         -P ${CMAKE_CURRENT_LIST_DIR}/PatchLibcameraNoCrypto.cmake
+@@ -44,7 +63,8 @@ ExternalProject_Add(libcamera_ext
+         --libexecdir=${LIBCAMERA_LIBDIR} --datadir=${LIBCAMERA_DATADIR}
+         --sysconfdir=${LIBCAMERA_SYSCONFDIR}
+         -Dcpp_link_args=-Wl,-rpath,${LIBCAMERA_RPATH}
+-        -Dpipelines=uvcvideo,simple -Dipas=softisp -Dgstreamer=disabled -Dv4l2=disabled
++        -Dpipelines=uvcvideo,simple -Dipas=softisp -Dsoftisp-gpu=${_libcamera_softisp_gpu}
++        -Dgstreamer=disabled -Dv4l2=disabled
+         -Dcam=disabled -Dqcam=disabled -Dlc-compliance=disabled
+         -Dtracing=disabled -Ddocumentation=disabled -Dpycamera=disabled -Dtest=false -Dudev=enabled
+         <BINARY_DIR> <SOURCE_DIR>
+-- 
+2.43.0
+

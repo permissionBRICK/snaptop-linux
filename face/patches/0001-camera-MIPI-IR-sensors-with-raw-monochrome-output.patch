@@ -1,0 +1,1070 @@
+From 64b6a01a51d225ca5f9c26ffacaf2894458e1c9e Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:48:51 +0000
+Subject: [PATCH 1/2] feat(camera): MIPI IR sensors with raw monochrome output
+
+Laptops with MIPI cameras behind a CSI-2 receiver without a monochrome
+ISP path (e.g. Snapdragon X with Qualcomm CAMSS: an HM1092 IR sensor next
+to an OV02C10) get only the IR sensor's raw format from libcamera's simple
+pipeline, R10_CSI2P. Biopass rejected it, and could not tell the two
+cameras apart, since both report the same /dev/video nodes.
+
+- Accept R10_CSI2P, R10, R12_CSI2P and R12, unpack them and stretch to
+  8-bit grey: black level from the 0.5th percentile (at most 1/16 of full
+  scale), white from the 99.5th, with a minimum span so a dark frame stays
+  dark. Such a stream is treated as IR (grey session) whatever was asked.
+- Frames of an emitter that strobes on its own: dark ones (off phase) are
+  no samples; a capture keeps the brightest lit frame and returns a dark
+  one only when nothing lit arrives (covered lens).
+- Honour libcamera's mounting orientation: request Rotate0 and turn the
+  frames upright in software when the sensor cannot flip (all formats).
+- A camera may be named by its libcamera id; a video node shared by
+  several cameras picks the monochrome one for IR and the colour one for
+  the main camera; auto-select prefers a colour camera.
+- Only one camera streams at a time: the main session is closed before
+  the IR session opens and the other way round. Cameras behind one
+  capture pipeline cannot stream together.
+- Clear errors for a camera in use by another application (-EBUSY on
+  acquire) or a busy capture pipeline (-EBUSY on start).
+- camera_capture_test resolves an index, id or model selector to the
+  camera id, so it captures from the right one of such cameras.
+---
+ auth/face/common/camera_capture.cc   | 208 ++++++++++++++++++++++-----
+ auth/face/common/capture_policy.cc   |  78 +++++++++-
+ auth/face/common/capture_policy.h    |  26 ++++
+ auth/face/common/pixel_convert.cc    |  84 +++++++++++
+ auth/face/common/pixel_convert.h     |  25 ++++
+ auth/face/face_auth.cc               |   4 +
+ auth/face/face_auth.h                |  12 +-
+ auth/test/camera/main.cpp            |  19 ++-
+ auth/test/capture_policy/main.cpp    |  62 ++++++--
+ auth/test/face_camera_reuse/main.cpp |  23 ++-
+ auth/test/pixel_convert/main.cpp     |  64 ++++++++-
+ docs/IR camera.md                    |  12 ++
+ 12 files changed, 548 insertions(+), 69 deletions(-)
+
+diff --git a/auth/face/common/camera_capture.cc b/auth/face/common/camera_capture.cc
+index 08826de..34c43d0 100644
+--- a/auth/face/common/camera_capture.cc
++++ b/auth/face/common/camera_capture.cc
+@@ -2,12 +2,15 @@
+ 
+ #include <dirent.h>
+ #include <libcamera/libcamera.h>
++#include <libcamera/orientation.h>
++#include <libcamera/transform.h>
+ #include <spdlog/spdlog.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cerrno>
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstdint>
+@@ -70,8 +73,8 @@ class SpdlogStreambuf : public std::streambuf {
+   std::string line_;
+ };
+ 
+-// Process-wide and outlives all sessions; RGB and IR capture run
+-// concurrently as two Cameras from this one manager.
++// Process-wide and outlives all sessions; RGB and IR capture use two Cameras
++// from this one manager (FaceAuth opens one session at a time).
+ std::shared_ptr<libcamera::CameraManager> cameraManager() {
+   static std::mutex init_mutex;
+   static std::shared_ptr<libcamera::CameraManager> manager;
+@@ -97,13 +100,43 @@ std::shared_ptr<libcamera::CameraManager> cameraManager() {
+   return manager;
+ }
+ 
++// A sensor without colour filters: an IR camera.
++bool isMonoCamera(const libcamera::Camera& camera) {
++  const auto cfa = camera.properties().get(libcamera::properties::draft::ColorFilterArrangement);
++  return cfa && *cfa == libcamera::properties::draft::ColorFilterArrangementMONO;
++}
++
++// The first camera of the role the stream asks for (monochrome for IR,
++// colour otherwise), else the first one.
++std::shared_ptr<libcamera::Camera> pickForRole(
++    const std::vector<std::shared_ptr<libcamera::Camera>>& cameras, CameraCaptureFormat format) {
++  const bool want_mono = format == CameraCaptureFormat::V4L2Grey;
++  for (const auto& camera : cameras) {
++    if (isMonoCamera(*camera) == want_mono) {
++      return camera;
++    }
++  }
++  return cameras.empty() ? nullptr : cameras.front();
++}
++
++// `path` is a libcamera camera id (as `cam -l` lists it), or a video node
++// (/dev/videoN or a /dev/v4l link) of the camera. Platform cameras behind one
++// CSI-2 receiver (e.g. Qualcomm CAMSS, Intel IPU) can share all their video
++// nodes, so a node may belong to several cameras: then the camera of the
++// stream's role is picked, and the camera id names one exactly.
+ std::shared_ptr<libcamera::Camera> findCameraByPath(libcamera::CameraManager& manager,
+-                                                    const std::string& linux_video_device_path) {
++                                                    const std::string& linux_video_device_path,
++                                                    CameraCaptureFormat format) {
++  if (auto camera = manager.get(linux_video_device_path)) {
++    return camera;
++  }
++
+   struct stat device_info{};
+   if (stat(linux_video_device_path.c_str(), &device_info) != 0 || !S_ISCHR(device_info.st_mode)) {
+     return nullptr;
+   }
+ 
++  std::vector<std::shared_ptr<libcamera::Camera>> matches;
+   for (const auto& camera : manager.cameras()) {
+     const auto devices = camera->properties().get(libcamera::properties::SystemDevices);
+     if (!devices) {
+@@ -111,18 +144,28 @@ std::shared_ptr<libcamera::Camera> findCameraByPath(libcamera::CameraManager& ma
+     }
+     for (const int64_t device : *devices) {
+       if (device == static_cast<int64_t>(device_info.st_rdev)) {
+-        return camera;
++        matches.push_back(camera);
++        break;
+       }
+     }
+   }
+-  return nullptr;
++  auto camera = pickForRole(matches, format);
++  if (matches.size() > 1) {
++    spdlog::info(
++        "FaceAuth: '{}' belongs to {} cameras; using '{}' for the {} stream (set the camera id to "
++        "choose)",
++        linux_video_device_path, matches.size(), camera->id(),
++        format == CameraCaptureFormat::V4L2Grey ? "IR" : "colour");
++  }
++  return camera;
+ }
+ 
+ std::shared_ptr<libcamera::Camera> findCamera(
+-    libcamera::CameraManager& manager, const std::optional<std::string>& linux_video_device_path) {
++    libcamera::CameraManager& manager, const std::optional<std::string>& linux_video_device_path,
++    CameraCaptureFormat format) {
+   if (linux_video_device_path.has_value()) {
+     // Not logged: openCameraSession falls back to direct V4L2.
+-    return findCameraByPath(manager, *linux_video_device_path);
++    return findCameraByPath(manager, *linux_video_device_path, format);
+   }
+ 
+   const auto cameras = manager.cameras();
+@@ -130,7 +173,8 @@ std::shared_ptr<libcamera::Camera> findCamera(
+     spdlog::error("FaceAuth: No camera devices reported by libcamera");
+     return nullptr;
+   }
+-  return cameras.front();
++  // An IR sensor listed first must not become the auto-selected colour camera.
++  return pickForRole(cameras, format);
+ }
+ 
+ // Maps the camera's SystemDevices dev_t entries back to /dev/video* paths
+@@ -195,7 +239,7 @@ bool isPlanarYuv(const libcamera::PixelFormat& format) {
+ bool isSupportedPixelFormat(const libcamera::PixelFormat& format) {
+   return format == libcamera::formats::YUYV || format == libcamera::formats::MJPEG ||
+          format == libcamera::formats::R8 || isPlanarYuv(format) ||
+-         packedRgbLayout(format).has_value();
++         packedRgbLayout(format).has_value() || isRawMono(format);
+ }
+ 
+ std::string listAvailableFormats(const libcamera::StreamFormats& formats) {
+@@ -249,13 +293,18 @@ bool negotiate(libcamera::CameraConfiguration& config, CameraCaptureFormat reque
+   }
+   const libcamera::PixelFormat requested_pixel_format = stream_config.pixelFormat;
+   const libcamera::Size requested_size = stream_config.size;
++  // Upright images. A sensor that cannot flip makes validate() report its
++  // mounting orientation instead; the session then rotates in software.
++  config.orientation = libcamera::Orientation::Rotate0;
+ 
+   const auto validation = config.validate();
+   if (validation == libcamera::CameraConfiguration::Invalid) {
+     spdlog::error("FaceAuth: Invalid camera configuration for '{}'", camera_label);
+     return false;
+   }
+-  if (validation == libcamera::CameraConfiguration::Adjusted) {
++  if (validation == libcamera::CameraConfiguration::Adjusted &&
++      (stream_config.size != requested_size ||
++       stream_config.pixelFormat != requested_pixel_format)) {
+     spdlog::warn("FaceAuth: Camera '{}' adjusted configuration from {}-{} to {}-{}", camera_label,
+                  requested_size.toString(), requested_pixel_format.toString(),
+                  stream_config.size.toString(), stream_config.pixelFormat.toString());
+@@ -269,7 +318,8 @@ bool negotiate(libcamera::CameraConfiguration& config, CameraCaptureFormat reque
+   }
+ 
+   if (requested_format == CameraCaptureFormat::V4L2Grey &&
+-      stream_config.pixelFormat != libcamera::formats::R8) {
++      stream_config.pixelFormat != libcamera::formats::R8 &&
++      !isRawMono(stream_config.pixelFormat)) {
+     spdlog::warn("FaceAuth: Camera '{}' exposes no GREY format; falling back to decoded {} capture",
+                  camera_label, stream_config.pixelFormat.toString());
+   }
+@@ -400,18 +450,21 @@ class LibcameraCaptureSession : public ICameraCaptureSession {
+ 
+     // Many IR emitters strobe lit/dark, and a fixed warmup count lands on the
+     // same phase every time, so sample several frames and keep the brightest
+-    // one that isn't over-exposed.
++    // one that isn't over-exposed. A raw monochrome frame that is dark (the
++    // emitter's off phase) is no sample: it is kept only in case no lit frame
++    // comes, so the caller still sees the darkness (covered lens).
+     const int samples = is_grey_ ? kIrCaptureSampleFrames : 1;
+     FrameSampling sampling(samples, kMaxDroppedFrames);
+-    ImageRGB best;
+-    double best_mean = 0.0;
++    Frame best;
++    Frame best_dark;
++    int dark_frames = 0;
+     while (sampling.wantsMore()) {
+       libcamera::Request* request = waitForRequest(deadline, has_timeout);
+       if (!request) {
+         break;
+       }
+-      ImageRGB image;
+-      const bool ok = frameSucceeded(request) && extractFrame(request, image);
++      Frame frame;
++      const bool ok = frameSucceeded(request) && extractFrame(request, samples > 1, frame);
+       if (!requeue(request)) {
+         close();
+         return {};
+@@ -420,22 +473,33 @@ class LibcameraCaptureSession : public ICameraCaptureSession {
+         sampling.recordDropped();
+         continue;
+       }
++      if (frame.dark) {
++        ++dark_frames;
++        sampling.recordDropped();
++        if (!best_dark.valid() || frame.score > best_dark.score) {
++          best_dark = std::move(frame);
++        }
++        continue;
++      }
+       sampling.recordGood();
+-      const double mean = samples > 1 ? meanLuma(image) : 0.0;
+-      if (best.empty() || irFrameScore(mean) > irFrameScore(best_mean)) {
+-        best_mean = mean;
+-        best = std::move(image);
++      if (!best.valid() || frame.score > best.score) {
++        best = std::move(frame);
+       }
+     }
+-    if (!sampling.gotAny() && isOpen()) {
++    if (!best.valid() && best_dark.valid()) {
++      spdlog::debug("FaceAuth: Only dark frames from '{}' (IR emitter off or lens covered)",
++                    camera_label_);
++      best = std::move(best_dark);
++    }
++    if (!best.valid() && isOpen()) {
+       spdlog::error("FaceAuth: No usable frame from '{}' after {} dropped frames", camera_label_,
+                     kMaxDroppedFrames);
+     }
+-    if (samples > 1 && !best.empty()) {
+-      spdlog::debug("FaceAuth: Kept brightest of {} frames from '{}' (mean={:.1f})", samples,
+-                    camera_label_, best_mean);
++    if (samples > 1 && best.valid()) {
++      spdlog::debug("FaceAuth: Kept brightest of {} frames from '{}' (score={:.1f}, {} dark)",
++                    samples, camera_label_, best.score, dark_frames);
+     }
+-    return best;
++    return finishFrame(best);
+   }
+ 
+  private:
+@@ -463,8 +527,12 @@ class LibcameraCaptureSession : public ICameraCaptureSession {
+       return false;
+     }
+ 
+-    if (camera_->acquire() != 0) {
+-      spdlog::error("FaceAuth: Failed to acquire camera '{}'", camera_label_);
++    if (const int ret = camera_->acquire(); ret != 0) {
++      if (ret == -EBUSY) {
++        spdlog::error("FaceAuth: Camera '{}' is in use by another application", camera_label_);
++      } else {
++        spdlog::error("FaceAuth: Failed to acquire camera '{}': {}", camera_label_, ret);
++      }
+       return false;
+     }
+     lifecycle_.markAcquired();
+@@ -480,6 +548,20 @@ class LibcameraCaptureSession : public ICameraCaptureSession {
+     height_ = static_cast<int>(stream_config.size.height);
+     stride_ = static_cast<int>(stream_config.stride);
+     stream_ = stream_config.stream();
++    // A raw monochrome stream comes from an IR sensor, whatever was asked
++    // for: warm up and sample like a grey session.
++    raw_mono_bits_ = rawMonoBitDepth(pixel_format_);
++    is_grey_ = is_grey_ || raw_mono_bits_ != 0;
++    // What turns the delivered images upright (identity unless the sensor
++    // could not apply the camera's mounting rotation itself).
++    const libcamera::Transform transform = libcamera::Orientation::Rotate0 / config_->orientation;
++    hflip_ = !!(transform & libcamera::Transform::HFlip);
++    vflip_ = !!(transform & libcamera::Transform::VFlip);
++    transpose_ = !!(transform & libcamera::Transform::Transpose);
++    if (transform != libcamera::Transform::Identity) {
++      spdlog::debug("FaceAuth: Camera '{}' delivers {} images; turning them upright in software",
++                    camera_label_, libcamera::transformToString(transform));
++    }
+ 
+     allocator_ = std::make_unique<libcamera::FrameBufferAllocator>(camera_);
+     if (allocator_->allocate(stream_) < 0) {
+@@ -524,8 +606,10 @@ class LibcameraCaptureSession : public ICameraCaptureSession {
+       events->ready.notify_all();
+     });
+ 
+-    if (camera_->start() < 0) {
+-      spdlog::error("FaceAuth: Failed to start camera '{}'", camera_label_);
++    if (const int ret = camera_->start(); ret < 0) {
++      // -EBUSY: another camera on the same capture pipeline is streaming.
++      spdlog::error("FaceAuth: Failed to start camera '{}': {}{}", camera_label_, ret,
++                    ret == -EBUSY ? " (its capture pipeline is in use)" : "");
+       camera_->requestCompleted.disconnect(events_.get());
+       return false;
+     }
+@@ -646,8 +730,36 @@ class LibcameraCaptureSession : public ICameraCaptureSession {
+     return false;
+   }
+ 
+-  // Call only after frameSucceeded(), which checks the buffer exists.
+-  bool extractFrame(libcamera::Request* request, ImageRGB& out) {
++  // One frame of a capture: converted, or for a raw monochrome stream its
++  // unpacked values, converted only for the frame the capture keeps.
++  struct Frame {
++    ImageRGB image;
++    std::vector<uint16_t> raw;
++    MonoLevels levels;
++    double score = 0.0;  // irFrameScore() of its brightness, when ranked
++    bool dark = false;
++    bool valid() const { return !image.empty() || !raw.empty(); }
++  };
++
++  // The kept frame as an upright 8-bit image.
++  ImageRGB finishFrame(Frame& frame) const {
++    ImageRGB image;
++    if (!frame.raw.empty()) {
++      if (!monoToRgb(frame.raw, width_, height_, frame.levels.black, frame.levels.white, image)) {
++        return {};
++      }
++    } else {
++      image = std::move(frame.image);
++    }
++    if (hflip_ || vflip_ || transpose_) {
++      return transformImage(image, hflip_, vflip_, transpose_);
++    }
++    return image;
++  }
++
++  // Call only after frameSucceeded(), which checks the buffer exists. `rank`:
++  // score the frame's brightness (several samples per capture).
++  bool extractFrame(libcamera::Request* request, bool rank, Frame& out) {
+     libcamera::FrameBuffer* buffer = request->findBuffer(stream_);
+     const auto it = mappings_.find(buffer);
+     const auto metadata = buffer->metadata().planes();
+@@ -661,16 +773,34 @@ class LibcameraCaptureSession : public ICameraCaptureSession {
+       const PlaneView& mapped = it->second.planes[i];
+       planes.push_back({mapped.data, std::min<size_t>(metadata[i].bytesused, mapped.size)});
+     }
+-    if (!convertFrame(pixel_format_, planes, width_, height_, stride_, out)) {
++    if (raw_mono_bits_ != 0) {
++      const RawMonoPacking packing =
++          isCsi2Packed(pixel_format_) ? RawMonoPacking::kCsi2 : RawMonoPacking::kLe16;
++      if (!unpackRawMono(planes[0].data, planes[0].size, width_, height_, stride_, raw_mono_bits_,
++                         packing, out.raw)) {
++        spdlog::error("FaceAuth: Failed to unpack frame from '{}'", camera_label_);
++        return false;
++      }
++      std::vector<uint32_t> histogram(size_t{1} << raw_mono_bits_, 0);
++      for (const uint16_t value : out.raw) {
++        ++histogram[value];
++      }
++      out.levels = monoLevels(histogram, raw_mono_bits_);
++      out.dark = out.levels.dark;
++      out.score = irFrameScore(out.levels.signal);
++      return true;
++    }
++    if (!convertFrame(pixel_format_, planes, width_, height_, stride_, out.image)) {
+       spdlog::error("FaceAuth: Failed to convert frame from '{}'", camera_label_);
+       return false;
+     }
+     // Only MJPEG can differ: it decodes at its own header size.
+-    if ((out.width != width_ || out.height != height_) && !warned_frame_size_) {
++    if ((out.image.width != width_ || out.image.height != height_) && !warned_frame_size_) {
+       warned_frame_size_ = true;
+       spdlog::warn("FaceAuth: Camera '{}' sends {}x{} frames, configured {}x{}", camera_label_,
+-                   out.width, out.height, width_, height_);
++                   out.image.width, out.image.height, width_, height_);
+     }
++    out.score = rank ? irFrameScore(meanLuma(out.image)) : 0.0;
+     return true;
+   }
+ 
+@@ -757,6 +887,12 @@ class LibcameraCaptureSession : public ICameraCaptureSession {
+   int height_ = 0;
+   bool warned_frame_size_ = false;
+   int stride_ = 0;
++  // 10 or 12 for a raw monochrome stream, else 0.
++  int raw_mono_bits_ = 0;
++  // Applied to every frame (libcamera Transform order: flips, then transpose).
++  bool hflip_ = false;
++  bool vflip_ = false;
++  bool transpose_ = false;
+ 
+   std::unique_ptr<libcamera::FrameBufferAllocator> allocator_;
+   std::vector<std::unique_ptr<libcamera::Request>> requests_;
+@@ -785,7 +921,7 @@ std::unique_ptr<ICameraCaptureSession> openCameraSession(
+     return nullptr;
+   }
+ 
+-  auto camera = findCamera(*manager, linux_video_device_path);
++  auto camera = findCamera(*manager, linux_video_device_path, format);
+   if (!camera && linux_video_device_path.has_value()) {
+     // Custom (DKMS) drivers and v4l2loopback are invisible to libcamera.
+     spdlog::info("FaceAuth: Camera path '{}' is not a libcamera device; trying direct V4L2",
+@@ -843,7 +979,7 @@ std::vector<CameraFormatDesc> listCameraFormats(const std::string& device_path)
+     return result;
+   }
+ 
+-  auto camera = findCameraByPath(*manager, device_path);
++  auto camera = findCameraByPath(*manager, device_path, CameraCaptureFormat::Default);
+   if (!camera) {
+     return listV4l2Formats(device_path);
+   }
+diff --git a/auth/face/common/capture_policy.cc b/auth/face/common/capture_policy.cc
+index f069891..199ed43 100644
+--- a/auth/face/common/capture_policy.cc
++++ b/auth/face/common/capture_policy.cc
+@@ -46,6 +46,14 @@ uint64_t area(const libcamera::Size& size) {
+   return static_cast<uint64_t>(size.width) * static_cast<uint64_t>(size.height);
+ }
+ 
++// Raw monochrome formats, in order of preference.
++const std::vector<libcamera::PixelFormat>& rawMonoFormats() {
++  static const std::vector<libcamera::PixelFormat> formats = {
++      libcamera::formats::R10_CSI2P, libcamera::formats::R10, libcamera::formats::R12_CSI2P,
++      libcamera::formats::R12};
++  return formats;
++}
++
+ }  // namespace
+ 
+ std::vector<libcamera::PixelFormat> pixelFormatPreference(CameraCaptureFormat format) {
+@@ -60,9 +68,13 @@ std::vector<libcamera::PixelFormat> pixelFormatPreference(CameraCaptureFormat fo
+     // Prefer a true grey stream, but some laptop IR sensors (e.g. Windows
+     // Hello cameras) only expose the IR stream as NV12/YUYV/MJPEG/RGB; decode
+     // those instead of failing outright. Planar 4:2:0 carries the same luma
+-    // in fewer bytes than YUYV, so it comes first.
+-    preference = {libcamera::formats::R8,     libcamera::formats::NV12, libcamera::formats::NV21,
+-                  libcamera::formats::YUV420, libcamera::formats::YUYV, libcamera::formats::MJPEG};
++    // in fewer bytes than YUYV, so it comes first. MIPI IR sensors without an
++    // ISP offer only their raw monochrome format, which comes right after R8.
++    preference = {libcamera::formats::R8};
++    preference.insert(preference.end(), rawMonoFormats().begin(), rawMonoFormats().end());
++    preference.insert(preference.end(), {libcamera::formats::NV12, libcamera::formats::NV21,
++                                         libcamera::formats::YUV420, libcamera::formats::YUYV,
++                                         libcamera::formats::MJPEG});
+     preference.insert(preference.end(), packed_rgb.begin(), packed_rgb.end());
+   } else {
+     // Prefer MJPEG for the colour stream: an uncompressed YUYV stream at a
+@@ -72,6 +84,7 @@ std::vector<libcamera::PixelFormat> pixelFormatPreference(CameraCaptureFormat fo
+                   libcamera::formats::NV21, libcamera::formats::YUV420};
+     preference.insert(preference.end(), packed_rgb.begin(), packed_rgb.end());
+     preference.push_back(libcamera::formats::R8);
++    preference.insert(preference.end(), rawMonoFormats().begin(), rawMonoFormats().end());
+   }
+   return preference;
+ }
+@@ -156,4 +169,63 @@ bool isMonochrome(const ImageRGB& image) {
+   return chroma >= 0.0 && chroma <= kMonochromeMaxChroma;
+ }
+ 
++bool isRawMono(const libcamera::PixelFormat& format) { return rawMonoBitDepth(format) != 0; }
++
++int rawMonoBitDepth(const libcamera::PixelFormat& format) {
++  if (format == libcamera::formats::R10_CSI2P || format == libcamera::formats::R10) {
++    return 10;
++  }
++  if (format == libcamera::formats::R12_CSI2P || format == libcamera::formats::R12) {
++    return 12;
++  }
++  return 0;
++}
++
++bool isCsi2Packed(const libcamera::PixelFormat& format) {
++  return format == libcamera::formats::R10_CSI2P || format == libcamera::formats::R12_CSI2P;
++}
++
++MonoLevels monoLevels(const std::vector<uint32_t>& histogram, int bit_depth) {
++  MonoLevels levels;
++  const size_t bins = bit_depth > 0 && bit_depth <= 16 ? size_t{1} << bit_depth : 0;
++  if (bins == 0 || histogram.size() < bins) {
++    levels.dark = true;
++    return levels;
++  }
++  uint64_t total = 0;
++  double sum = 0.0;
++  for (size_t v = 0; v < bins; ++v) {
++    total += histogram[v];
++    sum += static_cast<double>(v) * histogram[v];
++  }
++  const int max_value = static_cast<int>(bins - 1);
++  if (total == 0) {
++    levels.dark = true;
++    levels.white = max_value;
++    return levels;
++  }
++  // Smallest value with more than `fraction` of the pixels at or below it.
++  const auto percentile = [&](double fraction) {
++    const double want = fraction * static_cast<double>(total);
++    uint64_t seen = 0;
++    for (size_t v = 0; v < bins; ++v) {
++      seen += histogram[v];
++      if (static_cast<double>(seen) > want) {
++        return static_cast<int>(v);
++      }
++    }
++    return max_value;
++  };
++  const int low = percentile(0.005);
++  const int high = percentile(0.995);
++  // The darkest pixels are the black level (a scene without any unlit area is
++  // rare in front of an IR emitter); capped so a bright scene keeps its shadows.
++  levels.black = std::min(low, (max_value + 1) / 16);
++  levels.white = std::min(max_value, std::max(high, levels.black + (max_value + 1) / 16));
++  levels.dark = high - levels.black < (max_value + 1) / 32;
++  const double mean = sum / static_cast<double>(total);
++  levels.signal = std::max(0.0, mean - levels.black) * 255.0 / (max_value - levels.black);
++  return levels;
++}
++
+ }  // namespace biopass
+diff --git a/auth/face/common/capture_policy.h b/auth/face/common/capture_policy.h
+index 2a4417c..a9ad6f5 100644
+--- a/auth/face/common/capture_policy.h
++++ b/auth/face/common/capture_policy.h
+@@ -6,6 +6,7 @@
+ #include <libcamera/geometry.h>
+ #include <libcamera/pixel_format.h>
+ 
++#include <cstdint>
+ #include <optional>
+ #include <vector>
+ 
+@@ -43,4 +44,29 @@ double meanChroma(const ImageRGB& image);
+ // an RGB camera filming a greyscale scene can pass it.
+ bool isMonochrome(const ImageRGB& image);
+ 
++// Raw monochrome formats (R10_CSI2P, R10, R12_CSI2P, R12): what libcamera's
++// simple pipeline offers for a MIPI IR sensor it has no ISP for. Such a
++// stream is treated as IR (grey) whatever the session asked for.
++bool isRawMono(const libcamera::PixelFormat& format);
++// 10 or 12 for a raw monochrome format, else 0.
++int rawMonoBitDepth(const libcamera::PixelFormat& format);
++// True for the CSI-2 packed variants (R10_CSI2P, R12_CSI2P).
++bool isCsi2Packed(const libcamera::PixelFormat& format);
++
++// How a raw monochrome frame is stretched to 8 bits, and how much light it
++// holds. IR sensors deliver values far below full scale, above a black level,
++// and an emitter that strobes on its own leaves some frames (nearly) black.
++struct MonoLevels {
++  int black = 0;        // raw value mapped to 0: the 0.5th percentile, at most 1/16 of full scale
++  int white = 0;        // raw value mapped to 255: the 99.5th percentile, at least black + 1/16
++  double signal = 0.0;  // mean above black, in 0..255 units of full scale (irFrameScore input)
++  bool dark = false;    // the 99.5th percentile within 1/32 of full scale above black
++};
++
++// From a histogram of the frame's raw values (one bin per value, so
++// 2^bit_depth bins). A dark frame (emitter off phase, covered lens) keeps the
++// minimum stretch span, so it stays dark instead of turning noise into an
++// image.
++MonoLevels monoLevels(const std::vector<uint32_t>& histogram, int bit_depth);
++
+ }  // namespace biopass
+diff --git a/auth/face/common/pixel_convert.cc b/auth/face/common/pixel_convert.cc
+index 2cf789b..fa5d144 100644
+--- a/auth/face/common/pixel_convert.cc
++++ b/auth/face/common/pixel_convert.cc
+@@ -214,4 +214,88 @@ bool mjpegToRgb(const uint8_t* src, size_t bytes_used, ImageRGB& out) {
+   return true;
+ }
+ 
++bool unpackRawMono(const uint8_t* src, size_t size, int width, int height, int stride,
++                   int bit_depth, RawMonoPacking packing, std::vector<uint16_t>& out) {
++  out.clear();
++  if (!src || (bit_depth != 10 && bit_depth != 12) || ImageRGB::byteSize(width, height) == 0) {
++    return false;
++  }
++  const size_t w = static_cast<size_t>(width);
++  size_t row_bytes = 0;
++  if (packing == RawMonoPacking::kLe16) {
++    row_bytes = w * 2;
++  } else if (bit_depth == 10) {
++    row_bytes = (w + 3) / 4 * 5;
++  } else {
++    row_bytes = (w + 1) / 2 * 3;
++  }
++  const size_t row_stride = std::max(static_cast<size_t>(std::max(stride, 0)), row_bytes);
++  if (size < row_stride * static_cast<size_t>(height - 1) + row_bytes) {
++    return false;
++  }
++
++  const uint16_t max_value = static_cast<uint16_t>((1u << bit_depth) - 1);
++  out.resize(w * static_cast<size_t>(height));
++  for (int y = 0; y < height; ++y) {
++    const uint8_t* row = src + static_cast<size_t>(y) * row_stride;
++    uint16_t* dst = out.data() + static_cast<size_t>(y) * w;
++    for (size_t x = 0; x < w; ++x) {
++      if (packing == RawMonoPacking::kLe16) {
++        dst[x] = std::min<uint16_t>(static_cast<uint16_t>(row[x * 2] | (row[x * 2 + 1] << 8)),
++                                    max_value);
++      } else if (bit_depth == 10) {
++        // Bytes 0-3: the high 8 bits of pixels 0-3; byte 4: their low 2 bits.
++        const uint8_t* group = row + x / 4 * 5;
++        const unsigned shift = static_cast<unsigned>(x % 4) * 2;
++        dst[x] = static_cast<uint16_t>((group[x % 4] << 2) | ((group[4] >> shift) & 0x3));
++      } else {
++        // Bytes 0-1: the high 8 bits of pixels 0-1; byte 2: their low 4 bits.
++        const uint8_t* group = row + x / 2 * 3;
++        const unsigned shift = static_cast<unsigned>(x % 2) * 4;
++        dst[x] = static_cast<uint16_t>((group[x % 2] << 4) | ((group[2] >> shift) & 0xF));
++      }
++    }
++  }
++  return true;
++}
++
++bool monoToRgb(const std::vector<uint16_t>& pixels, int width, int height, int black, int white,
++               ImageRGB& out) {
++  const size_t count =
++      static_cast<size_t>(std::max(width, 0)) * static_cast<size_t>(std::max(height, 0));
++  if (ImageRGB::byteSize(width, height) == 0 || pixels.size() < count) {
++    return false;
++  }
++  const int span = std::max(1, white - black);
++  out = ImageRGB(width, height);
++  uint8_t* dst = out.ptr();
++  for (size_t i = 0; i < count; ++i) {
++    const uint8_t v = clamp_u8(((static_cast<int>(pixels[i]) - black) * 255 + span / 2) / span);
++    dst[i * 3 + 0] = v;
++    dst[i * 3 + 1] = v;
++    dst[i * 3 + 2] = v;
++  }
++  return true;
++}
++
++ImageRGB transformImage(const ImageRGB& in, bool hflip, bool vflip, bool transpose) {
++  if (in.empty() || (!hflip && !vflip && !transpose)) {
++    return in.clone();
++  }
++  const int out_w = transpose ? in.height : in.width;
++  const int out_h = transpose ? in.width : in.height;
++  ImageRGB out(out_w, out_h);
++  for (int y = 0; y < out_h; ++y) {
++    for (int x = 0; x < out_w; ++x) {
++      // The flipped image's (fx, fy) lands at (x, y), transposed or not.
++      const int fx = transpose ? y : x;
++      const int fy = transpose ? x : y;
++      const int sx = hflip ? in.width - 1 - fx : fx;
++      const int sy = vflip ? in.height - 1 - fy : fy;
++      std::memcpy(&out.at(y, x, 0), &in.at(sy, sx, 0), 3);
++    }
++  }
++  return out;
++}
++
+ }  // namespace biopass
+diff --git a/auth/face/common/pixel_convert.h b/auth/face/common/pixel_convert.h
+index 23f0208..14adf78 100644
+--- a/auth/face/common/pixel_convert.h
++++ b/auth/face/common/pixel_convert.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <vector>
+ 
+ #include "image.h"
+ 
+@@ -44,4 +45,28 @@ bool packedRgbToRgb(const uint8_t* src, size_t size, int width, int height, int
+ // header over ImageRGB::kMaxDim.
+ bool mjpegToRgb(const uint8_t* src, size_t bytes_used, ImageRGB& out);
+ 
++// Raw monochrome frames from MIPI IR sensors (e.g. Y10 behind a CSI-2
++// receiver without an ISP; libcamera names them R10_CSI2P, R10, R12_CSI2P,
++// R12). The values sit far below full scale and above a black level, so they
++// are unpacked first and stretched to 8 bits with monoToRgb().
++enum class RawMonoPacking {
++  kCsi2,  // MIPI CSI-2 packing: 10 bits: 4 pixels in 5 bytes, 12 bits: 2 in 3
++  kLe16,  // one little-endian 16-bit word per pixel, value in the low bits
++};
++
++// One value per pixel (0 .. 2^bit_depth - 1), row-major, `width` per row.
++// bit_depth: 10 or 12. False if `size` is too small for the rows.
++bool unpackRawMono(const uint8_t* src, size_t size, int width, int height, int stride,
++                   int bit_depth, RawMonoPacking packing, std::vector<uint16_t>& out);
++
++// Maps black..white linearly to 0..255 grey (clamped) as an RGB image.
++bool monoToRgb(const std::vector<uint16_t>& pixels, int width, int height, int black, int white,
++               ImageRGB& out);
++
++// The image with libcamera Transform semantics: the flips first, then the
++// transpose (which swaps width and height). Used to undo a camera's mounting
++// rotation when the sensor cannot flip (see libcamera::CameraConfiguration::
++// orientation).
++ImageRGB transformImage(const ImageRGB& in, bool hflip, bool vflip, bool transpose);
++
+ }  // namespace biopass
+diff --git a/auth/face/face_auth.cc b/auth/face/face_auth.cc
+index 219fa20..469345e 100644
+--- a/auth/face/face_auth.cc
++++ b/auth/face/face_auth.cc
+@@ -69,6 +69,7 @@ bool FaceAuth::irIsMainCamera() const {
+ // treat as grey; ask for grey so every capture warms up and keeps the
+ // brightest of several frames. The colour timeout still bounds the capture.
+ std::unique_ptr<ICameraCaptureSession> FaceAuth::openMainCamera() const {
++  ir_camera_session_.reset();
+   if (irIsMainCamera()) {
+     return open_camera_(face_config_.camera, CameraCaptureFormat::V4L2Grey, kIrCaptureWarmupFrames,
+                         kColorCaptureTimeoutMs);
+@@ -107,6 +108,9 @@ ICameraCaptureSession* FaceAuth::irPresenceSession() {
+   }
+   if (!ir_camera_session_ || !ir_camera_session_->isOpen()) {
+     ir_camera_session_.reset();
++    // The main frame is captured by now; the next attempt opens the main
++    // camera again (openMainCamera() closes this session first).
++    camera_session_.reset();
+     ir_camera_session_ = open_camera_(*ir_camera, CameraCaptureFormat::V4L2Grey,
+                                       kIrCaptureWarmupFrames, kIrCaptureTimeoutMs);
+     if (!ir_camera_session_) {
+diff --git a/auth/face/face_auth.h b/auth/face/face_auth.h
+index e1c996b..3428907 100644
+--- a/auth/face/face_auth.h
++++ b/auth/face/face_auth.h
+@@ -48,8 +48,10 @@ class FaceAuth : public IAuthMethod {
+ 
+   // The session the IR presence check captures from, or nullptr. When the IR
+   // camera is the main camera it is the main session: libcamera can't acquire
+-  // one camera twice. Otherwise the IR session, opened on first use. Public
+-  // for tests.
++  // one camera twice. Otherwise the IR session, opened on first use after the
++  // main session is closed: only one camera streams at a time (cameras behind
++  // one capture pipeline, e.g. MIPI sensors on one CSI-2 receiver, cannot
++  // stream together, and USB cameras share the bus). Public for tests.
+   ICameraCaptureSession* irPresenceSession();
+ 
+  private:
+@@ -58,7 +60,8 @@ class FaceAuth : public IAuthMethod {
+                      std::atomic<bool>* cancel_signal);
+   // True when ir_camera names the same device as camera.
+   bool irIsMainCamera() const;
+-  // The main camera; opened as grey when it is the IR camera.
++  // The main camera; opened as grey when it is the IR camera. Closes the IR
++  // session first.
+   std::unique_ptr<ICameraCaptureSession> openMainCamera() const;
+   // Loads detection + recognition once; false if either fails to load.
+   bool ensureModelsLoaded();
+@@ -73,7 +76,8 @@ class FaceAuth : public IAuthMethod {
+   CameraOpener open_camera_;
+   // Opened by isAvailable() (hence mutable) and kept for the auth session.
+   mutable std::unique_ptr<ICameraCaptureSession> camera_session_;
+-  std::unique_ptr<ICameraCaptureSession> ir_camera_session_;
++  // Closed by openMainCamera() (hence mutable) before the main camera opens.
++  mutable std::unique_ptr<ICameraCaptureSession> ir_camera_session_;
+   std::unique_ptr<FaceDetection> detector_;
+   std::unique_ptr<FaceRecognition> recognizer_;
+   // Loaded by the first anti-spoofing check and kept, like detector_ and
+diff --git a/auth/test/camera/main.cpp b/auth/test/camera/main.cpp
+index eb32cdd..2976638 100644
+--- a/auth/test/camera/main.cpp
++++ b/auth/test/camera/main.cpp
+@@ -59,9 +59,10 @@ void print_formats(const std::string& device_path) {
+   }
+ }
+ 
+-// Resolves a device selector to a /dev/video* path. Accepts a Linux path
+-// (/dev/videoN or a /dev/v4l/by-* link) directly, a bare index into
+-// listCameraDevices(), or a model substring.
++// Resolves a device selector to what openCameraSession() takes. A Linux path
++// (/dev/videoN or a /dev/v4l/by-* link) is used directly; a bare index into
++// listCameraDevices(), or a camera id or model substring, gives the camera id,
++// which names one camera even where cameras share their video nodes.
+ std::string resolve_device_selector(const std::string& selector) {
+   if (selector.rfind("/dev/", 0) == 0) {
+     return selector;
+@@ -77,19 +78,17 @@ std::string resolve_device_selector(const std::string& selector) {
+     if (parsed >= devices.size()) {
+       throw std::runtime_error("Device index out of range: " + selector);
+     }
+-    if (devices[parsed].video_paths.empty()) {
+-      throw std::runtime_error("Device [" + selector + "] has no /dev/video* path");
+-    }
+-    return devices[parsed].video_paths.front();
++    return devices[parsed].id;
+   }
+ 
+   std::vector<std::string> matches;
+   for (const auto& device : devices) {
++    if (device.id == selector) {
++      return device.id;
++    }
+     if (device.id.find(selector) != std::string::npos ||
+         device.model.find(selector) != std::string::npos) {
+-      if (!device.video_paths.empty()) {
+-        matches.push_back(device.video_paths.front());
+-      }
++      matches.push_back(device.id);
+     }
+   }
+ 
+diff --git a/auth/test/capture_policy/main.cpp b/auth/test/capture_policy/main.cpp
+index 9d7cff0..97e3609 100644
+--- a/auth/test/capture_policy/main.cpp
++++ b/auth/test/capture_policy/main.cpp
+@@ -41,19 +41,21 @@ bool picks(const std::vector<Size>& sizes, const PixelFormat& format, const Size
+ }
+ 
+ void testPreference() {
+-  const std::vector<PixelFormat> colour = {formats::MJPEG,    formats::YUYV,     formats::NV12,
+-                                           formats::NV21,     formats::YUV420,   formats::BGR888,
+-                                           formats::RGB888,   formats::XBGR8888, formats::XRGB8888,
+-                                           formats::ABGR8888, formats::ARGB8888, formats::R8};
++  const std::vector<PixelFormat> colour = {
++      formats::MJPEG,     formats::YUYV,     formats::NV12,      formats::NV21,
++      formats::YUV420,    formats::BGR888,   formats::RGB888,    formats::XBGR8888,
++      formats::XRGB8888,  formats::ABGR8888, formats::ARGB8888,  formats::R8,
++      formats::R10_CSI2P, formats::R10,      formats::R12_CSI2P, formats::R12};
+   expect(pixelFormatPreference(CameraCaptureFormat::Default) == colour,
+-         "colour: MJPEG, YUYV, NV12, NV21, YUV420, packed RGB (BGR888 first), then R8");
++         "colour: MJPEG, YUYV, NV12, NV21, YUV420, packed RGB (BGR888 first), R8, then raw mono");
+ 
+-  const std::vector<PixelFormat> ir = {formats::R8,       formats::NV12,     formats::NV21,
+-                                       formats::YUV420,   formats::YUYV,     formats::MJPEG,
+-                                       formats::BGR888,   formats::RGB888,   formats::XBGR8888,
+-                                       formats::XRGB8888, formats::ABGR8888, formats::ARGB8888};
++  const std::vector<PixelFormat> ir = {
++      formats::R8,       formats::R10_CSI2P, formats::R10,      formats::R12_CSI2P,
++      formats::R12,      formats::NV12,      formats::NV21,     formats::YUV420,
++      formats::YUYV,     formats::MJPEG,     formats::BGR888,   formats::RGB888,
++      formats::XBGR8888, formats::XRGB8888,  formats::ABGR8888, formats::ARGB8888};
+   expect(pixelFormatPreference(CameraCaptureFormat::V4L2Grey) == ir,
+-         "ir: R8, NV12, NV21, YUV420, YUYV, MJPEG, then packed RGB (BGR888 first)");
++         "ir: R8, raw mono, NV12, NV21, YUV420, YUYV, MJPEG, then packed RGB (BGR888 first)");
+ }
+ 
+ void testCaptureSize() {
+@@ -158,6 +160,45 @@ void testMonochrome() {
+ 
+ }  // namespace
+ 
++// Levels of raw 10-bit IR frames as an HM1092 (Y10, strobing emitter)
++// delivers them: black level ~30, a lit frame's brightest pixels ~130, an
++// unlit frame's within a few levels of black.
++void testMonoLevels() {
++  using biopass::isRawMono;
++  using biopass::monoLevels;
++  using biopass::rawMonoBitDepth;
++  expect(isRawMono(formats::R10_CSI2P) && isRawMono(formats::R12) && !isRawMono(formats::R8) &&
++             rawMonoBitDepth(formats::R10) == 10 && rawMonoBitDepth(formats::R12_CSI2P) == 12 &&
++             rawMonoBitDepth(formats::YUYV) == 0,
++         "raw mono formats and their bit depth");
++
++  std::vector<uint32_t> lit(1024, 0);
++  lit[30] = 100;   // unlit background: black level
++  lit[60] = 9700;  // the scene
++  lit[130] = 200;  // the brightest part
++  const auto l = monoLevels(lit, 10);
++  expect(l.black == 30 && l.white == 130 && !l.dark,
++         "lit frame: black at the 0.5th, white at the 99.5th percentile");
++  expect(l.signal > 7.5 && l.signal < 8.5, "lit frame: signal is the mean above black");
++
++  std::vector<uint32_t> dark(1024, 0);
++  dark[30] = 5000;
++  dark[33] = 4900;
++  dark[41] = 100;
++  const auto d = monoLevels(dark, 10);
++  expect(d.dark && d.white - d.black == 64,
++         "unlit frame: dark, stretch kept at 1/16 of full scale");
++  expect(irFrameScore(d.signal) < irFrameScore(l.signal), "a lit frame ranks above an unlit one");
++
++  std::vector<uint32_t> bright(1024, 0);
++  bright[500] = 100;
++  bright[900] = 9900;
++  const auto b = monoLevels(bright, 10);
++  expect(b.black == 64 && !b.dark, "bright scene: black level capped at 1/16 of full scale");
++  expect(monoLevels(std::vector<uint32_t>(1024, 0), 10).dark, "empty histogram: dark");
++  expect(monoLevels(lit, 12).dark, "histogram too small for the bit depth: dark");
++}
++
+ int main() {
+   testPreference();
+   testCaptureSize();
+@@ -165,5 +206,6 @@ int main() {
+   testIrScore();
+   testMeanLuma();
+   testMonochrome();
++  testMonoLevels();
+   return g_failures == 0 ? 0 : 1;
+ }
+diff --git a/auth/test/face_camera_reuse/main.cpp b/auth/test/face_camera_reuse/main.cpp
+index 5c24198..1690294 100644
+--- a/auth/test/face_camera_reuse/main.cpp
++++ b/auth/test/face_camera_reuse/main.cpp
+@@ -3,7 +3,8 @@
+ // from. When an attempt can't open the camera, one more open still decides
+ // Unavailable vs Retry, and a session it gets is kept for the next attempt.
+ // When the IR camera is the main camera, the IR presence check reuses the
+-// main session instead of opening the device a second time.
++// main session instead of opening the device a second time. A separate IR
++// camera never streams at the same time as the main one.
+ // Uses a fake camera and an unknown user, so no camera or model is needed.
+ // Exits non-zero on any failure.
+ 
+@@ -206,8 +207,10 @@ void checkIrIsMainCameraReused(const std::string& camera, const std::string& ir_
+   expect(log.closes == 1 && log.live == 0, label + ": session end closes the one session");
+ }
+ 
+-// Different cameras: the IR session is a second, grey session, opened once
+-// and reused while it stays open.
++// Different cameras: the IR session is a second, grey session. Only one
++// camera streams at a time (cameras on one CSI-2 receiver can't stream
++// together): the main session is closed before the IR session opens, and the
++// IR session before the main camera opens again.
+ void checkSeparateIrCamera() {
+   CameraLog log;
+   biopass::FaceAuth face(withCameras("/dev/fake-rgb", "/dev/fake-ir"), kUser, fakeOpener(log));
+@@ -222,11 +225,21 @@ void checkSeparateIrCamera() {
+              log.formats[1] == biopass::CameraCaptureFormat::V4L2Grey &&
+              log.timeouts[1] == biopass::kIrCaptureTimeoutMs,
+          "separate IR camera: opened as grey with the IR timeout");
++  expect(log.closes == 1 && log.live == 1,
++         "separate IR camera: the main session is closed before the IR one opens");
+   expect(face.irPresenceSession() == ir && log.opens == 2,
+-         "separate IR camera: reused on the next attempt");
++         "separate IR camera: reused while it stays open");
++
++  // The next attempt opens the main camera again, after closing the IR
++  // session. (The unknown user has no enrolled face; the attempt stops there.)
++  face.authenticate(kUser, biopass::AuthConfig{});
++  expect(log.opens == 3 && log.paths[2] == "/dev/fake-rgb" && log.closes == 2 && log.live == 1,
++         "separate IR camera: the IR session is closed before the main camera opens again");
++  expect(log.max_live_at_open == 0, "separate IR camera: never two sessions open at once (max=" +
++                                        std::to_string(log.max_live_at_open) + ")");
+ 
+   face.endAuthenticationSession();
+-  expect(log.live == 0, "separate IR camera: session end closes both");
++  expect(log.live == 0, "separate IR camera: session end closes the open session");
+ }
+ 
+ // A /dev/v4l/by-id style symlink names the same device as its target.
+diff --git a/auth/test/pixel_convert/main.cpp b/auth/test/pixel_convert/main.cpp
+index 6d2e0b5..a555479 100644
+--- a/auth/test/pixel_convert/main.cpp
++++ b/auth/test/pixel_convert/main.cpp
+@@ -1,6 +1,8 @@
+ // Byte-order checks for the packed RGB converters (face/common/pixel_convert.h)
+ // used for libcamera SoftISP output, and the values the YUYV (BT.601 limited
+-// range), NV12/NV21/YUV420 and GREY converters produce. Exits non-zero on any failure.
++// range), NV12/NV21/YUV420 and GREY converters produce, the raw monochrome
++// unpacking and stretch, and the orientation transform. Exits non-zero on any
++// failure.
+ 
+ #include <cstdio>
+ #include <vector>
+@@ -276,6 +278,64 @@ void checkYuv420() {
+          "YUV420: rejects zero height");
+ }
+ 
++// Raw monochrome: CSI-2 packed 10 and 12 bits, 16-bit containers, padding.
++void checkRawMono() {
++  using biopass::RawMonoPacking;
++  std::vector<uint16_t> px;
++  // 10 bits, 4 pixels in 5 bytes: 0x3FF, 0x000, 0x201, 0x0FE, then 0xEE padding.
++  // High bytes 0xFF 0x00 0x80 0x3F, low bits 11 00 01 10 -> 0b10010011.
++  const uint8_t p10[12] = {0xFF, 0x00, 0x80, 0x3F, 0x93, 0xEE, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEE};
++  expect(biopass::unpackRawMono(p10, sizeof(p10), 4, 2, 6, 10, RawMonoPacking::kCsi2, px) &&
++             px.size() == 8 && px[0] == 0x3FF && px[1] == 0 && px[2] == 0x201 && px[3] == 0x0FE &&
++             px[4] == 0 && px[7] == 0,
++         "R10_CSI2P: 4 pixels in 5 bytes, row padding skipped");
++  expect(!biopass::unpackRawMono(p10, 9, 4, 2, 6, 10, RawMonoPacking::kCsi2, px),
++         "R10_CSI2P: rejects a truncated frame");
++  // 12 bits, 2 pixels in 3 bytes: 0xABC, 0x123 -> 0xAB 0x12 0x3C.
++  const uint8_t p12[3] = {0xAB, 0x12, 0x3C};
++  expect(biopass::unpackRawMono(p12, sizeof(p12), 2, 1, 3, 12, RawMonoPacking::kCsi2, px) &&
++             px.size() == 2 && px[0] == 0xABC && px[1] == 0x123,
++         "R12_CSI2P: 2 pixels in 3 bytes");
++  const uint8_t le[4] = {0xFF, 0x03, 0x34, 0x12};
++  expect(biopass::unpackRawMono(le, sizeof(le), 2, 1, 4, 10, RawMonoPacking::kLe16, px) &&
++             px[0] == 0x3FF && px[1] == 0x3FF,
++         "R10: little-endian words, values clamped to the bit depth");
++  expect(!biopass::unpackRawMono(le, sizeof(le), 2, 1, 4, 8, RawMonoPacking::kLe16, px),
++         "rejects a bit depth other than 10 or 12");
++
++  ImageRGB out;
++  const std::vector<uint16_t> raw = {30, 130, 80, 1000};
++  expect(biopass::monoToRgb(raw, 2, 2, 30, 130, out) && pixelIs(out, 0, 0, {0, 0, 0}) &&
++             pixelIs(out, 1, 0, {255, 255, 255}) && pixelIs(out, 0, 1, {128, 128, 128}) &&
++             pixelIs(out, 1, 1, {255, 255, 255}),
++         "mono stretch: black..white -> 0..255 grey, clamped");
++  expect(!biopass::monoToRgb(raw, 3, 2, 30, 130, out), "mono stretch: rejects too few pixels");
++}
++
++// libcamera Transform semantics: flips first, then the transpose.
++void checkTransform() {
++  // 2x1: A=(1,1,1), B=(2,2,2)
++  const uint8_t ab[6] = {1, 1, 1, 2, 2, 2};
++  const ImageRGB in(2, 1, ab);
++  ImageRGB out = biopass::transformImage(in, true, true, false);
++  expect(out.width == 2 && out.height == 1 && out.at(0, 0, 0) == 2 && out.at(0, 1, 0) == 1,
++         "rotate 180 of A-B is B-A");
++  out = biopass::transformImage(in, false, true, true);
++  expect(out.width == 1 && out.height == 2 && out.at(0, 0, 0) == 1 && out.at(1, 0, 0) == 2,
++         "Rot90 (VFlip + Transpose) of A-B is A over B");
++  out = biopass::transformImage(in, true, false, true);
++  expect(out.width == 1 && out.height == 2 && out.at(0, 0, 0) == 2 && out.at(1, 0, 0) == 1,
++         "Rot270 (HFlip + Transpose) of A-B is B over A");
++  // 2x2 A B / C D, Rot90 clockwise -> C A / D B
++  const uint8_t abcd[12] = {1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4};
++  out = biopass::transformImage(ImageRGB(2, 2, abcd), false, true, true);
++  expect(
++      out.at(0, 0, 0) == 3 && out.at(0, 1, 0) == 1 && out.at(1, 0, 0) == 4 && out.at(1, 1, 0) == 2,
++      "Rot90 of A-B/C-D is C-A/D-B");
++  out = biopass::transformImage(in, false, false, false);
++  expect(out.width == 2 && out.at(0, 0, 0) == 1, "identity keeps the image");
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -288,6 +348,8 @@ int main() {
+   checkGrey();
+   checkNv12();
+   checkYuv420();
++  checkRawMono();
++  checkTransform();
+ 
+   std::printf("%s\n", g_failures == 0 ? "All checks passed" : "Some checks FAILED");
+   return g_failures == 0 ? 0 : 1;
+diff --git a/docs/IR camera.md b/docs/IR camera.md
+index cac13ce..e742bfa 100644
+--- a/docs/IR camera.md	
++++ b/docs/IR camera.md	
+@@ -59,6 +59,18 @@ Profiles below an `Auto-select` profile are never used.
+ 
+ With no profiles, the `Camera Device` and `IR Camera` settings are used, as before.
+ 
++### MIPI IR sensors (raw monochrome)
++
++Some laptops (e.g. Snapdragon X with Qualcomm CAMSS, or Intel IPU) connect the IR sensor over MIPI CSI-2 without an ISP that handles monochrome sensors. libcamera's simple pipeline then offers only the sensor's raw format, such as `R10_CSI2P` (10-bit packed, `Y10P`), `R10`, `R12_CSI2P` or `R12`. Biopass reads these as IR streams:
++
++- The values are unpacked and stretched to 8-bit grey: the darkest pixels (0.5th percentile, at most 1/16 of full scale) become black, the brightest (99.5th percentile) white. A frame with almost no light keeps a minimum stretch, so it stays dark instead of turning sensor noise into an image.
++- Dark frames, as an emitter that strobes on its own delivers in its off phase, don't count as samples: each capture keeps the brightest lit frame, and returns a dark one only when no lit frame arrives (covered lens).
++- If the camera is mounted rotated (libcamera's `Rotation` property, from the devicetree or ACPI) and the sensor cannot flip, Biopass turns the frames upright in software. This applies to every format.
++
++Such cameras often share all their `/dev/video*` nodes (one CSI-2 receiver for both sensors), so a node does not say which camera it is. Biopass then uses the monochrome sensor for the IR camera and the colour sensor for the main camera. To pick a camera explicitly, put its libcamera id (as `cam -l` or `camera_capture_test --list-devices` prints it, e.g. `/base/soc@0/cci@ac15000/i2c-bus@0/camera@24`) into `camera` or `anti_spoofing.ir_camera` in `config.yaml`; the app shows it as an unavailable device but keeps it. For the IR sensor as the main camera, set both to its id.
++
++Only one camera streams at a time: the main camera is closed before the IR camera opens, and the other way round. Cameras behind one capture pipeline cannot stream together, and USB cameras share the bus. A camera that another application holds fails the attempt at once; PAM then falls through to the next method.
++
+ ## 3. If The IR Emitter Stays Off On Linux
+ 
+ If the IR camera is detected but its emitter does not light up, use [`linux-enable-ir-emitter`](https://github.com/EmixamPP/linux-enable-ir-emitter):
+-- 
+2.43.0
+
