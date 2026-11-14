@@ -21,6 +21,7 @@
 #   s15-face snapshot ir|rgb [file]     one frame as Biopass sees it (default /tmp/s15-face-<camera>.png)
 #   s15-face cameras                    the cameras as Biopass's libcamera lists them
 set -u
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin   # pam_exec passes only the PAM environment
 STATE=/run/s15-face
 MAX_FAILS=5
 TOOL=/usr/lib/s15-face/camera_capture_test
