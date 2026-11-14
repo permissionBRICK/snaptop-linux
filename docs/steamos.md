@@ -98,7 +98,8 @@ IR illuminator is a separate component.
 | `kms`, `s15-display` | The display driver (msm) is in the image but only loaded when a passphrase is requested, next to the prompt and without delaying it (`s15-prompt-display.service`); meanwhile the Caps Lock light blinks (`s15-prompt-signal.service`). See below. |
 | `keyboard`, `sd-vconsole`, `i2c_hid_of`, `hid_asus_ec` | Internal keyboard, console keymap and font (`/etc/vconsole.conf`) for a passphrase prompt. The keymap is global for all consoles, so SteamOS's own `systemd-vconsole-setup` is masked. |
 | `tpm_qcom_crb`, `sd-encrypt` | Firmware TPM and LUKS, for an encrypted root ([tpm.md](tpm.md)); idle without `crypttab`/`rd.luks`. |
-| `s15-btrfs-logcheck` | Before the root is mounted: replays a btrfs tree log left by a crash, or drops it if the kernel cannot replay it ([known-issues.md](known-issues.md#btrfs-tree-log)). |
+| `s15-btrfs-logcheck` | Before the root is mounted: replays a btrfs tree log left by a crash, or drops it if the kernel cannot replay it; after the resume attempt, so it never mounts the file system under a hibernation image ([known-issues.md](known-issues.md#btrfs-tree-log)). |
+| `s15-hibernate` | Only with `resume=` (hibernation enabled, [power.md](power.md#hibernation)): stops the DSPs that `s15-dsp` started before the kernel hands over to a hibernation image, and starts them again if the resume does not happen. |
 | `sd-s15-etc-overlay` | Mounts SteamOS's `/etc` overlay before switch-root, so units enabled at runtime start at boot. |
 
 Why the DSPs start this early: the firmware's framebuffer (efifb) does not survive the kernel's cleanup of unused

@@ -109,7 +109,7 @@ for u in steamvr-program-ble.service steamvr-v4l2loopback.service steamvr-set-ke
          adbd.service adbd-post.service usb-gadget.service usb-gadget.target usb-ncm-gadget@.service \
          usb-ncm-dnsmasq@.service steamos-boot.service efi.mount esp.mount home.mount persist.mount \
          systemd-repart.service set-bluetooth-mac-address.service swapfile.service home-swapfile.swap \
-         iio-sensor-proxy.service; do
+         hibernate-prepare.service iio-sensor-proxy.service; do
   ln -sfn /dev/null "$R/etc/systemd/system/$u"
 done
 for u in steamvr.service steamvr-logs.service steamvr-proxmicmute.service steamvr-v4l2cam.service \
@@ -282,6 +282,16 @@ with open(sys.argv[1], "w") as f: c.write(f, space_around_delimiters=False)
 PY
 install -D -m0755 "$HERE/s15-power-key" "$R/usr/local/bin/s15-power-key"
 install -D -m0755 "$HERE/s15-power-key-mark" "$R/usr/lib/systemd/system-sleep/s15-power-key-mark"
+# Hibernation (docs/power.md#hibernation): inert until hibernate.sh enable (swap file, resume options).
+install -D -m0755 "$HERE/s15-hibernate" "$R/usr/lib/systemd/system-sleep/s15-hibernate"
+install -D -m0755 "$HERE/s15-hibernate-initrd" "$R/usr/local/sbin/s15-hibernate-initrd"
+install -m0644 "$HERE/s15-hibernate-swap.service" "$R/etc/systemd/system/s15-hibernate-swap.service"
+# systemd 256+ freezes user sessions before the sleep hooks run; s15-hibernate stops the ADSP, which removes the
+# sound card and waits until PipeWire closed it, so a frozen PipeWire blocks it for good.
+install -d "$R/etc/systemd/system/systemd-hibernate.service.d"
+printf '[Service]\nEnvironment=SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=false\n' \
+  > "$R/etc/systemd/system/systemd-hibernate.service.d/s15-no-freeze.conf"
+ln -sfn /etc/systemd/system/s15-hibernate-swap.service "$R/etc/systemd/system/multi-user.target.wants/s15-hibernate-swap.service"
 printf '[Unit]\nDescription=Power key: sleep in Desktop Mode, ignore the waking press\n[Service]\nExecStart=/usr/local/bin/s15-power-key\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n' \
   > "$R/etc/systemd/system/s15-power-key.service"
 mkdir -p "$R/etc/systemd/system/multi-user.target.wants"
@@ -331,7 +341,7 @@ say "initramfs for $KV (systemd; boot drivers, DSPs and display, keyboard, TPM, 
 # docs/steamos.md#initramfs. The install hooks are files in steamos/initcpio/; the busybox variant's /etc overlay hook
 # (s15_etc_overlay) is replaced by sd-s15-etc-overlay.
 mkdir -p "$R/etc/initcpio/install"
-for h in s15 s15-dsp s15-display s15-btrfs-logcheck sd-s15-etc-overlay; do install -m0644 "$HERE/initcpio/$h" "$R/etc/initcpio/install/$h"; done
+for h in s15 s15-dsp s15-hibernate s15-display s15-btrfs-logcheck sd-s15-etc-overlay; do install -m0644 "$HERE/initcpio/$h" "$R/etc/initcpio/install/$h"; done
 # Before the root is mounted: replay a btrfs tree log left by a crash, or drop it if the kernel cannot replay it
 # (docs/known-issues.md#btrfs-tree-log).
 install -D -m0755 "$HERE/s15-btrfs-logcheck" "$R/usr/local/sbin/s15-btrfs-logcheck"

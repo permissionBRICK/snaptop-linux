@@ -126,8 +126,7 @@ only the user or the battery wakes the machine.
 
 Still able to wake the machine: lid, keyboard, touchpad, power key, USB devices, the EC, the ADSP (battery
 management) and the thermal sensors. The RTC cannot (the firmware owns its alarm), so there are no timed wakes and
-no suspend-then-hibernate. Hibernation is compiled in but has no disk swap to write to (only zram) and is untested
-on this platform.
+no suspend-then-hibernate. Hibernation is experimental and off by default ([below](#hibernation)).
 
 ## Standby: CX collapse (2026-11-01)
 
@@ -165,6 +164,47 @@ AOSD, 0.17 W CXSD-only), so `aoss_cxsd_only` stays. The drain in AOSD could not 
 Caveat: these figures come from the battery gauge (`energy_now` in 10 mWh steps, model-based, possibly corrected after
 a long rest), not from a power meter; compare only long runs at similar charge levels. A false "input activity" after the hourly EC
 wake kept the laptop awake for 14 min in this test (fixed: the input baseline is now taken 2 s after the wake).
+
+## Hibernation
+
+Experimental (2026-11-14), not part of the install and not offered by default: the goal is Windows' "hibernate after
+some hours of standby". The mechanics work end to end; the restored system does not yet (see below).
+
+Enable with `sudo /opt/snaptop-linux/steamos/hibernate.sh enable` (`status`, `disable` to undo). It
+- creates a 16 GiB swap file in its own subvolume of the partition's top level, `.s15-swap` (outside the OS
+  versions that updates swap; the top level carries `compression=zstd`, which the subvolume must not inherit, or the
+  file cannot be made NOCOW), switched on at boot by `s15-hibernate-swap.service` with a priority below zram;
+- writes `resume=<root device> resume_offset=<page>` into every boot entry of this install (`s15-os-update` copies
+  them into the entries it writes), rebuilds the initramfs and re-seals the TPM unlock;
+- masks Valve's `hibernate-prepare.service`: its swap helper finds the file offset with `filefrag`, which is wrong
+  on btrfs, so the kernel would write the image over other data.
+
+Around a hibernation (sleep hook `s15-hibernate`, initcpio hook `s15-hibernate`):
+- the image size limit is set to the memory in use, so the page cache is dropped instead of saved (about 4.5 GB);
+- the location systemd-sleep configured is checked against `/etc/s15-hibernate.conf`; on a mismatch the swap file
+  is switched off and the hibernation fails instead of writing elsewhere;
+- BootNext is set to the running entry and systemd-boot's one-shot entry to the running kernel: the firmware starts
+  Windows first, and BootNext survives a full power-off (tested 2026-11-14);
+- the CDSP and ADSP are stopped (CDSP first: the other DSP's state notifications to it time out after 5 s each).
+  Their driver has no hibernation callbacks, and the boot that restores the image starts its own instances in the
+  initramfs; `s15-hibernate-initrd` stops those again right before the hand-over, and the restored system starts
+  them. Stopping the ADSP removes the sound card, which waits until PipeWire closed it, so user sessions are not
+  frozen during the hooks (`SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=false` on `systemd-hibernate.service`; otherwise the
+  stop waits forever and the kernel aborts the hibernation after systemd's 90 s hook timeout);
+- `s15-ec-darkwake` and `s15-sleep-radios` treat a resume from hibernation as a real wake.
+
+Measured (2026-11-14): hibernation entry a few seconds; on resume the boot kernel reaches the image load after about
+12 s (8.5 s of it stopping the CDSP, which is not needed in the initramfs). Then it took minutes until the restored
+system ran again: the image load itself is the suspect (not yet measured). After the restore: Wi-Fi and the ADSP
+(battery, USB-C) come back; broken are the GPU (the GMU expects its firmware still loaded: "Unable to power on the GPU
+RSC", black screen), the EC (an interrupt storm of "Unknown EC event: 0"; it seems to reset itself without its
+temperature feed during a long resume), the USB controllers ("Clearing Run/Stop bit failed"), Bluetooth (no answer
+from the controller) and audio (after any ADSP restart the LPASS macros keep dead clock handles; the macro and codec
+drivers forbid a rebind, and unloading the LPASS modules afterwards corrupted the kernel). These need kernel work.
+Test aids: `/run/s15-hibernate-signal` (Caps Lock blinks when the restored system runs), `/run/s15-hibernate-entry`
+(one-shot entry for the resume, e.g. one without `quiet`), `s15.hibernate_report=1` on that entry (the boot kernel
+writes its log to `S15BOOT/s15-hibernate-resume.log` before the image load). `clk_ignore_unused` on the resume entry
+crashed the restore.
 
 ## Idle on the new kernel (2026-11-01, keyboard backlight off, Wi-Fi on)
 

@@ -1,0 +1,18 @@
+#!/bin/bash
+# mkinitcpio install hook (systemd initramfs): hibernation (docs/power.md#hibernation). Around
+# systemd-hibernate-resume.service, s15-hibernate-initrd stops the DSPs that s15-dsp started when a hibernation image
+# is about to be restored, and starts them again if the resume does not happen. Inert without resume= on the kernel
+# command line (hibernate.sh enable adds it to the boot entries).
+build() {
+    local b
+    for b in cat dd tail tr sleep mkdir mount umount dmesg cut grep journalctl; do add_binary "$b"; done
+    # timing report on S15BOOT for resume tests (s15.hibernate_report=1): FAT and the RTC
+    for m in vfat nls_cp437 nls_iso8859-1 nls_utf8 rtc-pm8xxx; do add_module "$m"; done
+    add_file /usr/local/sbin/s15-hibernate-initrd /usr/lib/s15/s15-hibernate-initrd 0755
+    printf '%s\n' \
+        '[Service]' \
+        'ExecStartPre=-/usr/lib/s15/s15-hibernate-initrd stop' \
+        'ExecStopPost=-/usr/lib/s15/s15-hibernate-initrd start' \
+        | add_file - /etc/systemd/system/systemd-hibernate-resume.service.d/s15-dsp.conf 0644
+}
+help() { echo "Vivobook S15: stop the initramfs' DSPs before resuming from hibernation (s15-hibernate-initrd)"; }

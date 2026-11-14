@@ -15,6 +15,8 @@
 # again every few seconds and the screen flickered on and off.)
 # Low battery: a dark wake on battery at or below 5 % shuts the machine down cleanly instead (there is no
 # hibernation; the EC wakes the machine roughly hourly, so the check runs often enough at ~0.15 W standby).
+# Only suspends: a resume from hibernation (s15-hibernate) has no wakeup IRQ either, but it is not a dark wake.
+[ "${2:-suspend}" = suspend ] || exit 0
 B=/sys/class/power_supply/qcom-battmgr-bat; LOW=${S15_DARKWAKE_LOW_PCT:-5}
 battery_low() { [ "$(cat $B/status)" = Discharging ] && [ $(( $(cat $B/energy_now) * 100 / $(cat $B/energy_full) )) -le "$LOW" ]; }
 lid() { busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager LidClosed 2>/dev/null; }

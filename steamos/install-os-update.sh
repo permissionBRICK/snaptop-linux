@@ -32,6 +32,7 @@ cat > "$R/etc/atomic-update.conf.d/s15.conf" <<'EOK'
 /etc/s15-wifi-nopowersave
 /etc/s15-kbd-mode.conf
 /etc/s15-sleep-keep-bt
+/etc/s15-hibernate.conf
 /etc/openvpn/**
 EOK
 [ -n "$R" ] || systemctl daemon-reload

@@ -16,7 +16,8 @@ case "$1" in
     fi ;;
   post)
     [ -e $S ] || exit 0
-    if [ -z "$(cat /sys/power/pm_wakeup_irq 2>/dev/null)" ] && [ ! -e /run/s15-no-darkwake ]; then
+    # (a resume from hibernation has no wakeup IRQ either, but it is always a real wake)
+    if [ "$2" = suspend ] && [ -z "$(cat /sys/power/pm_wakeup_irq 2>/dev/null)" ] && [ ! -e /run/s15-no-darkwake ]; then
       exit 0   # dark wake (or a failed suspend): s15-ec-darkwake decides, and restores Bluetooth if staying awake
     fi
     rfkill unblock bluetooth && rm -f $S ;;

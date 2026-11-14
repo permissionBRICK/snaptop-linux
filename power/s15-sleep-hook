@@ -9,7 +9,10 @@ sysidle() { awk 'NR>1{t+=$2; s+=$NF} END{printf "%d %d", t, s}' /sys/kernel/debu
 # accumulated residency in ms (counter runs at 19.2 MHz)
 res() { awk '/Accumulated Duration/ {printf "%d", $3 / 19200}' $Q/$1 2>/dev/null || echo 0; }
 mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug 2>/dev/null
-now=$(date +%s); e=$(cat $B/energy_now); c=$(( e * 100 / $(cat $B/energy_full) )); ac=$(cat $B/status)
+now=$(date +%s)
+# after a hibernation the battery comes back with the ADSP, which s15-hibernate starts in parallel: wait up to 30 s
+for _ in $(seq 60); do cat $B/energy_now > /dev/null 2>&1 && break; sleep 0.5; done
+e=$(cat $B/energy_now); c=$(( e * 100 / $(cat $B/energy_full) )); ac=$(cat $B/status)
 v=$(( $(cat $B/voltage_now 2>/dev/null || echo 0) / 1000 ))
 case "$1" in
   pre)

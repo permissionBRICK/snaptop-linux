@@ -1,0 +1,117 @@
+#!/bin/bash
+# systemd-sleep hook (/usr/lib/systemd/system-sleep/s15-hibernate): what a hibernation needs on this laptop
+# (docs/power.md#hibernation). Acts only on "hibernate" and only after `hibernate.sh enable` (/etc/s15-hibernate.conf).
+#
+# pre:
+# 1. The image has to land where the boot entries' resume=/resume_offset= look for it. systemd-sleep has written
+#    /sys/power/resume and resume_offset by now; if they differ from /etc/s15-hibernate.conf, the swap file is switched
+#    off, so the kernel finds no swap device to write to and the hibernation is aborted (the system stays up).
+# 2. The firmware starts Windows Boot Manager first. BootNext (the firmware's one-time entry; it survives a power-off)
+#    is set to the entry this boot came from, and systemd-boot's one-shot entry to the running entry (the same kernel),
+#    so the next power-on resumes SteamOS. A one-shot entry that was already set (a staged update) is put back later.
+# 3. The image size limit is set to the memory in use (plus 256 MiB), so the page cache is dropped instead of saved.
+# 4. The ADSP and CDSP are stopped. Their driver (qcom_q6v5_pas) has no hibernation callbacks, and the boot that
+#    restores the image starts its own instances in the initramfs (s15-dsp); s15-hibernate-initrd stops those right
+#    before the kernel hands over, so the restored system finds both stopped and starts them again in "post".
+#    The CDSP goes first and comes back last: a DSP that changes state notifies the other one, and the CDSP never
+#    answers (5 s timeouts each). Stopping the ADSP removes the sound card, which waits until PipeWire closed it, so
+#    user sessions must not be frozen during the hooks (systemd-hibernate.service drop-in s15-no-freeze.conf).
+#    s15-sleep-hook (running in parallel) reads the battery first: the ADSP provides it.
+# post (after a resume, or after an aborted hibernation): start the DSPs, remove a BootNext and one-shot entry that were
+# not used, put a saved one-shot entry back, switch the swap file on again if step 1 switched it off.
+[ "$2" = hibernate ] || exit 0
+C=/etc/s15-hibernate.conf
+[ -r $C ] || exit 0
+. $C   # RESUME_DEV, RESUME_OFFSET, SWAPFILE
+L=/var/log/s15-sleep.log; R=/run/s15-hibernate
+G=4a67b082-0a4c-41cf-b6c7-440b29bb8c4f; V=/sys/firmware/efi/efivars; ONESHOT=$V/LoaderEntryOneShot-$G
+log() { echo "$(date -Is) hibernate: $*" >> $L; }
+efivars() { mountpoint -q $V || mount -t efivarfs efivarfs $V 2>/dev/null; }
+efistr() { [ -r "$1" ] && tail -c +5 "$1" | tr -d '\0'; }    # systemd-boot's variables: UTF-16LE, ASCII here
+set_oneshot() {   # one write() of attributes (NV, boot service, runtime) and the UTF-16LE string, like s15-os-update
+    chattr -i "$ONESHOT" 2>/dev/null
+    python3 -c 'import struct, sys
+open(sys.argv[1], "wb").write(struct.pack("<I", 7) + (sys.argv[2] + "\0").encode("utf-16-le"))' "$ONESHOT" "$1"
+}
+clear_oneshot() { [ -e "$ONESHOT" ] && chattr -i "$ONESHOT" 2>/dev/null; rm -f "$ONESHOT"; }
+dsp() { local r; for r in /sys/class/remoteproc/remoteproc*; do [ "$(cat "$r/name" 2>/dev/null)" = "$1" ] && echo "$r"; done; }
+dsp_states() { local n s=; for n in adsp cdsp; do s="$s $n=$(cat "$(dsp $n)/state" 2>/dev/null)"; done; echo "${s# }"; }
+since() { awk -v a="$1" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }'; }
+wait_running() {   # up to 20 s
+    local _
+    for _ in $(seq 100); do [ "$(cat "$1/state")" = running ] && return 0; sleep 0.2; done
+    return 1
+}
+
+case "$1" in
+  pre)
+    t0=$(date +%s)
+    rm -f $R.*
+    want=$(printf '%d:%d' 0x"$(stat -L -c %t "$RESUME_DEV")" 0x"$(stat -L -c %T "$RESUME_DEV")")
+    have=$(cat /sys/power/resume); hoff=$(cat /sys/power/resume_offset)
+    if [ "$have" != "$want" ] || [ "$hoff" != "$RESUME_OFFSET" ]; then
+        log "the kernel would write the image to $have page $hoff, the boot entries resume from $want page" \
+            "$RESUME_OFFSET: aborting (swap file off)"
+        swapoff "$SWAPFILE" && touch $R.swapoff
+        exit 0
+    fi
+    efivars
+    cur=$(efibootmgr 2>/dev/null | sed -n 's/^BootCurrent: //p')
+    for _ in 1 2 3; do   # the write goes through the firmware's TrustZone service: read it back
+        [ -n "$cur" ] || break
+        efibootmgr -q -n "$cur" 2>/dev/null
+        efibootmgr 2>/dev/null | grep -q "^BootNext: $cur" && { echo "$cur" > $R.bootnext; break; }
+        sleep 1
+    done
+    [ -e $R.bootnext ] || log "WARNING: BootNext not set (BootCurrent '$cur'): the next power-on starts Windows"
+    sel=$(efistr $V/LoaderEntrySelected-$G)
+    # Tests: /run/s15-hibernate-entry names another entry with the same kernel (e.g. one without "quiet").
+    [ -s /run/s15-hibernate-entry ] && sel=$(cat /run/s15-hibernate-entry)
+    old=$(efistr "$ONESHOT")
+    [ -n "$old" ] && echo "$old" > $R.oneshot.saved
+    if [ -n "$sel" ] && set_oneshot "$sel" && [ "$(efistr "$ONESHOT")" = "$sel" ]; then echo "$sel" > $R.oneshot
+    else log "WARNING: systemd-boot one-shot entry not set (selected '$sel')"; fi
+    used=$(awk '/^MemTotal:/ {t = $2} /^MemAvailable:/ {a = $2} END {print (t - a + 262144) * 1024}' /proc/meminfo)
+    echo "$used" > /sys/power/image_size
+    # stop the DSPs once s15-sleep-hook has read the battery (it writes its state file first)
+    for _ in $(seq 50); do
+        [ "$(stat -c %Y /run/s15-sleep.state 2>/dev/null || echo 0)" -ge $((t0 - 1)) ] && break
+        sleep 0.1
+    done
+    ts=$(date +%s.%N)
+    for n in cdsp adsp; do
+        r=$(dsp $n)
+        [ "$(cat "$r/state")" = running ] && echo stop > "$r/state" 2>/dev/null && echo "$n" >> $R.dsps
+    done
+    log "image to $have page $hoff (limit $((used >> 20)) MiB); BootNext ${cur:-?}, one-shot ${sel:-?}${old:+ (was $old)};" \
+        "DSPs stopped in $(since "$ts") s: $(dsp_states)" ;;
+  post)
+    [ -e $R.swapoff ] && { swapon "$SWAPFILE"; rm -f $R.swapoff; exit 0; }
+    log "restored, hooks running at $(date +%T.%N | cut -c1-12)"
+    # Timing tests: with /run/s15-hibernate-signal (made before hibernating) Caps Lock blinks for 6 s at this point.
+    [ -e /run/s15-hibernate-signal ] && systemd-run --quiet --collect --no-block /bin/sh -c '
+        leds() { for l in /sys/class/leds/*::capslock; do echo "$2" > "$l/$1"; done; }
+        leds trigger none
+        for i in 1 2 3 4 5 6 7 8 9 10; do leds brightness 1; sleep 0.3; leds brightness 0; sleep 0.3; done
+        leds trigger kbd-capslock'
+    ts=$(date +%s.%N)
+    for n in adsp cdsp; do
+        grep -qx "$n" $R.dsps 2>/dev/null || continue
+        r=$(dsp $n)
+        [ "$(cat "$r/state")" = running ] || echo start > "$r/state" 2>/dev/null
+        wait_running "$r"
+    done
+    dt=$(since "$ts")
+    efivars
+    how="restored after a power-off (BootNext used)"
+    bn=$(efibootmgr 2>/dev/null | sed -n 's/^BootNext: //p')
+    if [ -e $R.bootnext ] && [ "$bn" = "$(cat $R.bootnext)" ]; then
+        efibootmgr -q -N 2>/dev/null
+        how="no power-off (mode $(sed 's/.*\[\(.*\)\].*/\1/' /sys/power/disk), or the hibernation was aborted)"
+    fi
+    if [ -e $R.oneshot ] && [ "$(efistr "$ONESHOT")" = "$(cat $R.oneshot)" ]; then clear_oneshot; fi
+    if [ -e $R.oneshot.saved ]; then set_oneshot "$(cat $R.oneshot.saved)"; fi
+    log "back: $how; DSPs started in $dt s: $(dsp_states)"
+    rm -f $R.* ;;
+esac
+exit 0

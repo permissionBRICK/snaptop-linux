@@ -9,6 +9,7 @@ build() {
         'Description=Replay or drop a btrfs tree log on the root file system (s15-btrfs-logcheck)' \
         'DefaultDependencies=no' \
         'After=initrd-root-device.target' \
+        'After=systemd-hibernate-resume.service' \
         'Before=sysroot.mount' \
         '[Service]' \
         'Type=oneshot' \

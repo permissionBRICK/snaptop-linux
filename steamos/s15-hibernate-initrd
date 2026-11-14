@@ -1,0 +1,74 @@
+#!/bin/sh
+# Runs in the initramfs around systemd-hibernate-resume.service (initcpio hook s15-hibernate, docs/power.md#hibernation).
+# stop:  if the resume device holds a hibernation image, stop the ADSP and CDSP that this boot started (s15-dsp)
+#        before the kernel hands over to the hibernated system. That system stopped its own DSPs before it was saved
+#        (s15-hibernate) and starts them again after the resume; the instances this boot started would be unknown to
+#        it. Without resume= on the kernel command line or without an image it does nothing.
+# start: the resume came back (the kernel refused the image, e.g. another kernel): start the DSPs again for this boot.
+M=/run/s15-hibernate-initrd.stopped
+log() { echo "<5>s15-hibernate-initrd: $*" > /dev/kmsg; echo "$*"; }
+# Timing report for resume tests: this boot's log until the image load starts, on S15BOOT (not mounted by the
+# hibernated system), read after the resume: S15BOOT/s15-hibernate-resume.log. Only with s15.hibernate_report=1.
+report() {
+    grep -q 's15.hibernate_report=1' /proc/cmdline || return 0
+    modprobe -q rtc_pm8xxx; modprobe -q vfat
+    b=/run/s15-hibernate-boot; mkdir -p $b
+    mount -t vfat /dev/disk/by-partlabel/S15BOOT $b 2>/dev/null || return 0
+    { echo "uptime $(cut -d' ' -f1 /proc/uptime) rtc $(cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null) (image load starts)"
+      dmesg; echo "=== journal"; journalctl -b -o short-monotonic --no-pager 2>/dev/null; } > $b/s15-hibernate-resume.log
+    sync; umount $b
+}
+dsps() {
+    for r in /sys/class/remoteproc/remoteproc*; do
+        case "$(cat "$r/name" 2>/dev/null)" in adsp | cdsp) echo "$r" ;; esac
+    done
+}
+case "$1" in
+  stop)
+    dev=; off=0
+    for w in $(cat /proc/cmdline); do
+        case $w in resume=*) dev=${w#resume=} ;; resume_offset=*) off=${w#resume_offset=} ;; esac
+    done
+    case $dev in
+        PARTLABEL=*) dev=/dev/disk/by-partlabel/${dev#PARTLABEL=} ;;
+        PARTUUID=*) dev=/dev/disk/by-partuuid/${dev#PARTUUID=} ;;
+        UUID=*) dev=/dev/disk/by-uuid/${dev#UUID=} ;;
+        /dev/*) ;;
+        *) exit 0 ;;
+    esac
+    [ -b "$dev" ] || exit 0
+    # the swap header page: the last 10 bytes hold the signature (SWAPSPACE2, or S1SUSPEND with an image)
+    sig=$(dd if="$dev" bs=4096 skip="$off" count=1 2>/dev/null | tail -c 10 | tr -d '\000')
+    case $sig in S1SUSPEND | ULSUSPEND | LINHIB0001) ;; *) exit 0 ;; esac
+    log "hibernation image on $dev at page $off: stopping the DSPs before the resume"
+    i=0
+    while [ $i -lt 100 ]; do   # up to 20 s: a DSP that is still booting cannot be stopped
+        busy=0
+        for r in $(dsps); do
+            [ "$(cat "$r/state")" = running ] && continue
+            [ -e "/usr/lib/firmware/$(cat "$r/firmware")" ] && busy=1   # its firmware is here, so it is starting
+        done
+        [ $busy = 0 ] && break
+        sleep 0.2; i=$((i + 1))
+    done
+    : > $M
+    for n in cdsp adsp; do   # the CDSP first: it never answers the other DSP's state notifications (5 s timeouts)
+        for r in $(dsps); do
+            [ "$(cat "$r/name")" = $n ] || continue
+            [ "$(cat "$r/state")" = running ] && echo stop > "$r/state" 2>/dev/null && echo "$r" >> $M
+            log "$n: $(cat "$r/state")"
+        done
+    done
+    report ;;
+  start)
+    [ -e $M ] || exit 0
+    for n in adsp cdsp; do   # the ADSP first
+        for r in $(cat $M); do
+            [ "$(cat "$r/name")" = $n ] || continue
+            echo start > "$r/state" 2>/dev/null
+            log "no resume: $n started again ($(cat "$r/state"))"
+        done
+    done
+    rm -f $M ;;
+esac
+exit 0

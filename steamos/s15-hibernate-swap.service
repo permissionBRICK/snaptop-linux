@@ -1,0 +1,15 @@
+[Unit]
+Description=Swap file for hibernation (docs/power.md#hibernation)
+Documentation=file:/opt/snaptop-linux/docs/power.md
+ConditionPathExists=/etc/s15-hibernate.conf
+RequiresMountsFor=/run/s15-os/top
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Default (negative) priority: zram (100) stays the swap in use; the file holds the hibernation image. swapon also
+# replaces a hibernation signature that no resume consumed (a boot without resume=), so an old image is never restored.
+ExecStart=/bin/sh -c '. /etc/s15-hibernate.conf; swapon --show=NAME --noheadings | grep -qxF "$SWAPFILE" || swapon "$SWAPFILE"'
+
+[Install]
+WantedBy=multi-user.target
