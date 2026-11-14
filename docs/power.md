@@ -201,8 +201,11 @@ gets back into the session about 64 s after the hibernate command, for saving, f
 starts the image load 2.8 s after it starts. After the restore the GPU, EC, Bluetooth (a rebind in the hook on top of
 patch `0018`), Wi-Fi, keyboard, touchpad, battery and all USB controllers work. Still broken: audio (after any ADSP
 restart the LPASS macros keep dead clock handles; the macro and codec drivers forbid a rebind, and unloading the LPASS
-modules afterwards corrupted the kernel). The CDSP stays offline until the next boot (nothing uses it). Not yet
-tested: a real power-off (`HibernateMode=shutdown`) with this kernel, and long-term use.
+modules afterwards corrupted the kernel). The CDSP stays offline until the next boot (nothing uses it). With a
+real power-off (`HibernateMode=shutdown`, the default) the session is back 17.5 s after pressing the power button,
+but the restored kernel cannot start the ADSP any more ("start timed out"; no battery, USB-C/UCSI or audio until the
+next boot), unlike after a warm reset: probably SMEM, which the firmware sets up afresh at a cold power-on while the
+restored kernel's SMP2P still points at its old items (being worked on).
 
 USB: the kernel that loads the image has to set up the USB PHYs itself. The eUSB2 PHY and PTN3222 repeater drivers
 are in `drivers/phy/`, not `drivers/phy/qualcomm/`, so the initcpio hook `s15` adds them by name; without them no
