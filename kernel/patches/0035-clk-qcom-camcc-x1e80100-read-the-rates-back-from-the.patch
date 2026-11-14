@@ -1,0 +1,107 @@
+From aa619627ac1caff91e6a1fe1f7baa806421ac798 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:39:31 +0000
+Subject: [PATCH] clk: qcom: camcc-x1e80100: read the rates back from the
+ hardware on restore from hibernation
+
+After a restore from hibernation the cameras of the ASUS Vivobook S 15 (X1E80100) streamed no frames if they had
+been used before the hibernation: the kernel that loaded the image configured the camcc PLLs at its probe, but the
+RCGs were back at their reset configuration while the clock framework still held the rates CAMSS had set. CAMSS
+sets the same rates at each power-up; clk_set_rate() skipped them as unchanged, and CSID/VFE ran at the reset
+clocks. (Cameras that had not been used before the hibernation worked: their cached rates were the reset ones.)
+
+Add clk_hw_recalc_rate(), which reads a clock's rate and its children's back from the hardware, and call it for
+every camcc clock in a .restore callback, so the next clk_set_rate() programs the RCGs again.
+
+Not upstream.
+---
+ drivers/clk/clk.c                 | 19 +++++++++++++++++++
+ drivers/clk/qcom/camcc-x1e80100.c | 24 ++++++++++++++++++++++++
+ include/linux/clk-provider.h      |  1 +
+ 3 files changed, 44 insertions(+)
+
+diff --git a/drivers/clk/clk.c b/drivers/clk/clk.c
+index fef87167a..aee8432bc 100644
+--- a/drivers/clk/clk.c
++++ b/drivers/clk/clk.c
+@@ -2029,6 +2029,25 @@ static void __clk_recalc_rates(struct clk_core *core, bool update_req,
+ 		__clk_recalc_rates(child, update_req, msg);
+ }
+ 
++/**
++ * clk_hw_recalc_rate - read the rate of a clock and its children back from the hardware
++ * @hw: the clock
++ *
++ * For a provider whose hardware lost its state behind the framework's back (a restore
++ * from hibernation): the cached rates no longer match the hardware, and clk_set_rate()
++ * to a cached rate would do nothing.
++ */
++void clk_hw_recalc_rate(struct clk_hw *hw)
++{
++	if (!hw)
++		return;
++
++	clk_prepare_lock();
++	__clk_recalc_rates(hw->core, false, 0);
++	clk_prepare_unlock();
++}
++EXPORT_SYMBOL_GPL(clk_hw_recalc_rate);
++
+ static unsigned long clk_core_get_rate_recalc(struct clk_core *core)
+ {
+ 	if (core && (core->flags & CLK_GET_RATE_NOCACHE))
+diff --git a/drivers/clk/qcom/camcc-x1e80100.c b/drivers/clk/qcom/camcc-x1e80100.c
+index 2bfd42904..4d534a11d 100644
+--- a/drivers/clk/qcom/camcc-x1e80100.c
++++ b/drivers/clk/qcom/camcc-x1e80100.c
+@@ -2540,11 +2540,35 @@ static int cam_cc_x1e80100_probe(struct platform_device *pdev)
+ 	return qcom_cc_probe(pdev, &cam_cc_x1e80100_desc);
+ }
+ 
++/*
++ * Restore from hibernation: the kernel that loaded the image configured the PLLs at its
++ * own probe, but the RCGs are back at their reset configuration while the clock framework
++ * still holds the rates set before the snapshot. CAMSS sets the same rates again at its
++ * next power-up, the framework skips them as unchanged, and the pipeline runs at the reset
++ * clocks (streams start, no frames arrive). Read the rates back from the hardware, so the
++ * next clk_set_rate() programs them.
++ */
++static int cam_cc_x1e80100_restore(struct device *dev)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(cam_cc_x1e80100_clocks); i++)
++		if (cam_cc_x1e80100_clocks[i])
++			clk_hw_recalc_rate(&cam_cc_x1e80100_clocks[i]->hw);
++
++	return 0;
++}
++
++static const struct dev_pm_ops cam_cc_x1e80100_pm_ops = {
++	.restore = pm_sleep_ptr(cam_cc_x1e80100_restore),
++};
++
+ static struct platform_driver cam_cc_x1e80100_driver = {
+ 	.probe = cam_cc_x1e80100_probe,
+ 	.driver = {
+ 		.name = "camcc-x1e80100",
+ 		.of_match_table = cam_cc_x1e80100_match_table,
++		.pm = pm_sleep_ptr(&cam_cc_x1e80100_pm_ops),
+ 	},
+ };
+ 
+diff --git a/include/linux/clk-provider.h b/include/linux/clk-provider.h
+index dc8e161f9..48da41d22 100644
+--- a/include/linux/clk-provider.h
++++ b/include/linux/clk-provider.h
+@@ -1486,6 +1486,7 @@ int clk_hw_get_parent_index(struct clk_hw *hw);
+ int clk_hw_set_parent(struct clk_hw *hw, struct clk_hw *new_parent);
+ unsigned int __clk_get_enable_count(struct clk *clk);
+ unsigned long clk_hw_get_rate(const struct clk_hw *hw);
++void clk_hw_recalc_rate(struct clk_hw *hw);
+ unsigned long clk_hw_get_flags(const struct clk_hw *hw);
+ #define clk_hw_can_set_rate_parent(hw) \
+ 	(clk_hw_get_flags((hw)) & CLK_SET_RATE_PARENT)
+-- 
+2.43.0
+

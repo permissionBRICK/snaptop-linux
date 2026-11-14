@@ -1,0 +1,269 @@
+From 2faa45507636a10a1450ec73fca792bd0136419c Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:19:02 +0000
+Subject: [PATCH] soc: qcom: smp2p: set up the edge again on restore from
+ hibernation
+
+The kernel that loads a hibernation image probes this driver too: it writes the outbound item afresh (RESTART_ACK
+cleared, the version taken from the remote's item or 2), and it may start and stop the remote, whose item then carries
+a new RESTART_DONE. After a power-off the firmware has also set SMEM up again, so a remote that the image-loading kernel
+did not start has no item at all. The restored kernel keeps what it cached before the snapshot: the item pointers,
+negotiation_done, the remote's matched entries, ssr_ack (the RESTART_ACK it wrote last).
+
+With the SSR ack feature a restarting remote sets RESTART_DONE to the inverse of the local RESTART_ACK and waits for the
+ack, which qcom_smp2p_check_ssr() only gives when RESTART_DONE differs from the cached ssr_ack. On the X1E80100 (ASUS
+Vivobook S 15) the image-loading kernel starts and stops the ADSP once, which leaves RESTART_ACK set; the restored
+kernel's ssr_ack is set only if it started the ADSP an odd number of times. From the second hibernation in a session on,
+the ADSP waits for an ack that never comes and never reports ready ("start timed out"), after a warm reset as after a
+power-off. The CDSP, which the image-loading kernel does not start, has no item after the reset, and the outbound item
+has version 2 again where the restored kernel had negotiated 1: the same timeout.
+
+On restore, compare the items with the cached view (pointers, outbound header, entry names and values, RESTART_ACK,
+version). If they differ, set the edge up as probe does, against the items as they are now: the outbound item with this
+kernel's entries and their last values (now kept by update_bits), RESTART_ACK equal to the remote's RESTART_DONE (its
+last restart counts as acknowledged, as in a running system), negotiation and the remote's entries from scratch. If
+they match, which is also the case after an aborted hibernation or a pm_test run (both call .restore in the same
+kernel), nothing changes. The remote processors are stopped across the hibernation; remoteproc starts them afterwards.
+
+Not upstream.
+---
+ drivers/soc/qcom/smp2p.c | 163 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 158 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/soc/qcom/smp2p.c b/drivers/soc/qcom/smp2p.c
+index af0ceeaf6..2ea06edf2 100644
+--- a/drivers/soc/qcom/smp2p.c
++++ b/drivers/soc/qcom/smp2p.c
+@@ -89,7 +89,7 @@ struct smp2p_smem_item {
+  * @smp2p:	reference to the device driver context
+  * @name:	name of the entry, to match against smp2p_smem_item
+  * @value:	pointer to smp2p_smem_item entry value
+- * @last_value:	last handled value
++ * @last_value:	last handled value (inbound), last written value (outbound)
+  * @domain:	irq_domain for inbound entries
+  * @irq_enabled:bitmap to track enabled irq bits
+  * @irq_rising:	bitmap to mark irq bits for rising detection
+@@ -133,6 +133,7 @@ struct smp2p_entry {
+  * @ipc_regmap:	regmap for the outbound ipc
+  * @ipc_offset:	offset within the regmap
+  * @ipc_bit:	bit in regmap@offset to kick to signal remote processor
++ * @irq:	interrupt for incoming notifications
+  * @mbox_client: mailbox client handle
+  * @mbox_chan:	apcs ipc mailbox channel handle
+  * @inbound:	list of inbound entries
+@@ -159,6 +160,8 @@ struct qcom_smp2p {
+ 	int ipc_offset;
+ 	int ipc_bit;
+ 
++	int irq;
++
+ 	struct mbox_client mbox_client;
+ 	struct mbox_chan *mbox_chan;
+ 
+@@ -502,6 +505,7 @@ static int smp2p_update_bits(void *data, u32 mask, u32 value)
+ 	val &= ~mask;
+ 	val |= value;
+ 	writel(val, entry->value);
++	entry->last_value = val;
+ 	spin_unlock_irqrestore(&entry->lock, flags);
+ 
+ 	trace_smp2p_update_bits(entry, orig, val);
+@@ -516,21 +520,28 @@ static const struct qcom_smem_state_ops smp2p_state_ops = {
+ 	.update_bits = smp2p_update_bits,
+ };
+ 
+-static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
+-				     struct smp2p_entry *entry,
+-				     struct device_node *node)
++/* Allocate an entry from the outbound smem item and write its last value (0 at probe) */
++static void qcom_smp2p_outbound_slot(struct qcom_smp2p *smp2p,
++				     struct smp2p_entry *entry)
+ {
+ 	struct smp2p_smem_item *out = smp2p->out;
+ 	char buf[SMP2P_MAX_ENTRY_NAME] = {};
+ 
+-	/* Allocate an entry from the smem item */
+ 	strscpy(buf, entry->name, SMP2P_MAX_ENTRY_NAME);
+ 	memcpy(out->entries[out->valid_entries].name, buf, SMP2P_MAX_ENTRY_NAME);
+ 
+ 	/* Make the logical entry reference the physical value */
+ 	entry->value = &out->entries[out->valid_entries].value;
++	writel(entry->last_value, entry->value);
+ 
+ 	out->valid_entries++;
++}
++
++static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
++				     struct smp2p_entry *entry,
++				     struct device_node *node)
++{
++	qcom_smp2p_outbound_slot(smp2p, entry);
+ 
+ 	entry->state = qcom_smem_state_register(node, &smp2p_state_ops, entry);
+ 	if (IS_ERR(entry->state)) {
+@@ -662,6 +673,7 @@ static int qcom_smp2p_probe(struct platform_device *pdev)
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq < 0)
+ 		return irq;
++	smp2p->irq = irq;
+ 
+ 	smp2p->mbox_client.dev = &pdev->dev;
+ 	smp2p->mbox_client.knows_txdone = true;
+@@ -782,6 +794,146 @@ static void qcom_smp2p_remove(struct platform_device *pdev)
+ 	smp2p->out->valid_entries = 0;
+ }
+ 
++/* struct smp2p_smem_item is packed: each entry's value follows its name */
++static_assert(offsetof(struct smp2p_smem_item, entries[0].value) -
++	      offsetof(struct smp2p_smem_item, entries[0].name) == SMP2P_MAX_ENTRY_NAME);
++
++/* Whether the item slot that @entry->value points into still carries @entry's name */
++static bool qcom_smp2p_slot_named(struct smp2p_entry *entry)
++{
++	const char *name = (const char *)entry->value - SMP2P_MAX_ENTRY_NAME;
++
++	return !strncmp(name, entry->name, SMP2P_MAX_ENTRY_NAME);
++}
++
++/*
++ * Hibernation: the kernel that loads the image probes this driver too, which writes the outbound item afresh (its
++ * RESTART_ACK bit cleared, the version not yet negotiated), and it may start and stop the remote, which writes the
++ * remote's item (RESTART_DONE, version, entries); after a power-off the firmware has also set SMEM up again. The view
++ * this kernel saved in the image (item pointers, negotiation, the RESTART_ACK it wrote last) can then be wrong. With
++ * the SSR ack feature that blocks the next start of the remote: it sets RESTART_DONE to the inverse of our RESTART_ACK
++ * and waits for the ack, which qcom_smp2p_check_ssr() only gives when RESTART_DONE differs from the cached ssr_ack.
++ *
++ * Returns why the items no longer match this kernel's view, or NULL if they do (also after an aborted hibernation or
++ * a pm_test run: both call .restore without another kernel in between).
++ */
++static const char *qcom_smp2p_items_changed(struct qcom_smp2p *smp2p)
++{
++	struct smp2p_smem_item *out, *in;
++	struct smp2p_entry *entry;
++	unsigned int n = 0;
++
++	out = qcom_smem_get(smp2p->remote_pid, smp2p->smem_items[SMP2P_OUTBOUND], NULL);
++	if (IS_ERR(out) || out != smp2p->out)
++		return "outbound item moved";
++	if (out->magic != SMP2P_MAGIC || out->local_pid != smp2p->local_pid ||
++	    out->remote_pid != smp2p->remote_pid)
++		return "outbound item rewritten";
++	list_for_each_entry(entry, &smp2p->outbound, node) {
++		if (!qcom_smp2p_slot_named(entry) || readl(entry->value) != entry->last_value)
++			return "outbound entries rewritten";
++		n++;
++	}
++	if (out->valid_entries != n)
++		return "outbound entries rewritten";
++	if (!!(out->flags & BIT(SMP2P_FLAGS_RESTART_ACK_BIT)) != smp2p->ssr_ack)
++		return "restart ack differs";
++
++	in = qcom_smem_get(smp2p->remote_pid, smp2p->smem_items[SMP2P_INBOUND], NULL);
++	if (IS_ERR(in))
++		in = NULL;
++	if (in != smp2p->in)
++		return "remote item moved";
++	if (!in)
++		return NULL;
++	if (smp2p->negotiation_done && in->version != out->version)
++		return "version differs";
++	list_for_each_entry(entry, &smp2p->inbound, node) {
++		if (entry->value && !qcom_smp2p_slot_named(entry))
++			return "remote entries rewritten";
++	}
++
++	return NULL;
++}
++
++/*
++ * Restore from hibernation: if the SMEM items changed (see above), set the edge up again as probe does, against the
++ * items as they are now, as if this driver was bound now. The remote processors must be stopped at this point;
++ * remoteproc starts them later (one that ran across the snapshot would not have survived the power-off anyway).
++ */
++static int qcom_smp2p_restore(struct device *dev)
++{
++	struct qcom_smp2p *smp2p = dev_get_drvdata(dev);
++	phys_addr_t out_was, in_was, out_now, in_now = 0;
++	struct smp2p_smem_item *in;
++	struct smp2p_entry *entry;
++	bool ack_was = smp2p->ssr_ack;
++	unsigned long flags;
++	const char *why;
++	int ret = 0;
++
++	disable_irq(smp2p->irq);
++
++	why = qcom_smp2p_items_changed(smp2p);
++	if (!why) {
++		dev_dbg(dev, "SMEM items unchanged after hibernation\n");
++		goto out;
++	}
++
++	out_was = qcom_smem_virt_to_phys(smp2p->out);
++	in_was = smp2p->in ? qcom_smem_virt_to_phys(smp2p->in) : 0;
++
++	/* The outbound item with this kernel's entries and their last values, as probe writes it ... */
++	ret = qcom_smp2p_alloc_outbound_item(smp2p);
++	if (ret)
++		goto out;
++
++	/*
++	 * ... and the remote's last restart counted as acknowledged, as in a running system: its next start then asks
++	 * for an ack (RESTART_DONE flipped), which qcom_smp2p_check_ssr() gives.
++	 */
++	in = qcom_smem_get(smp2p->remote_pid, smp2p->smem_items[SMP2P_INBOUND], NULL);
++	if (IS_ERR(in))
++		in = NULL;
++	smp2p->ssr_ack = in && in->version && (in->flags & BIT(SMP2P_FLAGS_RESTART_DONE_BIT));
++	if (smp2p->ssr_ack)
++		smp2p->out->flags |= BIT(SMP2P_FLAGS_RESTART_ACK_BIT);
++
++	/* probe added the outbound entries to the list in reverse order of their slots */
++	list_for_each_entry_reverse(entry, &smp2p->outbound, node) {
++		spin_lock_irqsave(&entry->lock, flags);
++		qcom_smp2p_outbound_slot(smp2p, entry);
++		spin_unlock_irqrestore(&entry->lock, flags);
++	}
++
++	/* Inbound: negotiate again and match the remote's entries from scratch */
++	smp2p->in = NULL;
++	smp2p->valid_entries = 0;
++	smp2p->negotiation_done = false;
++	smp2p->ssr_ack_enabled = false;
++	list_for_each_entry(entry, &smp2p->inbound, node) {
++		entry->value = NULL;
++		entry->last_value = 0;
++	}
++	qcom_smp2p_start_in(smp2p);
++
++	qcom_smp2p_kick(smp2p);
++
++	out_now = qcom_smem_virt_to_phys(smp2p->out);
++	if (in)
++		in_now = qcom_smem_virt_to_phys(in);
++	dev_info(dev, "SMEM items changed during hibernation (%s): set up again; outbound item %pa (was %pa), remote item %pa (was %pa) flags %#x, restart ack %d (was %d)\n",
++		 why, &out_now, &out_was, &in_now, &in_was, in ? in->flags : 0, smp2p->ssr_ack, ack_was);
++out:
++	enable_irq(smp2p->irq);
++
++	return ret;
++}
++
++static const struct dev_pm_ops qcom_smp2p_pm_ops = {
++	.restore = qcom_smp2p_restore,
++};
++
+ static const struct of_device_id qcom_smp2p_of_match[] = {
+ 	{ .compatible = "qcom,smp2p" },
+ 	{}
+@@ -794,6 +946,7 @@ static struct platform_driver qcom_smp2p_driver = {
+ 	.driver  = {
+ 		.name  = "qcom_smp2p",
+ 		.of_match_table = qcom_smp2p_of_match,
++		.pm = pm_sleep_ptr(&qcom_smp2p_pm_ops),
+ 	},
+ };
+ module_platform_driver(qcom_smp2p_driver);
+-- 
+2.43.0
+

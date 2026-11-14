@@ -1,0 +1,52 @@
+From 112146020ac6e93c722dcd1c7e5d6dc9bd79cccb Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:08:06 +0000
+Subject: [PATCH 29/29] soundwire: qcom: disable runtime PM on remove and gate
+ the AHB clock only once
+
+qcom_swrm_remove() gated the AHB ("iface") clock unconditionally, although
+runtime suspend gates it too, and it left runtime PM enabled. Neither matters
+while the controller is never unbound; it is now, on the ASUS Vivobook S 15
+(X1E80100), whenever the ADSP restarts: the LPASS macros that clock the
+controllers are unbound and probed again (see the q6dsp-lpass-clocks patches),
+and the SoundWire controllers with them.
+
+ - A controller that was runtime-suspended at that point (the usual case)
+   got a second clk_disable_unprepare() on its macro's clock: unbalanced.
+ - The next probe called pm_runtime_set_active() and pm_runtime_enable() on
+   a device whose runtime PM was still enabled ("Unbalanced
+   pm_runtime_enable!"), and a pending autosuspend could fire after remove
+   without a driver. The device then counted as suspended while the new probe
+   ran the bus with the clock enabled; the first runtime resume then enabled
+   the clock again and, on the WCD938x buses, tried to take a running bus out
+   of clock stop.
+
+Disable runtime PM after the bus is deleted, gate the clock only if the
+controller is active, and mark it suspended.
+
+Not upstream.
+---
+ drivers/soundwire/qcom.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+index 6d8c81900..58978b4cc 100644
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -1751,7 +1751,12 @@ static void qcom_swrm_remove(struct platform_device *pdev)
+ 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(&pdev->dev);
+ 
+ 	sdw_bus_master_delete(&ctrl->bus);
+-	clk_disable_unprepare(ctrl->hclk);
++
++	/* runtime suspend has gated the AHB clock already */
++	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		clk_disable_unprepare(ctrl->hclk);
++	pm_runtime_set_suspended(&pdev->dev);
+ }
+ 
+ static int __maybe_unused swrm_runtime_resume(struct device *dev)
+-- 
+2.43.0
+

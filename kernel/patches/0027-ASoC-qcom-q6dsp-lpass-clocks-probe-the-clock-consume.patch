@@ -1,0 +1,136 @@
+From 0c8ef7395ded0fbf2df5c9f4d3b68766a25a682d Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:09:49 +0000
+Subject: [PATCH 27/29] ASoC: qcom: q6dsp-lpass-clocks: probe the clock
+ consumers again after a DSP restart
+
+After the ADSP is stopped and started again, audio never worked again on the
+ASUS Vivobook S 15 (X1E80100): the LPASS macro codecs and everything behind
+them (SoundWire controllers, WSA884x, WCD938x) stayed bound across the
+restart, ran against a DSP that had lost their clock votes and an LPASS
+whose state was gone, and the sound card failed to come back:
+
+  wcd938x_codec audio-codec: ASoC error (-16): at snd_soc_component_probe() on audio-codec
+  snd-x1e80100 sound: ASoC: failed to instantiate card -16
+
+fw_devlink should have unbound them with the clock controller and probed them
+again, but it linked them to the wrong device. When the remoteproc driver
+binds, the glink-edge/gpr/service nodes below it have no devices yet (they
+appear once the DSP runs), so device_links_driver_bound() ->
+fw_devlink_pickup_dangling_consumers() marks them as never becoming devices
+and makes the remoteproc the supplier of the macros and the LPI pin
+controller (/sys/class/devlink/platform:6800000.remoteproc--platform:6ac0000.codec,
+...). The remoteproc stays bound across a DSP restart. The same problem is
+discussed upstream ("[DISCUSSION] fw_devlink: incorrect ancestor fallback
+for intermediate bus topologies breaks audio dependency resolution",
+linux-sound, July 2026; no fix merged).
+
+Create managed links from every consumer of the clock controller to its
+current device, on each probe, with DL_FLAG_AUTOPROBE_CONSUMER: when the
+DSP stops, the driver core unbinds the consumers (and, through their own
+fw_devlink links, the SoundWire controllers and codecs) while the DSP-side
+device goes away; once the DSP is back and the new device has bound, the
+consumers are probed again and the card comes back. The links are created
+before the device attaches to the DSP, so no consumer can finish its probe
+before its link exists.
+
+GPIO controllers are not linked: the LPASS LPI pin controller provides the
+GPIO of the shared WSA884x reset line, and the reset-gpio auxiliary device on
+top of it is a child of its gpio_device that is never removed; unbinding the
+pin controller would delete that parent under it. The previous patch keeps
+its clocks valid instead.
+
+Not upstream.
+---
+ sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c | 61 +++++++++++++++++++++++
+ 1 file changed, 61 insertions(+)
+
+diff --git a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+index 0add5ce4f..b7d1e4cb5 100644
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+@@ -10,6 +10,7 @@
+ #include <linux/device.h>
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
+ #include <linux/slab.h>
+ #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
+ #include "q6dsp-lpass-clocks.h"
+@@ -257,6 +258,60 @@ static struct q6dsp_cc *q6dsp_cc_get(struct device *dev,
+ 	return ERR_PTR(ret);
+ }
+ 
++/*
++ * fw_devlink cannot link the consumers of these clocks to this device: when the
++ * remoteproc driver binds, the GPR/APR nodes below it have no devices yet, so
++ * fw_devlink treats them as never becoming devices and makes the remoteproc the
++ * supplier of their consumers (device_links_driver_bound() ->
++ * fw_devlink_pickup_dangling_consumers()). The remoteproc stays bound across a
++ * DSP restart; the consumers kept running against a DSP that had lost all their
++ * state, and nothing probed them again afterwards.
++ *
++ * Link every consumer to this device instead, on each probe, as the device is
++ * new after each restart. When the DSP stops, the driver core unbinds the
++ * consumers (and their own consumers) before this device goes away; when it is
++ * back, DL_FLAG_AUTOPROBE_CONSUMER probes them again once this device is bound.
++ *
++ * GPIO controllers are left out: devices created on top of their GPIO chips
++ * (reset-gpio, shared GPIO proxies) do not survive the unbinding of the
++ * controller. They keep their clocks, which stay registered.
++ */
++static void q6dsp_clock_link_consumers(struct device *dev)
++{
++	struct device_node *np;
++
++	for_each_node_with_property(np, "clocks") {
++		struct of_phandle_iterator it;
++		struct platform_device *con;
++		bool consumer = false;
++		int err;
++
++		of_for_each_phandle(&it, err, np, "clocks", "#clock-cells", 0) {
++			if (it.node == dev->of_node) {
++				consumer = true;
++				of_node_put(it.node);
++				break;
++			}
++		}
++
++		if (!consumer || !of_device_is_available(np) ||
++		    of_property_read_bool(np, "gpio-controller"))
++			continue;
++
++		con = of_find_device_by_node(np);
++		if (!con)
++			continue;
++
++		if (device_link_add(&con->dev, dev, DL_FLAG_AUTOPROBE_CONSUMER))
++			dev_dbg(dev, "linked consumer %s\n", dev_name(&con->dev));
++		else
++			dev_warn(dev, "failed to link consumer %s\n",
++				 dev_name(&con->dev));
++
++		put_device(&con->dev);
++	}
++}
++
+ int q6dsp_clock_dev_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -282,6 +337,12 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
+ 	if (busy)
+ 		return -EBUSY;
+ 
++	/*
++	 * Before attaching: a consumer can only finish its probe once this
++	 * device is attached, so the links are in place before any of them binds.
++	 */
++	q6dsp_clock_link_consumers(dev);
++
+ 	/*
+ 	 * Attach to this DSP instance. Clocks that are still prepared from
+ 	 * before a DSP restart were lost with the old instance: request them
+-- 
+2.43.0
+

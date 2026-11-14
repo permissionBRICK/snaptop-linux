@@ -38,8 +38,8 @@ Install a new payload in SteamOS: `sudo steamos/install-kernel.sh <payload>` (ke
 3. **Our patches** in `kernel/patches/`, among them 8 bpc on the panel (`0001`, below), the firmware TPM driver
    (`0011`, [tpm](tpm.md)), two boot fixes for the TPM unlock (`0012`, `0013`, below), the SoundWire resume
    fix (`0014`, below), the display memory clock at boot (`0015`, below; halves the boot time), restore fixes for
-   hibernation (`0016`-`0020`, `0022`-`0024`, below), the USB wakeup for runtime PM (`0021`, below) and the shared
-   camera LED (`0025`, below).
+   hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0035`, below), the USB wakeup for runtime PM (`0021`, below)
+   and the shared camera LED (`0025`, below).
 4. **DT overlay** from the same community repo (`overlay/build-overlay.sh --dtbo-only`): audio (WSA8845 speakers,
    SoundWire, mics), RGB and IR cameras, and optionally the EC node; plus our fragments from `kernel/overlay/`
    (camera activity LED). `build.sh` merges it into the mainline DTB
@@ -108,7 +108,7 @@ With it, `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y`: the text console take
 is printed, so with `quiet` the firmware's logo stays on screen until `msm` takes over (about 4 s after the kernel
 starts).
 
-## Our patches: restore from hibernation (`0016`-`0020`, `0022`-`0024`)
+## Our patches: restore from hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0035`)
 
 Hibernation powers the SoC off; drivers that only know suspend find their hardware reset after the restore, set up
 by the kernel that loaded the image only as far as its own drivers needed it ([power.md](power.md#hibernation)).
@@ -130,6 +130,22 @@ Experimental, like hibernation itself; suspend to RAM is unchanged by all of the
 - `0023` (`ath12k`): when the Wi-Fi firmware did not come back after a restore, unloading the driver later oopsed in
   `hwmon_device_unregister`; the thermal devices are no longer unregistered twice.
 - `0024` (`iommu/arm-smmu-qcom`): the Adreno SMMU's PRR setup (sparse mappings) is written again after a reset.
+- `0026`-`0031`, `0034` (audio after an ADSP restart, which every hibernation does): fw_devlink links the LPASS
+  macros to the remoteproc instead of the q6prm clock device (its node has no device when the remoteproc binds), so
+  nothing re-probed them and they kept dead clock handles. The q6prm clocks now stay registered across a DSP restart,
+  the macros and the sound card are linked to the clock device and probed again when the DSP is back; the macro and
+  SoundWire drivers got the fixes a second probe needs (runtime PM on remove, the WSA mclk output with devm, the
+  SoundWire IRQ mappings disposed of). The LPI pin controller stays bound: unbinding it took the shared WSA reset GPIO
+  device with it and corrupted the kernel.
+- `0032` (`soc: qcom: smp2p`): the kernel that loads the image rewrites the SMP2P handshake in SMEM; the restored
+  kernel kept its restart-acknowledge bit and negotiated version, so the second hibernation in a session could not
+  start the ADSP and the CDSP never came back. The edges are set up again on restore when SMEM differs.
+- `0033` (`irqchip/gic-v3`): that kernel also sets every SPI to level-triggered; edge-triggered interrupts of drivers
+  it does not load (CAMSS, SoundWire) lost their type. The trigger types and enables are saved before the snapshot
+  and written back right after the jump.
+- `0035` (`clk: qcom: camcc-x1e80100`): the camera clocks are back at reset after the power-off while the clock
+  framework still held the rates CAMSS had set, so the same `clk_set_rate()` at the next stream did nothing (no
+  frames). The rates are read back from the hardware on restore (`clk_hw_recalc_rate()`, new).
 
 ## Our patch: shared camera privacy LED (`0025`)
 

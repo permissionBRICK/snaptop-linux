@@ -1,0 +1,440 @@
+From 6e9e98703be0f9412f116f3fe7d4471ce88b16f0 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:09:47 +0000
+Subject: [PATCH 26/29] ASoC: qcom: q6dsp-lpass-clocks: keep the clocks across
+ a DSP restart
+
+The q6prm (and q6afe) clock controller is a child of a GPR/APR service under
+the DSP's remoteproc node. When the ADSP is stopped and started again
+(remoteproc "stop"/"start", a crash recovery, an audio PD restart), the
+service device goes away and comes back, and with it this device: its clocks
+were devm-registered, so they were unregistered and registered anew. A
+consumer that stays bound keeps its struct clk, which now points to an
+unregistered clk_core (clk_nodrv_ops); every later prepare fails with -ENXIO:
+
+  qcom-sm8550-lpass-lpi-pinctrl 6e80000.pinctrl: __pm_clk_enable: failed to enable clk ..., error -6
+
+(ASUS Vivobook S 15, X1E80100, after "echo stop/start" on the ADSP or a
+restore from hibernation, which stops and starts it.) The LPASS LPI pin
+controller has to stay bound across the restart: it is the GPIO controller
+of the shared WSA884x reset line, whose reset-gpio auxiliary device is a
+child of its gpio_device and is never removed.
+
+Register the clocks and the OF provider once per firmware node, without a
+struct device, and keep them registered when the DSP-side device goes away.
+The device only attaches and detaches: while it is gone, prepare fails with
+-ENODEV and unprepare only drops the state. Requests that are still prepared
+when the DSP comes back were lost with the old DSP instance and are sent
+again when the new device probes.
+
+Not upstream.
+---
+ sound/soc/qcom/qdsp6/q6afe-clocks.c       |   1 +
+ sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c | 265 +++++++++++++++++-----
+ sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.h |   1 +
+ sound/soc/qcom/qdsp6/q6prm-clocks.c       |   1 +
+ 4 files changed, 217 insertions(+), 51 deletions(-)
+
+diff --git a/sound/soc/qcom/qdsp6/q6afe-clocks.c b/sound/soc/qcom/qdsp6/q6afe-clocks.c
+index 84b9018c3..87106f374 100644
+--- a/sound/soc/qcom/qdsp6/q6afe-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6afe-clocks.c
+@@ -113,6 +113,7 @@ static struct platform_driver q6afe_clock_platform_driver = {
+ 		.of_match_table = of_match_ptr(q6afe_clock_device_id),
+ 	},
+ 	.probe = q6dsp_clock_dev_probe,
++	.remove = q6dsp_clock_dev_remove,
+ };
+ module_platform_driver(q6afe_clock_platform_driver);
+ 
+diff --git a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+index ab7d20580..0add5ce4f 100644
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+@@ -4,7 +4,9 @@
+ #include <linux/err.h>
+ #include <linux/init.h>
+ #include <linux/clk-provider.h>
++#include <linux/list.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/device.h>
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+@@ -15,40 +17,93 @@
+ #define Q6DSP_MAX_CLK_ID			105
+ #define Q6DSP_LPASS_CLK_ROOT_DEFAULT		0
+ 
++struct q6dsp_cc;
+ 
+ struct q6dsp_clk {
+-	struct device *dev;
++	struct q6dsp_cc *cc;
+ 	int q6dsp_clk_id;
+ 	int attributes;
+ 	int rate;
+ 	uint32_t handle;
++	bool vote;
++	bool registered;
++	bool prepared;
+ 	struct clk_hw hw;
+ };
+ 
+ #define to_q6dsp_clk(_hw) container_of(_hw, struct q6dsp_clk, hw)
+ 
++/*
++ * The clock controller lives on the DSP: its device is a child of a GPR/APR
++ * service, which is removed when the DSP (or its audio protection domain) stops
++ * and added again when it is back. The clocks themselves are registered once
++ * per firmware node and stay registered across such restarts, so that consumers
++ * which are not unbound in between (the LPASS LPI pin controller) do not keep
++ * handles to unregistered clocks. @dev is the current DSP-side device, NULL
++ * while the DSP is down.
++ */
+ struct q6dsp_cc {
++	struct list_head node;
++	struct device_node *np;
+ 	struct device *dev;
++	struct mutex lock;	/* protects dev and the prepared flags */
+ 	struct q6dsp_clk *clks[Q6DSP_MAX_CLK_ID];
+ 	const struct q6dsp_clk_desc *desc;
+ };
+ 
++static LIST_HEAD(q6dsp_cc_list);
++static DEFINE_MUTEX(q6dsp_cc_list_lock);
++
++/* Called with cc->lock held and cc->dev set */
++static int q6dsp_clk_send(struct q6dsp_clk *clk, bool on)
++{
++	struct q6dsp_cc *cc = clk->cc;
++	const struct q6dsp_clk_desc *desc = cc->desc;
++
++	if (clk->vote) {
++		if (on)
++			return desc->lpass_vote_clk(cc->dev, clk->q6dsp_clk_id,
++						    clk_hw_get_name(&clk->hw),
++						    &clk->handle);
++
++		return desc->lpass_unvote_clk(cc->dev, clk->q6dsp_clk_id,
++					      clk->handle);
++	}
++
++	return desc->lpass_set_clk(cc->dev, clk->q6dsp_clk_id, clk->attributes,
++				   Q6DSP_LPASS_CLK_ROOT_DEFAULT,
++				   on ? clk->rate : 0);
++}
++
+ static int clk_q6dsp_prepare(struct clk_hw *hw)
+ {
+ 	struct q6dsp_clk *clk = to_q6dsp_clk(hw);
+-	struct q6dsp_cc *cc = dev_get_drvdata(clk->dev);
++	struct q6dsp_cc *cc = clk->cc;
++	int ret;
++
++	mutex_lock(&cc->lock);
++	if (cc->dev) {
++		ret = q6dsp_clk_send(clk, true);
++		if (!ret)
++			clk->prepared = true;
++	} else {
++		ret = -ENODEV;
++	}
++	mutex_unlock(&cc->lock);
+ 
+-	return cc->desc->lpass_set_clk(clk->dev, clk->q6dsp_clk_id, clk->attributes,
+-				     Q6DSP_LPASS_CLK_ROOT_DEFAULT, clk->rate);
++	return ret;
+ }
+ 
+ static void clk_q6dsp_unprepare(struct clk_hw *hw)
+ {
+ 	struct q6dsp_clk *clk = to_q6dsp_clk(hw);
+-	struct q6dsp_cc *cc = dev_get_drvdata(clk->dev);
++	struct q6dsp_cc *cc = clk->cc;
+ 
+-	cc->desc->lpass_set_clk(clk->dev, clk->q6dsp_clk_id, clk->attributes,
+-			      Q6DSP_LPASS_CLK_ROOT_DEFAULT, 0);
++	mutex_lock(&cc->lock);
++	if (cc->dev && clk->prepared)
++		q6dsp_clk_send(clk, false);
++	clk->prepared = false;
++	mutex_unlock(&cc->lock);
+ }
+ 
+ static int clk_q6dsp_set_rate(struct clk_hw *hw, unsigned long rate,
+@@ -83,29 +138,11 @@ static const struct clk_ops clk_q6dsp_ops = {
+ 	.recalc_rate	= clk_q6dsp_recalc_rate,
+ };
+ 
+-static int clk_vote_q6dsp_block(struct clk_hw *hw)
+-{
+-	struct q6dsp_clk *clk = to_q6dsp_clk(hw);
+-	struct q6dsp_cc *cc = dev_get_drvdata(clk->dev);
+-
+-	return cc->desc->lpass_vote_clk(clk->dev, clk->q6dsp_clk_id,
+-				  clk_hw_get_name(&clk->hw), &clk->handle);
+-}
+-
+-static void clk_unvote_q6dsp_block(struct clk_hw *hw)
+-{
+-	struct q6dsp_clk *clk = to_q6dsp_clk(hw);
+-	struct q6dsp_cc *cc = dev_get_drvdata(clk->dev);
+-
+-	cc->desc->lpass_unvote_clk(clk->dev, clk->q6dsp_clk_id, clk->handle);
+-}
+-
+ static const struct clk_ops clk_vote_q6dsp_ops = {
+-	.prepare	= clk_vote_q6dsp_block,
+-	.unprepare	= clk_unvote_q6dsp_block,
++	.prepare	= clk_q6dsp_prepare,
++	.unprepare	= clk_q6dsp_unprepare,
+ };
+ 
+-
+ static struct clk_hw *q6dsp_of_clk_hw_get(struct of_phandle_args *clkspec,
+ 					  void *data)
+ {
+@@ -114,7 +151,7 @@ static struct clk_hw *q6dsp_of_clk_hw_get(struct of_phandle_args *clkspec,
+ 	unsigned int attr = clkspec->args[1];
+ 
+ 	if (idx >= Q6DSP_MAX_CLK_ID || attr > LPASS_CLK_ATTRIBUTE_COUPLE_DIVISOR) {
+-		dev_err(cc->dev, "Invalid clk specifier (%d, %d)\n", idx, attr);
++		pr_err("%pOF: Invalid clk specifier (%d, %d)\n", cc->np, idx, attr);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+@@ -126,25 +163,45 @@ static struct clk_hw *q6dsp_of_clk_hw_get(struct of_phandle_args *clkspec,
+ 	return ERR_PTR(-ENOENT);
+ }
+ 
+-int q6dsp_clock_dev_probe(struct platform_device *pdev)
++static void q6dsp_cc_free(struct q6dsp_cc *cc)
++{
++	int i;
++
++	for (i = 0; i < Q6DSP_MAX_CLK_ID; i++) {
++		if (!cc->clks[i])
++			continue;
++		if (cc->clks[i]->registered)
++			clk_hw_unregister(&cc->clks[i]->hw);
++		kfree(cc->clks[i]);
++	}
++
++	of_node_put(cc->np);
++	kfree(cc);
++}
++
++/* Called with q6dsp_cc_list_lock held */
++static struct q6dsp_cc *q6dsp_cc_get(struct device *dev,
++				     const struct q6dsp_clk_desc *desc,
++				     bool *existed)
+ {
++	const struct q6dsp_clk_init *q6dsp_clks = desc->clks;
+ 	struct q6dsp_cc *cc;
+-	struct device *dev = &pdev->dev;
+-	const struct q6dsp_clk_init *q6dsp_clks;
+-	const struct q6dsp_clk_desc *desc;
+ 	int i, ret;
+ 
+-	cc = devm_kzalloc(dev, sizeof(*cc), GFP_KERNEL);
+-	if (!cc)
+-		return -ENOMEM;
++	list_for_each_entry(cc, &q6dsp_cc_list, node) {
++		if (cc->np == dev->of_node) {
++			*existed = true;
++			return cc->desc == desc ? cc : ERR_PTR(-EINVAL);
++		}
++	}
+ 
+-	desc = of_device_get_match_data(&pdev->dev);
+-	if (!desc)
+-		return -EINVAL;
++	cc = kzalloc_obj(*cc);
++	if (!cc)
++		return ERR_PTR(-ENOMEM);
+ 
++	cc->np = of_node_get(dev->of_node);
+ 	cc->desc = desc;
+-	cc->dev = dev;
+-	q6dsp_clks = desc->clks;
++	mutex_init(&cc->lock);
+ 
+ 	for (i = 0; i < desc->num_clks; i++) {
+ 		unsigned int id = q6dsp_clks[i].clk_id;
+@@ -153,33 +210,139 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
+ 		};
+ 		struct q6dsp_clk *clk;
+ 
+-		clk = devm_kzalloc(dev, sizeof(*clk), GFP_KERNEL);
+-		if (!clk)
+-			return -ENOMEM;
++		if (id >= Q6DSP_MAX_CLK_ID || cc->clks[id]) {
++			ret = -EINVAL;
++			goto err;
++		}
+ 
+-		clk->dev = dev;
++		clk = kzalloc_obj(*clk);
++		if (!clk) {
++			ret = -ENOMEM;
++			goto err;
++		}
++
++		clk->cc = cc;
+ 		clk->q6dsp_clk_id = q6dsp_clks[i].q6dsp_clk_id;
+ 		clk->rate = q6dsp_clks[i].rate;
++		clk->vote = !clk->rate;
+ 		clk->hw.init = &init;
+ 
+-		if (clk->rate)
+-			init.ops = &clk_q6dsp_ops;
+-		else
++		if (clk->vote)
+ 			init.ops = &clk_vote_q6dsp_ops;
++		else
++			init.ops = &clk_q6dsp_ops;
+ 
+ 		cc->clks[id] = clk;
+ 
+-		ret = devm_clk_hw_register(dev, &clk->hw);
++		/*
++		 * No struct device: the clock outlives the DSP-side device it
++		 * was first registered for.
++		 */
++		ret = clk_hw_register(NULL, &clk->hw);
+ 		if (ret)
+-			return ret;
++			goto err;
++		clk->registered = true;
+ 	}
+ 
+-	ret = devm_of_clk_add_hw_provider(dev, q6dsp_of_clk_hw_get, cc);
++	ret = of_clk_add_hw_provider(cc->np, q6dsp_of_clk_hw_get, cc);
+ 	if (ret)
+-		return ret;
++		goto err;
++
++	list_add(&cc->node, &q6dsp_cc_list);
++
++	return cc;
++
++err:
++	q6dsp_cc_free(cc);
++	return ERR_PTR(ret);
++}
++
++int q6dsp_clock_dev_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	const struct q6dsp_clk_desc *desc;
++	bool existed = false, busy;
++	struct q6dsp_cc *cc;
++	int i, restored = 0;
++
++	desc = of_device_get_match_data(&pdev->dev);
++	if (!desc)
++		return -EINVAL;
++
++	mutex_lock(&q6dsp_cc_list_lock);
++	cc = q6dsp_cc_get(dev, desc, &existed);
++	mutex_unlock(&q6dsp_cc_list_lock);
++	if (IS_ERR(cc))
++		return PTR_ERR(cc);
++
++	/* Only one DSP-side device per clock controller at a time */
++	mutex_lock(&cc->lock);
++	busy = cc->dev != NULL;
++	mutex_unlock(&cc->lock);
++	if (busy)
++		return -EBUSY;
++
++	/*
++	 * Attach to this DSP instance. Clocks that are still prepared from
++	 * before a DSP restart were lost with the old instance: request them
++	 * again.
++	 */
++	mutex_lock(&cc->lock);
++	cc->dev = dev;
++	for (i = 0; i < Q6DSP_MAX_CLK_ID; i++) {
++		struct q6dsp_clk *clk = cc->clks[i];
++
++		if (!clk || !clk->prepared)
++			continue;
++
++		if (q6dsp_clk_send(clk, true)) {
++			dev_warn(dev, "failed to request %s again\n",
++				 clk_hw_get_name(&clk->hw));
++			clk->prepared = false;
++		} else {
++			restored++;
++		}
++	}
++	mutex_unlock(&cc->lock);
++
++	if (existed)
++		dev_info(dev, "DSP back, clocks kept, %d clock requests restored\n",
++			 restored);
+ 
+ 	dev_set_drvdata(dev, cc);
+ 
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(q6dsp_clock_dev_probe);
++
++void q6dsp_clock_dev_remove(struct platform_device *pdev)
++{
++	struct q6dsp_cc *cc = platform_get_drvdata(pdev);
++	int i;
++
++	/*
++	 * Release what is still prepared (fails fast when the DSP is already
++	 * gone) but keep the prepared state: it is requested again from the
++	 * next DSP instance.
++	 */
++	mutex_lock(&cc->lock);
++	for (i = 0; i < Q6DSP_MAX_CLK_ID; i++) {
++		if (cc->clks[i] && cc->clks[i]->prepared)
++			q6dsp_clk_send(cc->clks[i], false);
++	}
++	cc->dev = NULL;
++	mutex_unlock(&cc->lock);
++}
++EXPORT_SYMBOL_GPL(q6dsp_clock_dev_remove);
++
++static void __exit q6dsp_clocks_exit(void)
++{
++	struct q6dsp_cc *cc, *tmp;
++
++	list_for_each_entry_safe(cc, tmp, &q6dsp_cc_list, node) {
++		list_del(&cc->node);
++		of_clk_del_provider(cc->np);
++		q6dsp_cc_free(cc);
++	}
++}
++module_exit(q6dsp_clocks_exit);
+diff --git a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.h b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.h
+index 3770d81f2..5ea12cec5 100644
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.h
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.h
+@@ -26,5 +26,6 @@ struct q6dsp_clk_desc {
+ };
+ 
+ int q6dsp_clock_dev_probe(struct platform_device *pdev);
++void q6dsp_clock_dev_remove(struct platform_device *pdev);
+ 
+ #endif  /* __Q6DSP_AUDIO_CLOCKS_H__ */
+diff --git a/sound/soc/qcom/qdsp6/q6prm-clocks.c b/sound/soc/qcom/qdsp6/q6prm-clocks.c
+index b4f9abbe0..4a24e0d8d 100644
+--- a/sound/soc/qcom/qdsp6/q6prm-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6prm-clocks.c
+@@ -122,6 +122,7 @@ static struct platform_driver q6prm_clock_platform_driver = {
+ 		.of_match_table = of_match_ptr(q6prm_clock_device_id),
+ 	},
+ 	.probe = q6dsp_clock_dev_probe,
++	.remove = q6dsp_clock_dev_remove,
+ };
+ module_platform_driver(q6prm_clock_platform_driver);
+ 
+-- 
+2.43.0
+

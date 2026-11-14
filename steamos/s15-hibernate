@@ -17,8 +17,10 @@
 #    answers (5 s timeouts each). Stopping the ADSP removes the sound card, which waits until PipeWire closed it, so
 #    user sessions must not be frozen during the hooks (systemd-hibernate.service drop-in s15-no-freeze.conf).
 #    s15-sleep-hook (running in parallel) reads the battery first: the ADSP provides it.
-# post (after a resume, or after an aborted hibernation): start the DSPs, remove a BootNext and one-shot entry that were
-# not used, put a saved one-shot entry back, switch the swap file on again if step 1 switched it off.
+# 5. Bluetooth is unbound (its controller loses power and firmware; see below).
+# post (after a resume, or after an aborted hibernation): start the DSPs, bind Bluetooth again, remove a BootNext and
+# one-shot entry that were not used, put a saved one-shot entry back, switch the swap file on again if step 1 switched
+# it off.
 [ "$2" = hibernate ] || exit 0
 C=/etc/s15-hibernate.conf
 [ -r $C ] || exit 0
@@ -78,6 +80,15 @@ case "$1" in
         [ "$(stat -c %Y /run/s15-sleep.state 2>/dev/null || echo 0)" -ge $((t0 - 1)) ] && break
         sleep 0.1
     done
+    # Bluetooth (WCN7850 over UART): the controller loses power and firmware with the SoC, and its driver has no
+    # restore; after the resume it did not answer, and unbinding it then hung in hci_unregister_dev() (a command
+    # job waiting for the dead controller). Unbind it here, while it works, and bind it again in "post": the probe
+    # powers it up and loads the firmware (systemd-rfkill restores the radio state of the new device).
+    for d in /sys/bus/serial/drivers/hci_uart_qca/serial*; do
+        [ -e "$d" ] || continue
+        n=${d##*/}
+        echo "$n" > /sys/bus/serial/drivers/hci_uart_qca/unbind 2>/dev/null && echo "$n" >> $R.bt
+    done
     ts=$(date +%s.%N)
     for n in cdsp adsp; do
         r=$(dsp $n)
@@ -95,35 +106,27 @@ case "$1" in
         for i in 1 2 3 4 5 6 7 8 9 10; do leds brightness 1; sleep 0.3; leds brightness 0; sleep 0.3; done
         leds trigger kbd-capslock'
     efivars
-    how="restored after a power-off (BootNext used)"; cycled=1
+    how="restored after a power-off (BootNext used)"
     bn=$(efibootmgr 2>/dev/null | sed -n 's/^BootNext: //p')
     if [ -e $R.bootnext ] && [ "$bn" = "$(cat $R.bootnext)" ]; then
         efibootmgr -q -N 2>/dev/null
-        how="no power-off (mode $(sed 's/.*\[\(.*\)\].*/\1/' /sys/power/disk), or the hibernation was aborted)"; cycled=0
+        how="no power-off (mode $(sed 's/.*\[\(.*\)\].*/\1/' /sys/power/disk), or the hibernation was aborted)"
     fi
-    # After a power cycle only the ADSP: the CDSP does not start again (start timed out) because the boot that restored
-    # the image never started it (it is not in the initramfs, s15-dsp) and its shared-memory items are missing.
-    # Nothing uses it; it stays offline until the next boot. After an aborted hibernation both come back.
+    # Both DSPs start again. The kernel that loaded the image rewrote the SMP2P handshake state in SMEM (and never
+    # started the CDSP); kernel patch 0032 sets the restored kernel's SMP2P edges up again from SMEM, otherwise the
+    # restart acknowledgement was out of step and every start timed out.
     ts=$(date +%s.%N)
     for n in adsp cdsp; do
         grep -qx "$n" $R.dsps 2>/dev/null || continue
-        [ $n = cdsp ] && [ $cycled = 1 ] && continue
         r=$(dsp $n)
         [ "$(cat "$r/state")" = running ] || echo start > "$r/state" 2>/dev/null
         wait_running "$r"
     done
     dt=$(since "$ts")
-    # Bluetooth (WCN7850 over UART): after the power cycle the controller does not answer ("Reading QCA version
-    # information failed"); its power sequencer still counts it as on. A rebind runs the power-on and the firmware
-    # download again (in the background; systemd-rfkill restores the radio state of the new device).
-    if [ $cycled = 1 ]; then
-        for d in /sys/bus/serial/drivers/hci_uart_qca/serial*; do
-            [ -e "$d" ] || continue
-            n=${d##*/}
-            systemd-run --quiet --collect --no-block /bin/sh -c \
-                "echo $n > /sys/bus/serial/drivers/hci_uart_qca/unbind; sleep 1; echo $n > /sys/bus/serial/drivers/hci_uart_qca/bind"
-        done
-    fi
+    # Bluetooth, unbound in "pre": bind it again (the probe loads the firmware; in the background)
+    for n in $(cat $R.bt 2>/dev/null); do
+        systemd-run --quiet --collect --no-block /bin/sh -c "echo $n > /sys/bus/serial/drivers/hci_uart_qca/bind"
+    done
     if [ -e $R.oneshot ] && [ "$(efistr "$ONESHOT")" = "$(cat $R.oneshot)" ]; then clear_oneshot; fi
     if [ -e $R.oneshot.saved ]; then set_oneshot "$(cat $R.oneshot.saved)"; fi
     log "back: $how; DSPs started in $dt s: $(dsp_states)"

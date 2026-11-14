@@ -194,18 +194,18 @@ Around a hibernation (sleep hook `s15-hibernate`, initcpio hook `s15-hibernate`)
   removes the sound card, which waits until PipeWire closed it, so user sessions are not frozen during the hooks
   (`SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=false` on `systemd-hibernate.service`; otherwise the stop waits forever and
   the kernel aborts the hibernation after systemd's 90 s hook timeout);
+- Bluetooth is unbound from its driver and bound again after the resume: the controller loses power and firmware,
+  the driver has no restore, and unbinding it only after the resume hung in `hci_unregister_dev()`;
 - `s15-ec-darkwake` and `s15-sleep-radios` treat a resume from hibernation as a real wake.
 
-State (2026-11-14, kernel patches `0016`-`0024`, [kernel.md](kernel.md)): a self-resuming test (`HibernateMode=reboot`)
-gets back into the session about 64 s after the hibernate command, for saving, firmware and loading; the boot kernel
-starts the image load 2.8 s after it starts. After the restore the GPU, EC, Bluetooth (a rebind in the hook on top of
-patch `0018`), Wi-Fi, keyboard, touchpad, battery and all USB controllers work. Still broken: audio (after any ADSP
-restart the LPASS macros keep dead clock handles; the macro and codec drivers forbid a rebind, and unloading the LPASS
-modules afterwards corrupted the kernel). The CDSP stays offline until the next boot (nothing uses it). With a
-real power-off (`HibernateMode=shutdown`, the default) the session is back 17.5 s after pressing the power button,
-but the restored kernel cannot start the ADSP any more ("start timed out"; no battery, USB-C/UCSI or audio until the
-next boot), unlike after a warm reset: probably SMEM, which the firmware sets up afresh at a cold power-on while the
-restored kernel's SMP2P still points at its old items (being worked on).
+State (2026-11-14, kernel patches `0016`-`0035`, [kernel.md](kernel.md)): with a real power-off
+(`HibernateMode=shutdown`, the default) the session is back 17.5 s after pressing the power button, the same as a cold
+boot but with all apps open; a self-resuming test (`HibernateMode=reboot`) takes about 70 s from the hibernate
+command, for saving, firmware and loading. After the restore the GPU, EC, Wi-Fi, Bluetooth (unbound before and bound
+again after, on top of patch `0018`), keyboard, touchpad, battery, all USB controllers, both DSPs and audio (speakers
+tested) work, also for three hibernations in a row in one session. The audio card is back about 2 s after the ADSP;
+the cameras work after the restore once patch `0035` reprograms their clocks (before it, only cameras unused before
+the hibernation worked). Not yet: long-term use and suspend-then-hibernate.
 
 USB: the kernel that loads the image has to set up the USB PHYs itself. The eUSB2 PHY and PTN3222 repeater drivers
 are in `drivers/phy/`, not `drivers/phy/qualcomm/`, so the initcpio hook `s15` adds them by name; without them no

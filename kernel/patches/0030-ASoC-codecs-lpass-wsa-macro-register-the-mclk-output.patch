@@ -1,0 +1,32 @@
+From 39c79c3c528ec149b091caeb063d3b6a53f3c8a1 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:25:14 +0000
+Subject: [PATCH 30/31] ASoC: codecs: lpass-wsa-macro: register the mclk output
+ with devm
+
+The WSA macro registered its mclk output with clk_hw_register() and never unregistered it. A second probe, after an
+unbind, failed with -EEXIST ("failed to register clk 'mclk'"). On the ASUS Vivobook S 15 (X1E80100) the WSA macros
+are unbound and probed again whenever the ADSP restarts (hibernation), so the speakers stayed silent afterwards. The
+RX, TX and VA macros already use devm_clk_hw_register().
+
+Not upstream.
+---
+ sound/soc/codecs/lpass-wsa-macro.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sound/soc/codecs/lpass-wsa-macro.c b/sound/soc/codecs/lpass-wsa-macro.c
+index fecc4a425..9d5ac0319 100644
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -2659,7 +2659,7 @@ static int wsa_macro_register_mclk_output(struct wsa_macro *wsa)
+ 	init.num_parents = 1;
+ 	wsa->hw.init = &init;
+ 	hw = &wsa->hw;
+-	ret = clk_hw_register(wsa->dev, hw);
++	ret = devm_clk_hw_register(wsa->dev, hw);
+ 	if (ret)
+ 		return ret;
+ 
+-- 
+2.43.0
+

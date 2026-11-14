@@ -1,0 +1,118 @@
+From 3f984c3530b25426d93301165a4fdfec8af50e5d Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:04:20 +0000
+Subject: [PATCH] ASoC: qcom: q6dsp-lpass-clocks: probe the sound card again
+ after a DSP restart
+
+The previous patch probes the macros, SoundWire and codec drivers again after a DSP restart, but the sound card kept
+the DAI names it had taken from them at its first probe, and those were freed: "snd-x1e80100 sound: ASoC: CODEC DAI
+<garbage> not registered", no card until the card driver was bound again by hand (ASUS Vivobook S 15, X1E80100).
+Link every sound card that has a DAI link to a consumer of these clocks to the clock device as well, so it is
+unbound with them and probed again (deferring until its components are back).
+
+Not upstream.
+---
+ sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c | 73 +++++++++++++++++++----
+ 1 file changed, 63 insertions(+), 10 deletions(-)
+
+diff --git a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+index b7d1e4cb5..92221d07f 100644
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+@@ -276,23 +276,75 @@ static struct q6dsp_cc *q6dsp_cc_get(struct device *dev,
+  * (reset-gpio, shared GPIO proxies) do not survive the unbinding of the
+  * controller. They keep their clocks, which stay registered.
+  */
+-static void q6dsp_clock_link_consumers(struct device *dev)
++static bool q6dsp_clock_is_consumer(struct device_node *np, struct device_node *provider)
++{
++	struct of_phandle_iterator it;
++	int err;
++
++	of_for_each_phandle(&it, err, np, "clocks", "#clock-cells", 0) {
++		if (it.node == provider) {
++			of_node_put(it.node);
++			return true;
++		}
++	}
++
++	return false;
++}
++
++/*
++ * A sound card takes the names of its DAIs from the codec and DSP drivers when it
++ * probes and keeps them. After a DSP restart those drivers were probed again and the
++ * names were gone ("CODEC DAI ... not registered"), so the card has to be probed again
++ * too: link every card with a DAI link to a consumer of these clocks as well.
++ */
++static void q6dsp_clock_link_cards(struct device *dev)
+ {
+ 	struct device_node *np;
+ 
+-	for_each_node_with_property(np, "clocks") {
+-		struct of_phandle_iterator it;
+-		struct platform_device *con;
+-		bool consumer = false;
+-		int err;
++	for_each_node_with_property(np, "sound-dai") {
++		struct of_phandle_args args;
++		struct platform_device *card = NULL;
++		struct device_node *up;
++		bool uses = false;
++		int i;
++
++		for (i = 0; !uses && !of_parse_phandle_with_args(np, "sound-dai", "#sound-dai-cells", i,
++								   &args); i++) {
++			uses = q6dsp_clock_is_consumer(args.np, dev->of_node);
++			of_node_put(args.np);
++		}
++		if (!uses)
++			continue;
+ 
+-		of_for_each_phandle(&it, err, np, "clocks", "#clock-cells", 0) {
+-			if (it.node == dev->of_node) {
+-				consumer = true;
+-				of_node_put(it.node);
++		/* the DAI link nodes are no devices; the card is the first ancestor that is */
++		for (up = of_get_parent(np); up; up = of_get_next_parent(up)) {
++			card = of_find_device_by_node(up);
++			if (card) {
++				of_node_put(up);
+ 				break;
+ 			}
+ 		}
++		if (!card)
++			continue;
++
++		if (device_link_add(&card->dev, dev, DL_FLAG_AUTOPROBE_CONSUMER))
++			dev_dbg(dev, "linked card %s\n", dev_name(&card->dev));
++		else
++			dev_warn(dev, "failed to link card %s\n", dev_name(&card->dev));
++
++		put_device(&card->dev);
++	}
++}
++
++static void q6dsp_clock_link_consumers(struct device *dev)
++{
++	struct device_node *np;
++
++	for_each_node_with_property(np, "clocks") {
++		struct platform_device *con;
++		bool consumer;
++
++		consumer = q6dsp_clock_is_consumer(np, dev->of_node);
+ 
+ 		if (!consumer || !of_device_is_available(np) ||
+ 		    of_property_read_bool(np, "gpio-controller"))
+@@ -342,6 +394,7 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
+ 	 * device is attached, so the links are in place before any of them binds.
+ 	 */
+ 	q6dsp_clock_link_consumers(dev);
++	q6dsp_clock_link_cards(dev);
+ 
+ 	/*
+ 	 * Attach to this DSP instance. Clocks that are still prepared from
+-- 
+2.43.0
+

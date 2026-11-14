@@ -1,0 +1,70 @@
+From 5253b37da5982108c92a40a6e2d24617c4723d4b Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:25:37 +0000
+Subject: [PATCH 31/31] soundwire: qcom: dispose of the IRQ mappings when the
+ controller goes away
+
+The controller requests its interrupt as rising edge, while the devicetree says level high (X1E80100), and the wake
+interrupt with a type of its own as well. The mapping keeps that type after the IRQ is freed, so probing the
+controller again after an unbind failed: "irq: type mismatch, failed to map hwirq-187", "Failed to request
+soundwire irq". On the ASUS Vivobook S 15 the SoundWire controllers are unbound and probed again whenever the ADSP
+restarts (hibernation). Dispose of both mappings with a devm action, so a new probe maps them from the devicetree.
+
+Not upstream.
+---
+ drivers/soundwire/qcom.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/drivers/soundwire/qcom.c b/drivers/soundwire/qcom.c
+index 58978b4cc..35c78e131 100644
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/debugfs.h>
+ #include <linux/of.h>
++#include <linux/irqdomain.h>
+ #include <linux/of_irq.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+@@ -1578,6 +1579,11 @@ static int swrm_reg_show(struct seq_file *s_file, void *data)
+ DEFINE_SHOW_ATTRIBUTE(swrm_reg);
+ #endif
+ 
++static void qcom_swrm_dispose_irq(void *data)
++{
++	irq_dispose_mapping((unsigned int)(uintptr_t)data);
++}
++
+ static int qcom_swrm_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -1677,6 +1683,15 @@ static int qcom_swrm_probe(struct platform_device *pdev)
+ 		 qcom_swrm_has_wsa_amps(dev->of_node));
+ 	ctrl->clock_stop_not_supported = ctrl->no_clock_stop;
+ 
++	/*
++	 * The handler is requested with a trigger type of its own, not the one in the devicetree; the mapping keeps it
++	 * after the IRQ is freed, and a second probe (after an unbind) then failed to map the interrupt again ("type
++	 * mismatch"). Dispose of the mappings when the device goes away.
++	 */
++	ret = devm_add_action_or_reset(dev, qcom_swrm_dispose_irq, (void *)(uintptr_t)ctrl->irq);
++	if (ret)
++		goto err_clk;
++
+ 	ret = devm_request_threaded_irq(dev, ctrl->irq, NULL,
+ 					qcom_swrm_irq_handler,
+ 					IRQF_TRIGGER_RISING |
+@@ -1689,6 +1704,9 @@ static int qcom_swrm_probe(struct platform_device *pdev)
+ 
+ 	ctrl->wake_irq = of_irq_get(dev->of_node, 1);
+ 	if (ctrl->wake_irq > 0) {
++		ret = devm_add_action_or_reset(dev, qcom_swrm_dispose_irq, (void *)(uintptr_t)ctrl->wake_irq);
++		if (ret)
++			goto err_init;
+ 		ret = devm_request_threaded_irq(dev, ctrl->wake_irq, NULL,
+ 						qcom_swrm_wake_irq_handler,
+ 						IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
+-- 
+2.43.0
+

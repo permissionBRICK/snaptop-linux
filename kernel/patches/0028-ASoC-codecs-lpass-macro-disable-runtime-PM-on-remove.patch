@@ -1,0 +1,120 @@
+From 110cb2a115d669cdb33731b0e9988a0c29ca7820 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 21:07:39 +0000
+Subject: [PATCH 28/29] ASoC: codecs: lpass-macro: disable runtime PM on remove
+
+The WSA, RX, TX and VA macro drivers enable runtime PM in probe but never
+disable it, so a second probe of the same device (the macros are unbound and
+probed again when the ADSP restarts, see the q6dsp-lpass-clocks patches)
+starts from whatever the runtime PM core was left with:
+
+ - pm_runtime_set_active() fails with -EAGAIN because runtime PM is still
+   enabled, and pm_runtime_enable() warns "Unbalanced pm_runtime_enable!";
+ - a pending autosuspend can fire after remove, with no driver: the device
+   then is "suspended" without its callback, while the next probe turns all
+   clocks on. Its first runtime resume enables them a second time, the
+   macro/dcodec votes and the MCLK/NPL/FSGEN clocks are never released again,
+   and LPASS (and with it CX) stops collapsing in standby.
+
+Disable runtime PM first in remove, so the state cannot change any more, gate
+the clocks only if the device is active (as before), and mark it suspended.
+Once the clocks are off, put the regmap in cache-only mode: the component is
+devm-registered and unregistered after remove, and a register access then
+must not reach the unclocked macro.
+
+Not upstream.
+---
+ sound/soc/codecs/lpass-rx-macro.c  | 3 +++
+ sound/soc/codecs/lpass-tx-macro.c  | 3 +++
+ sound/soc/codecs/lpass-va-macro.c  | 3 +++
+ sound/soc/codecs/lpass-wsa-macro.c | 3 +++
+ 4 files changed, 12 insertions(+)
+
+diff --git a/sound/soc/codecs/lpass-rx-macro.c b/sound/soc/codecs/lpass-rx-macro.c
+index 9afebf63a..c35abb68f 100644
+--- a/sound/soc/codecs/lpass-rx-macro.c
++++ b/sound/soc/codecs/lpass-rx-macro.c
+@@ -3935,13 +3935,16 @@ static void rx_macro_remove(struct platform_device *pdev)
+ {
+ 	struct rx_macro *rx = dev_get_drvdata(&pdev->dev);
+ 
++	pm_runtime_disable(&pdev->dev);
+ 	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		regcache_cache_only(rx->regmap, true);
+ 		clk_disable_unprepare(rx->mclk);
+ 		clk_disable_unprepare(rx->npl);
+ 		clk_disable_unprepare(rx->fsgen);
+ 		clk_disable_unprepare(rx->macro);
+ 		clk_disable_unprepare(rx->dcodec);
+ 	}
++	pm_runtime_set_suspended(&pdev->dev);
+ }
+ 
+ static const struct of_device_id rx_macro_dt_match[] = {
+diff --git a/sound/soc/codecs/lpass-tx-macro.c b/sound/soc/codecs/lpass-tx-macro.c
+index fc4630cf5..7581584f1 100644
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -2390,13 +2390,16 @@ static void tx_macro_remove(struct platform_device *pdev)
+ {
+ 	struct tx_macro *tx = dev_get_drvdata(&pdev->dev);
+ 
++	pm_runtime_disable(&pdev->dev);
+ 	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		regcache_cache_only(tx->regmap, true);
+ 		clk_disable_unprepare(tx->macro);
+ 		clk_disable_unprepare(tx->dcodec);
+ 		clk_disable_unprepare(tx->mclk);
+ 		clk_disable_unprepare(tx->npl);
+ 		clk_disable_unprepare(tx->fsgen);
+ 	}
++	pm_runtime_set_suspended(&pdev->dev);
+ 
+ 	lpass_macro_pds_exit(tx->pds);
+ }
+diff --git a/sound/soc/codecs/lpass-va-macro.c b/sound/soc/codecs/lpass-va-macro.c
+index c3825367a..e657d76f5 100644
+--- a/sound/soc/codecs/lpass-va-macro.c
++++ b/sound/soc/codecs/lpass-va-macro.c
+@@ -1703,7 +1703,9 @@ static void va_macro_remove(struct platform_device *pdev)
+ {
+ 	struct va_macro *va = dev_get_drvdata(&pdev->dev);
+ 
++	pm_runtime_disable(&pdev->dev);
+ 	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		regcache_cache_only(va->regmap, true);
+ 		if (va->has_npl_clk)
+ 			clk_disable_unprepare(va->npl);
+ 
+@@ -1711,6 +1713,7 @@ static void va_macro_remove(struct platform_device *pdev)
+ 		clk_disable_unprepare(va->dcodec);
+ 		clk_disable_unprepare(va->macro);
+ 	}
++	pm_runtime_set_suspended(&pdev->dev);
+ 
+ 	lpass_macro_pds_exit(va->pds);
+ }
+diff --git a/sound/soc/codecs/lpass-wsa-macro.c b/sound/soc/codecs/lpass-wsa-macro.c
+index e49dac271..fecc4a425 100644
+--- a/sound/soc/codecs/lpass-wsa-macro.c
++++ b/sound/soc/codecs/lpass-wsa-macro.c
+@@ -2845,13 +2845,16 @@ static void wsa_macro_remove(struct platform_device *pdev)
+ {
+ 	struct wsa_macro *wsa = dev_get_drvdata(&pdev->dev);
+ 
++	pm_runtime_disable(&pdev->dev);
+ 	if (!pm_runtime_status_suspended(&pdev->dev)) {
++		regcache_cache_only(wsa->regmap, true);
+ 		clk_disable_unprepare(wsa->macro);
+ 		clk_disable_unprepare(wsa->dcodec);
+ 		clk_disable_unprepare(wsa->mclk);
+ 		clk_disable_unprepare(wsa->npl);
+ 		clk_disable_unprepare(wsa->fsgen);
+ 	}
++	pm_runtime_set_suspended(&pdev->dev);
+ }
+ 
+ static int wsa_macro_runtime_suspend(struct device *dev)
+-- 
+2.43.0
+
