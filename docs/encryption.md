@@ -128,6 +128,11 @@ removes tokens that no entry produces any more. Log: `journalctl -u s15-luks-res
   variants of another BIOS (other PCR 0): after a BIOS update, going back to the previous BIOS needs the passphrase.
 - The two systemd-boot entries need separate tokens even with identical files: the kernel command line names the
   initrd (`initrd=\EFI\S15\initramfs-s15.img.old`), which changes PCR 9.
+- Token order: systemd-cryptsetup tries the tokens in token-ID order, and each one sealed to another entry costs a
+  failed unseal (about 0.5 s). The tool renumbers its tokens in place (`cryptsetup token import --token-replace`) so
+  that the default entry (`loader.conf`) with the current firmware variant is tried first. The LUKS2 JSON area holds
+  12 KiB, about ten TPM tokens: the tool never copies tokens, makes room by removing an obsolete one before enrolling
+  when needed, and removes a token whose key slot another token still uses without wiping that slot.
 - After the unlock PCR 15 holds the volume key's measurement, so a running system cannot test a token; the tool
   only checks that the token it enrolled has the predicted policy. Before changing anything it checks that PCR 0
   and 2 in the TPM equal their event log up to the separator, the basis of every prediction.

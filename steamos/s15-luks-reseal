@@ -222,6 +222,57 @@ def tpm2_tokens(dev):
     return out
 
 
+def json_free(dev):
+    """Free bytes in the LUKS2 JSON metadata area (12 KiB by default; a systemd-tpm2 token takes about 1 KiB)."""
+    meta = json.loads(run("cryptsetup", "luksDump", "--dump-json-metadata", dev).stdout)
+    return int(meta["config"]["json_size"]) - len(json.dumps(meta))
+
+
+def drop_token(dev, tid, slots, keep_slots):
+    """Remove one token; wipe its key slots only if no remaining token uses them (a slot can carry two tokens)."""
+    shared = [s for s in slots if s in keep_slots]
+    for s in slots:
+        if s not in shared:
+            run("systemd-cryptenroll", f"--unlock-key-file={KEY}", f"--wipe-slot={s}", dev)
+    if shared or not slots:
+        run("cryptsetup", "token", "remove", "--token-id", str(tid), dev, check=False)
+
+
+def token_order(dev, want, default, fid, dry=False):
+    """systemd-cryptsetup tries the TPM tokens in token-ID order, and each token sealed to another entry or firmware
+    variant costs a failed unseal (about 0.5 s) before the right one. Renumber our tokens so that the default entry
+    with the current firmware variant comes first. In place (cryptsetup token import --token-replace), because the
+    JSON area has no room for copies; if interrupted, a token can be missing (that entry asks for the passphrase
+    once, the next run enrolls it again) or doubled (removed without its key slot)."""
+    have = sorted(tpm2_tokens(dev))
+    ids = [t[0] for t in have]
+
+    def rank(t):
+        name, vid = want.get(t[2], (None, None, None, None))[2:]
+        return (name != default, vid != fid, t[0])
+
+    order = sorted(have, key=rank)
+    if [t[0] for t in order] == ids:
+        if have:
+            print(f"token order: {want.get(order[0][2], (0, '?'))[1]} first (token {order[0][0]})")
+        return
+    print(f"token order: renumbering so that {want.get(order[0][2], (0, '?'))[1]} is token {ids[0]}")
+    if dry:
+        return
+    meta = json.loads(run("cryptsetup", "luksDump", "--dump-json-metadata", dev).stdout)
+    js = {tid: json.dumps(meta["tokens"][str(tid)]) for tid in ids}
+    for (tid, _, _), new in zip(order, ids):
+        if tid == new:
+            continue
+        with tempfile.NamedTemporaryFile("w", dir="/run", suffix=".json") as f:
+            f.write(js[tid])
+            f.flush()
+            run("cryptsetup", "token", "import", "--token-replace", "--token-id", str(new), "--json-file", f.name, dev)
+    now = sorted(tpm2_tokens(dev))
+    if [t[2] for t in now] != [t[2] for t in order]:
+        die("token order: unexpected result after renumbering")
+
+
 def main():
     dry = "--dry-run" in sys.argv
     if os.geteuid():
@@ -260,11 +311,19 @@ def main():
                 ents.append((name, kernel, initrd, lo))
         if not ents:
             die("no boot entry on S15BOOT can be sealed - nothing changed")
+        default = "s15.conf"
+        for line in open(f"{esp}/loader/loader.conf", encoding="utf-8"):
+            k, _, v = line.strip().partition(" ")
+            if k == "default" and v.strip():
+                default = v.strip()
         want = {}
         for vid, v in variants.items():
             for name, kernel, initrd, lo in ents:
                 p = predict(v, f"{esp}/{LOADER}", kernel, initrd, lo)
-                want.setdefault(policy(p), (p, f"{name} (firmware variant {vid})"))
+                pol = policy(p)
+                # entries with identical values share one token; label it with the default entry if it is one of them
+                if pol not in want or (name == default and want[pol][2] != default):
+                    want[pol] = (p, f"{name} (firmware variant {vid})", name, vid)
     finally:
         run("umount", esp)
         os.rmdir(esp)
@@ -292,23 +351,31 @@ def main():
             seen.add(pol)
         else:
             drop.append((tid, slots, pol))
-    add = [(pol, p, why) for pol, (p, why) in want.items() if pol not in seen]
-    for pol, (p, why) in want.items():
+    add = [(pol, p, why) for pol, (p, why, _, _) in want.items() if pol not in seen]
+    for pol, (p, why, _, _) in want.items():
         print(f"{'keep' if pol in seen else 'ADD '} {pol[:16]}  {why}")
     for tid, slots, pol in drop:
         print(f"DROP {pol[:16]}  token {tid}, key slot {','.join(slots)} (no sealed entry produces these values)")
     if dry:
+        token_order(dev, want, default, fid, dry=True)
         return
+    kept = [t for t in have if t not in drop]
+    keep_slots = {s for _, slots, _ in kept for s in slots}
     for pol, p, why in add:
+        # The JSON area holds about ten TPM tokens: make room by removing an obsolete one first if needed.
+        while drop and json_free(dev) < 2048:
+            tid, slots, dpol = drop.pop(0)
+            drop_token(dev, tid, slots, keep_slots)
+            print(f"removed {dpol[:16]} (key slot {','.join(slots)}) to make room")
         spec = "+".join(f"{i}:sha256={p[i].hex()}" for i in PCRS)
         run("systemd-cryptenroll", f"--unlock-key-file={KEY}", "--tpm2-device=auto", f"--tpm2-pcrs={spec}", dev)
         if pol not in {t[2] for t in tpm2_tokens(dev)}:
             die(f"enrolled token for {why} has an unexpected policy - stopping before removing anything")
         print(f"enrolled {pol[:16]} for {why}")
     for tid, slots, pol in drop:
-        for s in slots:
-            run("systemd-cryptenroll", f"--unlock-key-file={KEY}", f"--wipe-slot={s}", dev)
-        print(f"removed {pol[:16]} (key slot {','.join(slots)})")
+        drop_token(dev, tid, slots, keep_slots)
+        print(f"removed {pol[:16]} (key slot {','.join(slots)}{', shared: token only' if set(slots) & keep_slots else ''})")
+    token_order(dev, want, default, fid)
     tmp = VARIANTS + ".tmp"
     with open(tmp, "w") as f:
         json.dump(variants, f, indent=1)
