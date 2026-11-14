@@ -117,7 +117,7 @@ sudo s15-pin set       # 6-12 digits, typed twice; s15-pin clear removes it, s15
 Optional: the login screen and Desktop Mode's lock screen also recognise your face with the IR camera, as Windows
 Hello does. It uses [Biopass](https://github.com/phucvinh57/biopass) 1.5.1 (face and fingerprint unlock for Linux
 PAM, MIT license): the app from Biopass's arm64 release, its authentication part built on the laptop with our patches
-for this IR camera (`face/patches/`, offered upstream).
+for this IR camera (`face/patches/`, to be offered upstream).
 
 > **State 2026-11-14:** built for SteamOS 0.5.7 (aarch64, in the image under qemu) and checked offline: Biopass's
 > unit tests, our IR path against frames captured on the laptop, the PAM edits on the image's files. **Not yet tested
@@ -177,7 +177,9 @@ time, and the camera light is on while either does.
   unpacked and stretched to 8-bit grey from their own black level and brightest pixels, turned upright (the camera
   is mounted upside down and cannot flip), and the dark frames of the IR light (it flashes 50 ms every 100 ms on
   its own) are skipped. The two cameras are told apart by their libcamera ids, and only one streams at a time.
-  libcamera 0.8.0 is built with its CPU software ISP (no GPU access needed).
+  libcamera 0.8.0 is built with its CPU software ISP (no GPU access needed), and marked as installed: Biopass's
+  bundled copy otherwise takes its own RUNPATH for a build tree, looks for its IPA helper process there, and the
+  colour camera's software ISP does not start (patch 0003, a bug in Biopass 1.5.1 found from the code).
 - `s15-face` (pam_exec) gates Biopass: `pam-empty` (login screen: empty field only) and `pam-gate` (lock screen,
   sudo/polkit), each counting a scan, and both refusing unless your Biopass settings name an IR camera (without
   one, a photo on a phone could pass); `pam-ok` and the login screen's account phase (`pam-account`) reset the count;

@@ -1,0 +1,75 @@
+From ac3ba40acc2edf74b09618d03b481fdd042cf523 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:49:57 +0000
+Subject: [PATCH] fix(camera): bundled libcamera finds its IPA proxy workers
+
+The bundled libcamera keeps the RUNPATH it is linked with, and libcamera
+takes a RUNPATH in its own ELF as the sign that it runs uninstalled from
+its build tree (source_paths.cpp). It then looks for IPA proxy workers
+only below that tree (/usr/src/libcamera/proxy/worker), never in
+/usr/lib/biopass/libcamera. With IPA signing disabled (#176) every IPA is
+isolated, so the software ISP's IPA fails to load ("Failed to get proxy
+worker path") and MIPI cameras behind the software ISP do not work. It
+also added /usr/src/ipa to the IPA search path.
+
+A second patch step marks the bundled copy as installed.
+---
+ auth/BundleLibcamera.cmake         |  3 +++
+ auth/PatchLibcameraInstalled.cmake | 31 ++++++++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+ create mode 100644 auth/PatchLibcameraInstalled.cmake
+
+diff --git a/auth/BundleLibcamera.cmake b/auth/BundleLibcamera.cmake
+index 0c7394c..9715e53 100644
+--- a/auth/BundleLibcamera.cmake
++++ b/auth/BundleLibcamera.cmake
+@@ -58,6 +58,9 @@ ExternalProject_Add(libcamera_ext
+     # Never link gnutls/libcrypto (#176); IPAs are then unsigned and run isolated.
+     PATCH_COMMAND  ${CMAKE_COMMAND} -DLIBCAMERA_SOURCE_DIR=<SOURCE_DIR>
+         -P ${CMAKE_CURRENT_LIST_DIR}/PatchLibcameraNoCrypto.cmake
++    # Its RUNPATH would make it look for IPA proxy workers in a build tree.
++    COMMAND        ${CMAKE_COMMAND} -DLIBCAMERA_SOURCE_DIR=<SOURCE_DIR>
++        -P ${CMAKE_CURRENT_LIST_DIR}/PatchLibcameraInstalled.cmake
+     CONFIGURE_COMMAND meson setup --buildtype=release
+         --prefix=${LIBCAMERA_PREFIX} --libdir=${LIBCAMERA_LIBDIR}
+         --libexecdir=${LIBCAMERA_LIBDIR} --datadir=${LIBCAMERA_DATADIR}
+diff --git a/auth/PatchLibcameraInstalled.cmake b/auth/PatchLibcameraInstalled.cmake
+new file mode 100644
+index 0000000..c24ed58
+--- /dev/null
++++ b/auth/PatchLibcameraInstalled.cmake
+@@ -0,0 +1,31 @@
++# Patch step for the bundled libcamera (see BundleLibcamera.cmake).
++#
++# libcamera decides whether it runs from its build tree by looking for a
++# RUNPATH in its own ELF (source_paths.cpp, "removed on install"). The bundled
++# copy keeps the RUNPATH it is linked with on purpose, so libcamera believes it
++# is uninstalled: it then looks for IPA proxy workers only below the build
++# tree (/usr/src/libcamera/proxy/worker from /usr/lib/biopass), never in
++# /usr/lib/biopass/libcamera, and every isolated IPA fails to load ("Failed to
++# get proxy worker path"). Without IPA signing (PatchLibcameraNoCrypto.cmake)
++# all IPAs are isolated, so the software ISP, and with it every MIPI camera
++# behind it, does not work. It also adds /usr/src/ipa to the IPA search path.
++# Mark the bundled copy as installed.
++#
++# Usage: cmake -DLIBCAMERA_SOURCE_DIR=<dir> -P PatchLibcameraInstalled.cmake
++# Idempotent; fails loudly if a libcamera bump changes the patched line.
++
++set(_file "${LIBCAMERA_SOURCE_DIR}/src/libcamera/source_paths.cpp")
++set(_marker "biopass: always installed")
++file(READ "${_file}" _content)
++if(_content MATCHES "${_marker}")
++    return()
++endif()
++set(_old "if (dyn->d_tag == DT_RUNPATH || dyn->d_tag == DT_RPATH)")
++string(FIND "${_content}" "${_old}" _pos)
++if(_pos EQUAL -1)
++    message(FATAL_ERROR "libcamera patch: '${_old}' not found in ${_file}; "
++                        "update auth/PatchLibcameraInstalled.cmake for the new libcamera version")
++endif()
++string(REPLACE "${_old}" "if (false) /* ${_marker}: its RUNPATH is deliberate */" _content "${_content}")
++file(WRITE "${_file}" "${_content}")
++message(STATUS "libcamera patch: bundled copy counts as installed")
+-- 
+2.43.0
+
