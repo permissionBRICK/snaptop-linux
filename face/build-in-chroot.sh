@@ -5,8 +5,11 @@
 set -euo pipefail
 B=/build; S=$B/src; T=$B/b; STAGE=$B/stage; J=${J:-8}; V=${BIOPASS_VERSION:?}
 log() { echo "$(date +%T) == $*"; }
-# A header-only build dependency the image lacks; from the image's own repository, into the build overlay only.
-pacman -Q cli11 >/dev/null 2>&1 || pacman -S --needed --noconfirm cli11 >/dev/null
+# Build-only dependencies the image lacks (cli11: headers; libcamera's code generators), from the image's own
+# repository, into the build overlay only.
+need=()
+for p in cli11 python-jinja python-ply python-yaml; do pacman -Q "$p" >/dev/null 2>&1 || need+=("$p"); done
+[ ${#need[@]} = 0 ] || pacman -S --needed --noconfirm "${need[@]}" >/dev/null
 log "sources and patches"
 rm -rf "$B/biopass-$V" "$T" "$STAGE" "$B/libcamera"; mkdir -p "$T/_deps" "$B/libcamera"
 tar -xf "$S/biopass-$V.tar.gz" -C "$B"

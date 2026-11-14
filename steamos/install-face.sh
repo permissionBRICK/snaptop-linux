@@ -83,6 +83,17 @@ put() {
   remove_files "$R"
   (cd "$s/root" && find . \( -type f -o -type l \) | sed 's#^\.##') > "$s/files"
   tar -C "$s/root" --owner=0 --group=0 -cf - usr | tar -C "$R/" -xpf - --no-overwrite-dir
+  # A build from the cache links the libraries of the version it was built for; one this version lacks: build again.
+  local missing
+  missing=$(chroot "${R:-/}" /bin/sh -c 'for f in /usr/bin/biopass /usr/bin/biopass-helper /usr/lib/security/libbiopass_pam.so \
+    /usr/libexec/biopass/biopass-keyring /usr/lib/biopass/*.so* /usr/lib/biopass/libcamera/*/*.so \
+    /usr/lib/biopass/libcamera/softisp_ipa_proxy; do ldd "$f"; done' 2>&1 | grep 'not found' | sort -u || true)
+  if [ -n "$missing" ]; then
+    rm -rf "$s"
+    [ "${REBUILD:-0}" != 1 ] || die "libraries missing in ${R:-/}: $missing"
+    echo "libraries missing in ${R:-/} ($(echo "$missing" | awk '{print $1}' | tr '\n' ' ')): building again" >&2
+    REBUILD=1 put "$R"; return
+  fi
   install -D -m0755 "$HERE/s15-face" "$R/usr/local/sbin/s15-face"
   install -d -m0700 "$R$STATE"
   { cat "$s/files"; echo /usr/local/sbin/s15-face; } > "$R$STATE/files"
