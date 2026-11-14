@@ -63,9 +63,14 @@ the OV02C10 can leave its controller stalled (`master 1 queue 0 timeout`), and W
 the failed stream start. The patch resets CCI on runtime resume and retries a transfer once after the
 existing timeout reset. A recovered transfer may still log that timeout.
 
-The visible camera activity LED is not configured in the current device tree. Its wiring and operation
-under Linux remain unverified; do not infer that the camera is off from an unlit indicator. The HM1092
-IR illuminator is a separate component.
+The camera activity LED next to the webcam lights while the RGB or the IR camera streams, as on Windows. It
+is TLMM gpio110 (`\_SB.CAMP` GPIO resource 1 in the DSDT; the Windows camera driver's privacy LED entry
+names that resource for the front and the IR sensor). `kernel/overlay/35-camera-privacy-led.dtsi` adds it as a
+`gpio-leds` LED (`/sys/class/leds/white:indicator`) and links it to both sensors; the v4l2 core switches it and
+takes it away from sysfs, so user space cannot switch it off while a camera streams. Both sensors share the LED;
+our kernel patch keeps it lit until the last of them stops (the two cameras cannot stream at the same time
+through the libcamera simple pipeline today, so this only matters if that changes). Opening a camera without
+streaming (format probing, `cam -l`) leaves it off. The HM1092 IR illuminator is a separate component.
 
 ## What `steamos-s15-setup.sh` changes in the Frame image
 
@@ -93,13 +98,13 @@ IR illuminator is a separate component.
 
 | Hook / module | Why |
 |---|---|
-| `s15` | Clock, interconnect, PHY, PCIe/NVMe, USB and USB storage drivers for the root filesystem. |
+| `s15` | Clock, interconnect, PHY, PCIe/NVMe, USB and USB storage drivers for the root filesystem, including the eUSB2 PHY and PTN3222 repeater drivers outside `drivers/phy/qualcomm/`: with them the USB controllers start in the initramfs (a USB keyboard works at the passphrase prompt), and a resume from hibernation finds USB PHYs that are set up. |
 | `s15-dsp` | Starts the ADSP with its firmware from the initramfs. The display driver waits for the USB-C/DisplayPort chain behind the ADSP (`pmic_glink`); without it the display could only start after the root filesystem. The compute DSP (CDSP) is left out (nothing there uses it, and stopping it again before a resume from hibernation took 8.5 s); `s15-cdsp.service` starts it once the root is mounted. |
 | `kms`, `s15-display` | The display driver (msm) is in the image but only loaded when a passphrase is requested, next to the prompt and without delaying it (`s15-prompt-display.service`); meanwhile the Caps Lock light blinks (`s15-prompt-signal.service`). See below. |
 | `keyboard`, `sd-vconsole`, `i2c_hid_of`, `hid_asus_ec` | Internal keyboard, console keymap and font (`/etc/vconsole.conf`) for a passphrase prompt. The keymap is global for all consoles, so SteamOS's own `systemd-vconsole-setup` is masked. |
 | `tpm_qcom_crb`, `sd-encrypt` | Firmware TPM and LUKS, for an encrypted root ([tpm.md](tpm.md)); idle without `crypttab`/`rd.luks`. |
 | `s15-btrfs-logcheck` | Before the root is mounted: replays a btrfs tree log left by a crash, or drops it if the kernel cannot replay it; after the resume attempt, so it never mounts the file system under a hibernation image ([known-issues.md](known-issues.md#btrfs-tree-log)). |
-| `s15-hibernate` | Only with `resume=` (hibernation enabled, [power.md](power.md#hibernation)): stops the DSPs that `s15-dsp` started before the kernel hands over to a hibernation image, and starts them again if the resume does not happen. |
+| `s15-hibernate` | Only with `resume=` (hibernation enabled, [power.md](power.md#hibernation)): loads the display driver and stops the ADSP that `s15-dsp` started before the kernel hands over to a hibernation image, and starts it again if the resume does not happen. |
 | `sd-s15-etc-overlay` | Mounts SteamOS's `/etc` overlay before switch-root, so units enabled at runtime start at boot. |
 
 Why the DSPs start this early: the firmware's framebuffer (efifb) does not survive the kernel's cleanup of unused

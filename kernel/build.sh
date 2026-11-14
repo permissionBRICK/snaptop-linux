@@ -50,9 +50,12 @@ $M -j"$JOBS" Image modules
 $M -j1 qcom/x1e80100-asus-vivobook-s15.dtb
 KREL=$($M -s kernelrelease)
 
-# 5. DT overlay from the community repo (audio, both cameras, optional EC) + IR sensor rotation
+# 5. DT overlay from the community repo (audio, both cameras, optional EC) plus our fragments in overlay/
+#    (camera privacy LED), built from a copy so the community checkout stays clean; + IR sensor rotation
 cd "$WORK"
-vivobook-s15-fedora/overlay/build-overlay.sh --dtbo-only --out "$WORK/overlay" >/dev/null
+rm -rf overlay-src; cp -r vivobook-s15-fedora/overlay overlay-src
+cp "$HERE"/overlay/*.dtsi overlay-src/fragments/
+overlay-src/build-overlay.sh --dtbo-only --out "$WORK/overlay" >/dev/null
 OUT=$WORK/payload; rm -rf "$OUT"; mkdir -p "$OUT/dtb" "$OUT/stage"
 D=linux/arch/arm64/boot/dts/qcom/x1e80100-asus-vivobook-s15.dtb
 for v in "":vivobook-s15.dtbo "-ec":vivobook-s15-experimental.dtbo; do

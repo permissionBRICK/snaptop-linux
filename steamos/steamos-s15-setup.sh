@@ -246,9 +246,12 @@ printf '[Unit]\nDescription=Lid watchdog every minute\n[Timer]\nOnBootSec=2min\n
 install -d "$R/etc/systemd/system/timers.target.wants"
 ln -sfn /etc/systemd/system/s15-lid-watchdog.timer "$R/etc/systemd/system/timers.target.wants/s15-lid-watchdog.timer"
 install -D -m0755 "$HERE/../power/s15-sleep-hook" "$R/usr/lib/systemd/system-sleep/s15-sleep-hook"
-# USB controllers: powered while awake (hot-plugging), runtime PM only around a suspend. Replaces the old udev rule
-# that kept them runtime-suspended all the time: a plugged-in device then never woke them.
+# USB controllers (docs/power.md, "USB runtime PM"): runtime PM while awake where a plug-in still wakes them
+# (s15-usb-pm: USB-C ports without a Type-C partner; USB-A with kernel patch 0021), all of them around a suspend.
+# Replaces the old udev rule that kept them runtime-suspended all the time: a plugged-in device then never woke them.
 rm -f "$R/etc/udev/rules.d/91-s15-usb-runtime-pm.rules"
+install -D -m0755 "$HERE/s15-usb-pm" "$R/usr/local/sbin/s15-usb-pm"
+install -D -m0644 "$HERE/91-s15-usb-pm.rules" "$R/etc/udev/rules.d/91-s15-usb-pm.rules"
 install -D -m0755 "$HERE/s15-usb-sleep" "$R/usr/lib/systemd/system-sleep/s15-usb-sleep"
 install -D -m0644 "$HERE/92-s15-wakeup.rules" "$R/etc/udev/rules.d/92-s15-wakeup.rules"
 # Encrypted root (docs/encryption.md): keep the TPM unlock matching the boot entries, at every boot and after

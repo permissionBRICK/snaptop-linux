@@ -1,0 +1,42 @@
+#!/bin/bash
+# USB runtime PM policy while awake (docs/power.md, "USB runtime PM"). Install as /usr/local/sbin/s15-usb-pm.
+#
+# A runtime-suspended controller notices a device plugged in only with our kernel patch 0021 (dwc3-qcom keeps the
+# 32 kHz sleep clock running, as Windows does; without it no PHY interrupt arrives):
+# - USB-C (a600000.usb = Type-C port0, a800000.usb = port1, DT connector endpoints): nothing can enumerate there
+#   before a Type-C attach, and UCSI (pmic_glink) reports every attach as /sys/class/typec/portN-partner. So the
+#   controller runs while its port has a partner and may runtime-suspend while it has none (works without 0021).
+# - USB-A (a400000.usb, multiport, both USB-A ports) and the USB2-only controller (a200000.usb, nothing attached
+#   on this laptop): runtime PM ("auto") when the running kernel has 0021 (/sys/module/dwc3_qcom/parameters/
+#   runtime_sleep_clk = Y), otherwise "on". /etc/s15-usb-pm.conf can set USB_A=on / USB2=on.
+# Controller and its xhci-hcd.N.auto child always get the same value: a suspended xHCI under an active controller
+# would not notice a plug-in either.
+# Called by 91-s15-usb-pm.rules (Type-C partner add/remove, controller bind) and by the s15-usb-sleep hook after
+# resume. Idempotent.
+USB_A=auto USB2=auto
+[ -r /etc/s15-usb-pm.conf ] && . /etc/s15-usb-pm.conf
+if [ "$(cat /sys/module/dwc3_qcom/parameters/runtime_sleep_clk 2>/dev/null)" != Y ]; then USB_A=on USB2=on; fi
+
+set_ctl() { # <controller name> <on|auto>
+  local d=/sys/bus/platform/devices/$1 f
+  [ -d "$d" ] || return 0
+  # "on" parent first (it resumes the child's parent anyway), "auto" child first
+  if [ "$2" = on ]; then
+    for f in "$d"/power/control "$d"/xhci-hcd.*.auto/power/control; do [ -w "$f" ] && echo on > "$f"; done
+  else
+    for f in "$d"/xhci-hcd.*.auto/power/control "$d"/power/control; do [ -w "$f" ] && echo auto > "$f"; done
+  fi
+}
+
+typec_ctl() { # <typec port number> <controller name>
+  if [ -e /sys/class/typec/port$1-partner ]; then set_ctl "$2" on
+  elif [ -e /sys/class/typec/port$1 ]; then set_ctl "$2" auto
+  else set_ctl "$2" on   # UCSI not up yet (ADSP starts ~20 s into the boot): keep it running
+  fi
+}
+
+typec_ctl 0 a600000.usb
+typec_ctl 1 a800000.usb
+set_ctl a400000.usb "$USB_A"
+set_ctl a200000.usb "$USB2"
+exit 0

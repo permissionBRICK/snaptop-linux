@@ -42,15 +42,17 @@ Screen-off idle A/B (2026-11-01, 75-150 s per step):
 |---|---|
 | keyboard backlight level 1 → off | 4.08 → 3.25 W (**-0.8 W**) |
 | PCIe ASPM `default` → `powersupersave` | no change |
-| USB runtime PM on all four dwc3 controllers *and* their `xhci-hcd.N.auto` children | 3.42 → 3.10 W (-0.3 W); no shutdown here, unlike the upstream report. **Not used while awake any more:** a runtime-suspended controller does not wake when a device is plugged in, so hot-plugging did not work. Now only around a suspend (`s15-usb-sleep`); getting the plug-in wakeup to work would bring the 0.3 W back. |
+| USB runtime PM on all four dwc3 controllers *and* their `xhci-hcd.N.auto` children | 3.42 → 3.10 W (-0.3 W); no shutdown here, unlike the upstream report. A runtime-suspended controller did not wake when a device was plugged in; since kernel patch `0021` (sleep clock kept on, as on Windows) it does, and `s15-usb-pm` uses runtime PM while awake (2026-11-14, see below). |
 
 Checked and fine: NVMe APST is on and the drive idles in PS4 (4 mW) with L1.2; USB4 and PCIe tunnel power
 domains are off; fans stop at idle. Still powered without a user: `gcc_ufs_phy_gdsc`/`gcc_ufs_mem_phy_gdsc` (no
 UFS on this laptop) and `gcc_usb30_tert_gdsc`, kept on by `pd_ignore_unused`.
 
 Open leads for the floor:
-- USB runtime PM while awake (-0.3 W screen-off, see the table) needs a working wakeup on plug-in first; the dwc3
-  controllers report `wakeup=enabled`, the xHCI hosts `disabled`, and no plug event reaches a suspended controller.
+- USB runtime PM while awake: done (2026-11-14). With the screen off and the rest idle, the four controllers on
+  `auto` drew 1.40-1.41 W against 1.46 W with them on (two rounds of 75 s each), so about -0.06 W at today's much
+  lower idle floor. Plug-in wakeup works on both USB-A ports (kernel patch `0021`, [kernel.md](kernel.md)); USB-C
+  controllers suspend only while their port has no Type-C partner (`s15-usb-pm`, udev rule `91-s15-usb-pm.rules`).
 - Wi-Fi and NVMe have runtime PM off (NVMe relies on APST, `default_ps_max_latency_us` = 100000); check which
   APST state the drive reaches.
 - Keyboard backlight was at level 1 during the test.
@@ -80,7 +82,7 @@ Screen off (a second run, 4 min each): 1.43 W with the Steam client running, 1.3
 - USB runtime PM while awake (plain desktop, 4 min each): 4.09 W always on, 3.99 W with the four controllers and
   their xHCI hosts on `auto` (all suspended after their 5 s autosuspend delay; the memory bus average vote fell from
   4.85 to 1.61 GB/s, 3.2 GB/s of it the controllers' own), 4.10 W on again. So about -0.1 W with the screen on
-  (-0.3 W screen off, above), and still blocked by the missing wakeup on plug-in (`s15-usb-sleep`).
+  (-0.3 W screen off, above), then still blocked by the missing wakeup on plug-in (fixed since, see "Open leads" above).
 - Panel Self Refresh: the panel supports PSR1 (DPCD `0x070` = `01`, eDP controller `aea0000`) and msm has it behind
   `msm.psr_enabled=1` (`/etc/modprobe.d`: msm is blacklisted in the initramfs and loads from the system on a TPM
   boot). Tried 2026-11-05: the login screen flashed on and off, the desktop showed once or twice and then stayed
@@ -168,7 +170,7 @@ wake kept the laptop awake for 14 min in this test (fixed: the input baseline is
 ## Hibernation
 
 Experimental (2026-11-14), not part of the install and not offered by default: the goal is Windows' "hibernate after
-some hours of standby". The mechanics work end to end; the restored system does not yet (see below).
+some hours of standby". The mechanics work end to end and the restored system works except for audio (see below).
 
 Enable with `sudo /opt/snaptop-linux/steamos/hibernate.sh enable` (`status`, `disable` to undo). It
 - creates a 16 GiB swap file in its own subvolume of the partition's top level, `.s15-swap` (outside the OS
@@ -186,21 +188,31 @@ Around a hibernation (sleep hook `s15-hibernate`, initcpio hook `s15-hibernate`)
 - BootNext is set to the running entry and systemd-boot's one-shot entry to the running kernel: the firmware starts
   Windows first, and BootNext survives a full power-off (tested 2026-11-14);
 - the CDSP and ADSP are stopped (CDSP first: the other DSP's state notifications to it time out after 5 s each).
-  Their driver has no hibernation callbacks, and the boot that restores the image starts its own instances in the
-  initramfs; `s15-hibernate-initrd` stops those again right before the hand-over, and the restored system starts
-  them. Stopping the ADSP removes the sound card, which waits until PipeWire closed it, so user sessions are not
-  frozen during the hooks (`SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=false` on `systemd-hibernate.service`; otherwise the
-  stop waits forever and the kernel aborts the hibernation after systemd's 90 s hook timeout);
+  Their driver has no hibernation callbacks, and the boot that restores the image starts its own ADSP in the
+  initramfs; `s15-hibernate-initrd` stops it again right before the hand-over (after loading msm, which quiesces the
+  firmware's live scanout; without that the restore crashed), and the restored system starts it. Stopping the ADSP
+  removes the sound card, which waits until PipeWire closed it, so user sessions are not frozen during the hooks
+  (`SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=false` on `systemd-hibernate.service`; otherwise the stop waits forever and
+  the kernel aborts the hibernation after systemd's 90 s hook timeout);
 - `s15-ec-darkwake` and `s15-sleep-radios` treat a resume from hibernation as a real wake.
 
-Measured (2026-11-14): hibernation entry a few seconds; on resume the boot kernel reaches the image load after about
-12 s (8.5 s of it stopping the CDSP, which is not needed in the initramfs). Then it took minutes until the restored
-system ran again: the image load itself is the suspect (not yet measured). After the restore: Wi-Fi and the ADSP
-(battery, USB-C) come back; broken are the GPU (the GMU expects its firmware still loaded: "Unable to power on the GPU
-RSC", black screen), the EC (an interrupt storm of "Unknown EC event: 0"; it seems to reset itself without its
-temperature feed during a long resume), the USB controllers ("Clearing Run/Stop bit failed"), Bluetooth (no answer
-from the controller) and audio (after any ADSP restart the LPASS macros keep dead clock handles; the macro and codec
-drivers forbid a rebind, and unloading the LPASS modules afterwards corrupted the kernel). These need kernel work.
+State (2026-11-14, kernel patches `0016`-`0024`, [kernel.md](kernel.md)): a self-resuming test (`HibernateMode=reboot`)
+gets back into the session about 64 s after the hibernate command, for saving, firmware and loading; the boot kernel
+starts the image load 2.8 s after it starts. After the restore the GPU, EC, Bluetooth (a rebind in the hook on top of
+patch `0018`), Wi-Fi, keyboard, touchpad, battery and all USB controllers work. Still broken: audio (after any ADSP
+restart the LPASS macros keep dead clock handles; the macro and codec drivers forbid a rebind, and unloading the LPASS
+modules afterwards corrupted the kernel). The CDSP stays offline until the next boot (nothing uses it). Not yet
+tested: a real power-off (`HibernateMode=shutdown`) with this kernel, and long-term use.
+
+USB: the kernel that loads the image has to set up the USB PHYs itself. The eUSB2 PHY and PTN3222 repeater drivers
+are in `drivers/phy/`, not `drivers/phy/qualcomm/`, so the initcpio hook `s15` adds them by name; without them no
+USB controller bound before the hand-over, that kernel's `clk_disable_unused` gated the QMP PHY clocks, and the
+restored kernel, which still counted the PHYs as set up, had no PIPE clock: every SuperSpeed xHCI restore spun for
+21 s with interrupts off (`Clearing Run/Stop bit failed`), which starved RPMh, the I2C controllers and Wi-Fi on that
+CPU (freezes, hard lockups). Two other approaches made the machine reset silently in the late/noirq freeze phase
+before the image was written: unbinding the USB controllers before hibernating, and PHY driver patches that
+release the PHYs before the snapshot. `echo platform > /sys/power/pm_test` reproduces such resets without writing an
+image (the `devices` level stops before the late/noirq phase).
 Test aids: `/run/s15-hibernate-signal` (Caps Lock blinks when the restored system runs), `/run/s15-hibernate-entry`
 (one-shot entry for the resume, e.g. one without `quiet`), `s15.hibernate_report=1` on that entry (the boot kernel
 writes its log to `S15BOOT/s15-hibernate-resume.log` before the image load). `clk_ignore_unused` on the resume entry

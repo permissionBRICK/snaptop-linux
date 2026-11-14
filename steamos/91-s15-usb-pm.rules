@@ -1,0 +1,5 @@
+# USB runtime PM policy (s15-usb-pm): re-evaluate when a Type-C partner comes or goes (UCSI) and when a USB
+# controller or its xHCI host binds. Install as /etc/udev/rules.d/91-s15-usb-pm.rules.
+ACTION=="add|remove", SUBSYSTEM=="typec", ENV{DEVTYPE}=="typec_partner", RUN+="/usr/local/sbin/s15-usb-pm"
+ACTION=="add", SUBSYSTEM=="typec", ENV{DEVTYPE}=="typec_port", RUN+="/usr/local/sbin/s15-usb-pm"
+ACTION=="bind", SUBSYSTEM=="platform", DRIVER=="dwc3-qcom|xhci-hcd", RUN+="/usr/local/sbin/s15-usb-pm"

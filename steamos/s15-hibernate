@@ -94,20 +94,35 @@ case "$1" in
         leds trigger none
         for i in 1 2 3 4 5 6 7 8 9 10; do leds brightness 1; sleep 0.3; leds brightness 0; sleep 0.3; done
         leds trigger kbd-capslock'
+    efivars
+    how="restored after a power-off (BootNext used)"; cycled=1
+    bn=$(efibootmgr 2>/dev/null | sed -n 's/^BootNext: //p')
+    if [ -e $R.bootnext ] && [ "$bn" = "$(cat $R.bootnext)" ]; then
+        efibootmgr -q -N 2>/dev/null
+        how="no power-off (mode $(sed 's/.*\[\(.*\)\].*/\1/' /sys/power/disk), or the hibernation was aborted)"; cycled=0
+    fi
+    # After a power cycle only the ADSP: the CDSP does not start again (start timed out) because the boot that restored
+    # the image never started it (it is not in the initramfs, s15-dsp) and its shared-memory items are missing.
+    # Nothing uses it; it stays offline until the next boot. After an aborted hibernation both come back.
     ts=$(date +%s.%N)
     for n in adsp cdsp; do
         grep -qx "$n" $R.dsps 2>/dev/null || continue
+        [ $n = cdsp ] && [ $cycled = 1 ] && continue
         r=$(dsp $n)
         [ "$(cat "$r/state")" = running ] || echo start > "$r/state" 2>/dev/null
         wait_running "$r"
     done
     dt=$(since "$ts")
-    efivars
-    how="restored after a power-off (BootNext used)"
-    bn=$(efibootmgr 2>/dev/null | sed -n 's/^BootNext: //p')
-    if [ -e $R.bootnext ] && [ "$bn" = "$(cat $R.bootnext)" ]; then
-        efibootmgr -q -N 2>/dev/null
-        how="no power-off (mode $(sed 's/.*\[\(.*\)\].*/\1/' /sys/power/disk), or the hibernation was aborted)"
+    # Bluetooth (WCN7850 over UART): after the power cycle the controller does not answer ("Reading QCA version
+    # information failed"); its power sequencer still counts it as on. A rebind runs the power-on and the firmware
+    # download again (in the background; systemd-rfkill restores the radio state of the new device).
+    if [ $cycled = 1 ]; then
+        for d in /sys/bus/serial/drivers/hci_uart_qca/serial*; do
+            [ -e "$d" ] || continue
+            n=${d##*/}
+            systemd-run --quiet --collect --no-block /bin/sh -c \
+                "echo $n > /sys/bus/serial/drivers/hci_uart_qca/unbind; sleep 1; echo $n > /sys/bus/serial/drivers/hci_uart_qca/bind"
+        done
     fi
     if [ -e $R.oneshot ] && [ "$(efistr "$ONESHOT")" = "$(cat $R.oneshot)" ]; then clear_oneshot; fi
     if [ -e $R.oneshot.saved ]; then set_oneshot "$(cat $R.oneshot.saved)"; fi

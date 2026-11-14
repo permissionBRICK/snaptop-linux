@@ -1,0 +1,201 @@
+From f128adfae94878a42e6964bcd86590fcbf353cde Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:32:51 +0000
+Subject: [PATCH 16/17] drm/msm/a6xx: set up the GMU's RSC/PDC sequences and
+ the zap shader again after hibernation
+
+Two things are only done once: the RSC/PDC sequences (a6xx_gmu_rpmh_init() at probe; they survive a GPU power
+collapse) and loading the zap shader into the secure world (a static flag). After a restore from hibernation the SoC
+was powered off and both are gone: "Unable to power on the GPU RSC", "GMU firmware initialization timed out", then
+GPU hangs (ASUS Vivobook S 15, X1E80100). Add a .restore PM callback that marks both as lost through a new
+adreno_gpu_funcs::power_lost hook; the next GMU resume programs the sequences again and the next hw_init reloads the
+zap shader.
+
+Not upstream.
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c      | 26 +++++++++++++++++-----
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.h      |  5 +++++
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c      | 22 +++++++++++++++---
+ drivers/gpu/drm/msm/adreno/adreno_device.c | 21 ++++++++++++++++-
+ drivers/gpu/drm/msm/adreno/adreno_gpu.h    |  2 ++
+ 5 files changed, 66 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 6d49c51df..ac79db261 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -680,9 +680,13 @@ static void a6xx_gmu_rpmh_init(struct a6xx_gmu *gmu)
+ 	if (adreno_is_a8xx(adreno_gpu))
+ 		return;
+ 
+-	pdcptr = devm_platform_ioremap_resource_byname(pdev, "gmu_pdc");
+-	if (IS_ERR(pdcptr))
+-		return;
++	if (!gmu->pdc_mmio) {
++		pdcptr = devm_platform_ioremap_resource_byname(pdev, "gmu_pdc");
++		if (IS_ERR(pdcptr))
++			return;
++		gmu->pdc_mmio = pdcptr;
++	}
++	pdcptr = gmu->pdc_mmio;
+ 
+ 	if (adreno_is_a650_family(adreno_gpu) ||
+ 	    adreno_is_a7xx(adreno_gpu))
+@@ -695,9 +699,13 @@ static void a6xx_gmu_rpmh_init(struct a6xx_gmu *gmu)
+ 		pdc_address_offset = 0x30080;
+ 
+ 	if (!pdc_in_aop) {
+-		seqptr = devm_platform_ioremap_resource_byname(pdev, "gmu_pdc_seq");
+-		if (IS_ERR(seqptr))
+-			return;
++		if (!gmu->pdc_seq_mmio) {
++			seqptr = devm_platform_ioremap_resource_byname(pdev, "gmu_pdc_seq");
++			if (IS_ERR(seqptr))
++				return;
++			gmu->pdc_seq_mmio = seqptr;
++		}
++		seqptr = gmu->pdc_seq_mmio;
+ 	}
+ 
+ 	/* Disable SDE clock gating */
+@@ -1331,6 +1339,12 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 	if (ret)
+ 		goto rpm_put;
+ 
++	/* After hibernation the RSC/PDC sequences set up at probe are gone */
++	if (gmu->rpmh_lost) {
++		a6xx_gmu_rpmh_init(gmu);
++		gmu->rpmh_lost = false;
++	}
++
+ 	ret = a6xx_gmu_secure_init(a6xx_gpu);
+ 	if (ret)
+ 		goto disable_clk;
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+index 3f96b10b5..0556930d6 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+@@ -114,6 +114,11 @@ struct a6xx_gmu {
+ 	struct a6xx_hfi_queue queues[HFI_MAX_QUEUES];
+ 
+ 	bool initialized;
++	/* the RSC/PDC sequences must be programmed again (after hibernation) */
++	bool rpmh_lost;
++	/* PDC mappings kept from the first a6xx_gmu_rpmh_init() (devm: requested until unbind) */
++	void __iomem *pdc_mmio;
++	void __iomem *pdc_seq_mmio;
+ 	bool hung;
+ 	bool legacy; /* a618 or a630 */
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 081e79ea4..9733c4e77 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1126,20 +1126,33 @@ static int a6xx_ucode_load(struct msm_gpu *gpu)
+ 	return 0;
+ }
+ 
++static bool a6xx_zap_loaded;
++
+ int a6xx_zap_shader_init(struct msm_gpu *gpu)
+ {
+-	static bool loaded;
+ 	int ret;
+ 
+-	if (loaded)
++	if (a6xx_zap_loaded)
+ 		return 0;
+ 
+ 	ret = adreno_zap_shader_load(gpu, GPU_PAS_ID);
+ 
+-	loaded = !ret;
++	a6xx_zap_loaded = !ret;
+ 	return ret;
+ }
+ 
++/*
++ * Restore from hibernation: the secure world lost the zap shader and the GMU's RSC/PDC sequences are gone; both are
++ * otherwise only set up once.
++ */
++static void a6xx_power_lost(struct adreno_gpu *adreno_gpu)
++{
++	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
++
++	a6xx_zap_loaded = false;
++	a6xx_gpu->gmu.rpmh_lost = true;
++}
++
+ #define A6XX_INT_MASK (A6XX_RBBM_INT_0_MASK_CP_AHB_ERROR | \
+ 		       A6XX_RBBM_INT_0_MASK_RBBM_ATB_ASYNCFIFO_OVERFLOW | \
+ 		       A6XX_RBBM_INT_0_MASK_CP_HW_ERROR | \
+@@ -2827,6 +2840,7 @@ const struct adreno_gpu_funcs a6xx_gpu_funcs = {
+ 	.bus_halt = a6xx_bus_clear_pending_transactions,
+ 	.mmu_fault_handler = a6xx_fault_handler,
+ 	.gx_is_on = a6xx_gmu_gx_is_on,
++	.power_lost = a6xx_power_lost,
+ };
+ 
+ const struct adreno_gpu_funcs a6xx_gmuwrapper_funcs = {
+@@ -2899,6 +2913,7 @@ const struct adreno_gpu_funcs a7xx_gpu_funcs = {
+ 	.mmu_fault_handler = a6xx_fault_handler,
+ 	.gx_is_on = a7xx_gmu_gx_is_on,
+ 	.aqe_is_enabled = a6xx_aqe_is_enabled,
++	.power_lost = a6xx_power_lost,
+ };
+ 
+ const struct adreno_gpu_funcs a8xx_gpu_funcs = {
+@@ -2931,4 +2946,5 @@ const struct adreno_gpu_funcs a8xx_gpu_funcs = {
+ 	.mmu_fault_handler = a8xx_fault_handler,
+ 	.gx_is_on = a8xx_gmu_gx_is_on,
+ 	.aqe_is_enabled = a6xx_aqe_is_enabled,
++	.power_lost = a6xx_power_lost,
+ };
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_device.c b/drivers/gpu/drm/msm/adreno/adreno_device.c
+index 05c77fe27..09b3886be 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -400,8 +400,27 @@ static int adreno_system_resume(struct device *dev)
+ 	return pm_runtime_force_resume(dev);
+ }
+ 
++static int adreno_system_restore(struct device *dev)
++{
++	struct msm_gpu *gpu = dev_to_gpu(dev);
++
++	if (gpu) {
++		struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++
++		if (adreno_gpu->funcs->power_lost)
++			adreno_gpu->funcs->power_lost(adreno_gpu);
++	}
++
++	return adreno_system_resume(dev);
++}
++
+ static const struct dev_pm_ops adreno_pm_ops = {
+-	SYSTEM_SLEEP_PM_OPS(adreno_system_suspend, adreno_system_resume)
++	.suspend = pm_sleep_ptr(adreno_system_suspend),
++	.resume = pm_sleep_ptr(adreno_system_resume),
++	.freeze = pm_sleep_ptr(adreno_system_suspend),
++	.thaw = pm_sleep_ptr(adreno_system_resume),
++	.poweroff = pm_sleep_ptr(adreno_system_suspend),
++	.restore = pm_sleep_ptr(adreno_system_restore),
+ 	RUNTIME_PM_OPS(adreno_runtime_suspend, adreno_runtime_resume, NULL)
+ };
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_gpu.h b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+index 114a40f79..eb630de49 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -81,6 +81,8 @@ struct adreno_gpu_funcs {
+ 	int (*mmu_fault_handler)(void *arg, unsigned long iova, int flags, void *data);
+ 	bool (*gx_is_on)(struct adreno_gpu *adreno_gpu);
+ 	bool (*aqe_is_enabled)(struct adreno_gpu *adreno_gpu);
++	/* restore from hibernation: state that outlives a GPU power collapse is gone */
++	void (*power_lost)(struct adreno_gpu *adreno_gpu);
+ };
+ 
+ struct adreno_reglist {
+-- 
+2.43.0
+

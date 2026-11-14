@@ -1,0 +1,732 @@
+From 3d4becfd01bfbd84458130138b9a18e075fdf7ad Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:38:22 +0000
+Subject: [PATCH 21/24] usb: dwc3: qcom: wake a runtime-suspended controller on
+ a plug-in (X1E80100)
+
+A runtime-suspended controller on the Vivobook S 15 missed a device plugged
+in: no PHY interrupt (dp/dm_hs_phy, ss_phy, pwr_event) arrived at all, so
+runtime PM could only be used where something else reports the attach
+(Type-C). This adds what the Windows driver stack of X1E80100 laptops does
+before a controller leaves D0 (ACPI PEP tables and QcXhciFilter8380.sys), as
+module parameters that are read at every runtime suspend.
+
+On by default:
+- runtime_sleep_clk: keep the "sleep" (suspend) clock on in runtime suspend
+  (Windows D1/D2 keep gcc_usb30_*_sleep_clk on; only D3 turns it off).
+  Turned off again for system suspend, so standby is unchanged. This is the
+  fix: with it, plugging a stick into either USB-A port of the multiport
+  controller raises dp_hs_phy_N and the device enumerates (tested on both
+  ports, three times); without it nothing happens.
+- wake_hold_ms=500: after a wakeup interrupt keep the xHCI host running for
+  500 ms. xhci_resume() resumes the root hubs only if a port change is
+  already latched (the 120 ms grace period applies only with suspended USB3
+  devices) and xhci-hcd.N.auto (autosuspend delay 0) suspends again at once,
+  so a connect that the controller had not latched yet was lost.
+- eusb2_wake=-1 (auto: USB2 PHY compatible contains "eusb2"): with a device
+  attached arm DM rising (HS/FS) or DP rising (LS) instead of DP/DM falling,
+  as for eUSB2 repeaters (same as the pending upstream series "Modify
+  interrupt handling for eUSB2 Phy targets" and the Windows driver tables).
+  No change without a device (DP and DM rising).
+
+Off by default (not needed for the plug-in wake; A/B tests via
+/sys/module/dwc3_qcom/parameters/):
+- runtime_pwr_event: request pwr_event / pwr_event_N and use it as a runtime
+  wakeup source: PWR_EVNT_IRQ_MASK = LPM_OUT_L2 (+ POWERDOWN_OUT_P3 and
+  LPM_OUT_RX_ELECIDLE for ports with a USB3 PHY), as the Windows filter
+  programs 0xf885c/0xf89e0. Never a system wakeup source (GIC only).
+- runtime_alt_irq: set QSCRATCH 0x20 bit 12 (+13 for the second MP port)
+  after clearing 0x24, as the Windows filter does; meaning undocumented.
+- icc_windows_bw: vote the usb-ddr bandwidth Windows votes in D0
+  (0x28000000 B/s SS, 0x3938700 B/s HS, avg = peak) instead of
+  1000/2500 MBps (SS) and 240/700 MBps (HS).
+
+Not for upstream as is (module parameters, compatible-string check).
+---
+ drivers/usb/dwc3/dwc3-qcom.c | 465 +++++++++++++++++++++++++++++++----
+ 1 file changed, 418 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
+index ac68b4218..9c0d70243 100644
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -7,13 +7,16 @@
+ #include <linux/io.h>
+ #include <linux/of.h>
+ #include <linux/clk.h>
++#include <linux/delay.h>
+ #include <linux/irq.h>
+ #include <linux/of_clk.h>
+ #include <linux/module.h>
++#include <linux/moduleparam.h>
+ #include <linux/kernel.h>
+ #include <linux/interconnect.h>
+ #include <linux/platform_device.h>
+ #include <linux/phy/phy.h>
++#include <linux/pm_runtime.h>
+ #include <linux/usb/of.h>
+ #include <linux/reset.h>
+ #include <linux/iopoll.h>
+@@ -27,6 +30,15 @@
+ #define UTMI_OTG_VBUS_VALID			BIT(20)
+ #define SW_SESSVLD_SEL				BIT(28)
+ 
++/*
++ * Written by the Windows xHCI filter of X1E80100 laptops before the controller
++ * leaves D0 (status cleared, bit 12 + port index set) and undone in D0 entry.
++ * Older downstream kernels call these ALT_INTERRUPT_EN / HS_PHY_IRQ_STAT; the
++ * meaning of bits 12/13 is not documented.
++ */
++#define QSCRATCH_ALT_INTERRUPT_EN		0x20
++#define QSCRATCH_HS_PHY_IRQ_STAT		0x24
++
+ #define QSCRATCH_SS_PHY_CTRL			0x30
+ #define LANE0_PWR_PRESENT			BIT(24)
+ 
+@@ -35,8 +47,42 @@
+ #define PIPE3_PHYSTATUS_SW			BIT(3)
+ #define PIPE_UTMI_CLK_DIS			BIT(8)
+ 
++#define PWR_EVNT_POWERDOWN_OUT_P3_MASK		BIT(3)
+ #define PWR_EVNT_LPM_IN_L2_MASK			BIT(4)
+ #define PWR_EVNT_LPM_OUT_L2_MASK		BIT(5)
++#define PWR_EVNT_LPM_OUT_RX_ELECIDLE_MASK	BIT(12)
++
++/* The interrupt enable ("mask", 1 = enabled) register follows each status register */
++#define PWR_EVNT_IRQ_MASK_OFFSET		0x4
++
++/*
++ * Runtime suspend options (read at every runtime suspend, so they can be
++ * changed through /sys/module/dwc3_qcom/parameters/ for A/B tests).
++ */
++static bool runtime_sleep_clk = true;
++module_param(runtime_sleep_clk, bool, 0644);
++MODULE_PARM_DESC(runtime_sleep_clk,
++		 "Keep the controller sleep (suspend) clock running in runtime suspend");
++
++static bool runtime_pwr_event;
++module_param(runtime_pwr_event, bool, 0644);
++MODULE_PARM_DESC(runtime_pwr_event,
++		 "Use the pwr_event interrupt (PHY L2/P3 exit) as runtime wakeup source");
++
++static bool runtime_alt_irq;
++module_param(runtime_alt_irq, bool, 0644);
++MODULE_PARM_DESC(runtime_alt_irq,
++		 "Set QSCRATCH 0x20 bit 12+port in runtime suspend like the Windows driver (experimental)");
++
++static unsigned int wake_hold_ms = 500;
++module_param(wake_hold_ms, uint, 0644);
++MODULE_PARM_DESC(wake_hold_ms,
++		 "Keep the xHCI host running this long after a wakeup interrupt (0 = off)");
++
++static int eusb2_wake = -1;
++module_param(eusb2_wake, int, 0644);
++MODULE_PARM_DESC(eusb2_wake,
++		 "eUSB2 wakeup line selection for connected devices: -1 auto (PHY compatible), 0 off, 1 on");
+ 
+ #define SDM845_QSCRATCH_BASE_OFFSET		0xf8800
+ #define SDM845_QSCRATCH_SIZE			0x400
+@@ -65,7 +111,10 @@ struct dwc3_qcom_port {
+ 	int			dp_hs_phy_irq;
+ 	int			dm_hs_phy_irq;
+ 	int			ss_phy_irq;
++	int			pwr_event_irq;
+ 	enum usb_device_speed	usb2_speed;
++	bool			dp_armed;
++	bool			dm_armed;
+ };
+ 
+ struct dwc3_qcom {
+@@ -85,6 +134,13 @@ struct dwc3_qcom {
+ 	struct icc_path		*icc_path_apps;
+ 
+ 	enum usb_role		current_role;
++
++	bool			has_eusb2_phy;
++	struct clk		*sleep_clk;	/* "sleep" entry of clks, may be NULL */
++	bool			sleep_clk_on;	/* left running across runtime suspend */
++	bool			pwr_event_armed;	/* QSCRATCH enable bits written */
++	bool			pwr_event_irq_on;	/* pwr_event IRQs enabled */
++	bool			alt_irq_armed;
+ };
+ 
+ #define to_dwc3_qcom(d) container_of((d), struct dwc3_qcom, dwc)
+@@ -128,10 +184,44 @@ static void dwc3_qcom_vbus_override_enable(struct dwc3_qcom *qcom, bool enable)
+ 	}
+ }
+ 
++/*
++ * usb-ddr vote. The defaults stay (1000/2500 MBps SS, 240/700 MBps HS); with
++ * icc_windows_bw the values the Windows power plugin of X1E80100 laptops votes
++ * in D0 are used instead (0x28000000 B/s SS, 0x3938700 B/s HS, avg = peak).
++ * Read when the vote is (re)enabled, i.e. at probe and every runtime resume.
++ */
++static bool icc_windows_bw;
++module_param(icc_windows_bw, bool, 0644);
++MODULE_PARM_DESC(icc_windows_bw,
++		 "Vote the DDR bandwidth the Windows driver votes (671/60 MB/s) instead of 1000-2500/240-700 MBps");
++
++static int dwc3_qcom_set_ddr_bw(struct dwc3_qcom *qcom)
++{
++	enum usb_device_speed max_speed = usb_get_maximum_speed(qcom->dwc.dev);
++	bool ss = max_speed >= USB_SPEED_SUPER || max_speed == USB_SPEED_UNKNOWN;
++
++	if (icc_windows_bw) {
++		u32 bw = ss ? Bps_to_icc(0x28000000) : Bps_to_icc(0x3938700);
++
++		return icc_set_bw(qcom->icc_path_ddr, bw, bw);
++	}
++
++	if (ss)
++		return icc_set_bw(qcom->icc_path_ddr,
++				  USB_MEMORY_AVG_SS_BW, USB_MEMORY_PEAK_SS_BW);
++
++	return icc_set_bw(qcom->icc_path_ddr,
++			  USB_MEMORY_AVG_HS_BW, USB_MEMORY_PEAK_HS_BW);
++}
++
+ static int dwc3_qcom_interconnect_enable(struct dwc3_qcom *qcom)
+ {
+ 	int ret;
+ 
++	ret = dwc3_qcom_set_ddr_bw(qcom);
++	if (ret)
++		dev_warn(qcom->dev, "failed to set usb-ddr bandwidth: %d\n", ret);
++
+ 	ret = icc_enable(qcom->icc_path_ddr);
+ 	if (ret)
+ 		return ret;
+@@ -166,7 +256,6 @@ static int dwc3_qcom_interconnect_disable(struct dwc3_qcom *qcom)
+  */
+ static int dwc3_qcom_interconnect_init(struct dwc3_qcom *qcom)
+ {
+-	enum usb_device_speed max_speed;
+ 	struct device *dev = qcom->dev;
+ 	int ret;
+ 
+@@ -183,14 +272,7 @@ static int dwc3_qcom_interconnect_init(struct dwc3_qcom *qcom)
+ 		goto put_path_ddr;
+ 	}
+ 
+-	max_speed = usb_get_maximum_speed(qcom->dwc.dev);
+-	if (max_speed >= USB_SPEED_SUPER || max_speed == USB_SPEED_UNKNOWN) {
+-		ret = icc_set_bw(qcom->icc_path_ddr,
+-				USB_MEMORY_AVG_SS_BW, USB_MEMORY_PEAK_SS_BW);
+-	} else {
+-		ret = icc_set_bw(qcom->icc_path_ddr,
+-				USB_MEMORY_AVG_HS_BW, USB_MEMORY_PEAK_HS_BW);
+-	}
++	ret = dwc3_qcom_set_ddr_bw(qcom);
+ 	if (ret) {
+ 		dev_err(dev, "failed to set bandwidth for usb-ddr path: %d\n", ret);
+ 		goto put_path_apps;
+@@ -272,49 +354,79 @@ static void dwc3_qcom_disable_wakeup_irq(int irq)
+ 	disable_irq_nosync(irq);
+ }
+ 
+-static void dwc3_qcom_disable_port_interrupts(struct dwc3_qcom_port *port)
++static bool dwc3_qcom_eusb2(struct dwc3_qcom *qcom)
+ {
+-	dwc3_qcom_disable_wakeup_irq(port->qusb2_phy_irq);
++	if (eusb2_wake >= 0)
++		return eusb2_wake;
++
++	return qcom->has_eusb2_phy;
++}
++
++/*
++ * Which DP/DM wakeup line to arm for a port. Without a device both lines
++ * (rising edge) to catch a connect. With a device attached, a classic USB2
++ * PHY sees disconnect and remote wakeup as a falling edge on DP (HS/FS) or DM
++ * (LS). Behind an eUSB2 repeater the repeater drives eD- high on a K state of
++ * a HS/FS device and eD+ high for a LS device (eUSB2 spec 5.5.14/5.5.15), so
++ * it is the other line, rising. The Windows driver of X1E80100 laptops arms
++ * the same lines (DP only for LS, DM only for HS/FS, both without a device).
++ */
++static void dwc3_qcom_port_wake_lines(struct dwc3_qcom *qcom,
++				      struct dwc3_qcom_port *port,
++				      int *dp_type, int *dm_type)
++{
++	bool eusb2 = dwc3_qcom_eusb2(qcom);
++
++	*dp_type = 0;
++	*dm_type = 0;
+ 
+ 	if (port->usb2_speed == USB_SPEED_LOW) {
+-		dwc3_qcom_disable_wakeup_irq(port->dm_hs_phy_irq);
++		if (eusb2)
++			*dp_type = IRQ_TYPE_EDGE_RISING;
++		else
++			*dm_type = IRQ_TYPE_EDGE_FALLING;
+ 	} else if ((port->usb2_speed == USB_SPEED_HIGH) ||
+ 			(port->usb2_speed == USB_SPEED_FULL)) {
+-		dwc3_qcom_disable_wakeup_irq(port->dp_hs_phy_irq);
++		if (eusb2)
++			*dm_type = IRQ_TYPE_EDGE_RISING;
++		else
++			*dp_type = IRQ_TYPE_EDGE_FALLING;
+ 	} else {
++		*dp_type = IRQ_TYPE_EDGE_RISING;
++		*dm_type = IRQ_TYPE_EDGE_RISING;
++	}
++}
++
++static void dwc3_qcom_disable_port_interrupts(struct dwc3_qcom *qcom,
++					      struct dwc3_qcom_port *port)
++{
++	dwc3_qcom_disable_wakeup_irq(port->qusb2_phy_irq);
++
++	/* exactly the lines dwc3_qcom_enable_port_interrupts() armed */
++	if (port->dp_armed)
+ 		dwc3_qcom_disable_wakeup_irq(port->dp_hs_phy_irq);
++	if (port->dm_armed)
+ 		dwc3_qcom_disable_wakeup_irq(port->dm_hs_phy_irq);
+-	}
++	port->dp_armed = false;
++	port->dm_armed = false;
+ 
+ 	dwc3_qcom_disable_wakeup_irq(port->ss_phy_irq);
+ }
+ 
+-static void dwc3_qcom_enable_port_interrupts(struct dwc3_qcom_port *port)
++static void dwc3_qcom_enable_port_interrupts(struct dwc3_qcom *qcom,
++					     struct dwc3_qcom_port *port)
+ {
+-	dwc3_qcom_enable_wakeup_irq(port->qusb2_phy_irq, 0);
++	int dp_type, dm_type;
+ 
+-	/*
+-	 * Configure DP/DM line interrupts based on the USB2 device attached to
+-	 * the root hub port. When HS/FS device is connected, configure the DP line
+-	 * as falling edge to detect both disconnect and remote wakeup scenarios. When
+-	 * LS device is connected, configure DM line as falling edge to detect both
+-	 * disconnect and remote wakeup. When no device is connected, configure both
+-	 * DP and DM lines as rising edge to detect HS/HS/LS device connect scenario.
+-	 */
++	dwc3_qcom_enable_wakeup_irq(port->qusb2_phy_irq, 0);
+ 
+-	if (port->usb2_speed == USB_SPEED_LOW) {
+-		dwc3_qcom_enable_wakeup_irq(port->dm_hs_phy_irq,
+-					    IRQ_TYPE_EDGE_FALLING);
+-	} else if ((port->usb2_speed == USB_SPEED_HIGH) ||
+-			(port->usb2_speed == USB_SPEED_FULL)) {
+-		dwc3_qcom_enable_wakeup_irq(port->dp_hs_phy_irq,
+-					    IRQ_TYPE_EDGE_FALLING);
+-	} else {
+-		dwc3_qcom_enable_wakeup_irq(port->dp_hs_phy_irq,
+-					    IRQ_TYPE_EDGE_RISING);
+-		dwc3_qcom_enable_wakeup_irq(port->dm_hs_phy_irq,
+-					    IRQ_TYPE_EDGE_RISING);
+-	}
++	dwc3_qcom_port_wake_lines(qcom, port, &dp_type, &dm_type);
++	if (dp_type)
++		dwc3_qcom_enable_wakeup_irq(port->dp_hs_phy_irq, dp_type);
++	if (dm_type)
++		dwc3_qcom_enable_wakeup_irq(port->dm_hs_phy_irq, dm_type);
++	port->dp_armed = dp_type;
++	port->dm_armed = dm_type;
+ 
+ 	dwc3_qcom_enable_wakeup_irq(port->ss_phy_irq, 0);
+ }
+@@ -324,7 +436,7 @@ static void dwc3_qcom_disable_interrupts(struct dwc3_qcom *qcom)
+ 	int i;
+ 
+ 	for (i = 0; i < qcom->num_ports; i++)
+-		dwc3_qcom_disable_port_interrupts(&qcom->ports[i]);
++		dwc3_qcom_disable_port_interrupts(qcom, &qcom->ports[i]);
+ }
+ 
+ static void dwc3_qcom_enable_interrupts(struct dwc3_qcom *qcom)
+@@ -332,11 +444,140 @@ static void dwc3_qcom_enable_interrupts(struct dwc3_qcom *qcom)
+ 	int i;
+ 
+ 	for (i = 0; i < qcom->num_ports; i++)
+-		dwc3_qcom_enable_port_interrupts(&qcom->ports[i]);
++		dwc3_qcom_enable_port_interrupts(qcom, &qcom->ports[i]);
+ }
+ 
+-static int dwc3_qcom_suspend(struct dwc3_qcom *qcom, bool wakeup)
++/*
++ * pwr_event is a plain GIC interrupt (no PDC), so it can only end a runtime
++ * suspend, not a system suspend; it is never armed as a system wakeup source.
++ */
++static void dwc3_qcom_pwr_event_irqs(struct dwc3_qcom *qcom, bool on)
+ {
++	int i;
++
++	if (qcom->pwr_event_irq_on == on)
++		return;
++
++	for (i = 0; i < qcom->num_ports; i++) {
++		if (!qcom->ports[i].pwr_event_irq)
++			continue;
++		if (on)
++			enable_irq(qcom->ports[i].pwr_event_irq);
++		else
++			disable_irq_nosync(qcom->ports[i].pwr_event_irq);
++	}
++
++	qcom->pwr_event_irq_on = on;
++}
++
++/* Called with the clocks still on, before a runtime suspend */
++static void dwc3_qcom_arm_pwr_event(struct dwc3_qcom *qcom)
++{
++	struct dwc3 *dwc = &qcom->dwc;
++	u32 reg, val;
++	int i;
++
++	for (i = 0; i < qcom->num_ports; i++) {
++		if (!qcom->ports[i].pwr_event_irq)
++			continue;
++
++		reg = pwr_evnt_irq_stat_reg[i];
++		/* write-1-to-clear whatever is pending (the L2 entry bit at least) */
++		writel(readl(qcom->qscratch_base + reg), qcom->qscratch_base + reg);
++
++		val = PWR_EVNT_LPM_OUT_L2_MASK;
++		if (i < dwc->num_usb3_ports && dwc->usb3_generic_phy[i])
++			val |= PWR_EVNT_POWERDOWN_OUT_P3_MASK |
++			       PWR_EVNT_LPM_OUT_RX_ELECIDLE_MASK;
++		writel(val, qcom->qscratch_base + reg + PWR_EVNT_IRQ_MASK_OFFSET);
++		qcom->pwr_event_armed = true;
++	}
++}
++
++/* Called with the clocks on again */
++static void dwc3_qcom_disarm_pwr_event(struct dwc3_qcom *qcom)
++{
++	u32 reg;
++	int i;
++
++	if (!qcom->pwr_event_armed)
++		return;
++
++	for (i = 0; i < qcom->num_ports; i++) {
++		if (!qcom->ports[i].pwr_event_irq)
++			continue;
++		reg = pwr_evnt_irq_stat_reg[i];
++		writel(0, qcom->qscratch_base + reg + PWR_EVNT_IRQ_MASK_OFFSET);
++		writel(readl(qcom->qscratch_base + reg), qcom->qscratch_base + reg);
++	}
++
++	qcom->pwr_event_armed = false;
++}
++
++static u32 dwc3_qcom_alt_irq_bits(struct dwc3_qcom *qcom)
++{
++	return GENMASK(12 + min_t(int, qcom->num_ports, 2) - 1, 12);
++}
++
++static void dwc3_qcom_arm_alt_irq(struct dwc3_qcom *qcom)
++{
++	void __iomem *base = qcom->qscratch_base;
++
++	writel(readl(base + QSCRATCH_HS_PHY_IRQ_STAT), base + QSCRATCH_HS_PHY_IRQ_STAT);
++	dwc3_qcom_setbits(base, QSCRATCH_ALT_INTERRUPT_EN, dwc3_qcom_alt_irq_bits(qcom));
++	qcom->alt_irq_armed = true;
++}
++
++static void dwc3_qcom_disarm_alt_irq(struct dwc3_qcom *qcom)
++{
++	void __iomem *base = qcom->qscratch_base;
++
++	if (!qcom->alt_irq_armed)
++		return;
++
++	writel(readl(base + QSCRATCH_HS_PHY_IRQ_STAT), base + QSCRATCH_HS_PHY_IRQ_STAT);
++	dwc3_qcom_clrbits(base, QSCRATCH_ALT_INTERRUPT_EN, dwc3_qcom_alt_irq_bits(qcom));
++	qcom->alt_irq_armed = false;
++}
++
++static void dwc3_qcom_clks_disable(struct dwc3_qcom *qcom, bool keep_sleep)
++{
++	int i;
++
++	for (i = qcom->num_clocks - 1; i >= 0; i--) {
++		if (keep_sleep && qcom->clks[i].clk == qcom->sleep_clk)
++			continue;
++		clk_disable_unprepare(qcom->clks[i].clk);
++	}
++}
++
++static int dwc3_qcom_clks_enable(struct dwc3_qcom *qcom, bool skip_sleep)
++{
++	int i, ret;
++
++	for (i = 0; i < qcom->num_clocks; i++) {
++		if (skip_sleep && qcom->clks[i].clk == qcom->sleep_clk)
++			continue;
++		ret = clk_prepare_enable(qcom->clks[i].clk);
++		if (ret)
++			goto err;
++	}
++
++	return 0;
++
++err:
++	while (--i >= 0) {
++		if (skip_sleep && qcom->clks[i].clk == qcom->sleep_clk)
++			continue;
++		clk_disable_unprepare(qcom->clks[i].clk);
++	}
++
++	return ret;
++}
++
++static int dwc3_qcom_suspend(struct dwc3_qcom *qcom, bool wakeup, bool runtime)
++{
++	bool runtime_wake;
+ 	u32 val;
+ 	int i, ret;
+ 
+@@ -348,7 +589,25 @@ static int dwc3_qcom_suspend(struct dwc3_qcom *qcom, bool wakeup)
+ 		if (!(val & PWR_EVNT_LPM_IN_L2_MASK))
+ 			dev_err(qcom->dev, "port-%d HS-PHY not in L2\n", i + 1);
+ 	}
+-	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
++
++	/*
++	 * Extra runtime wakeup sources, as the Windows driver of X1E80100
++	 * laptops sets them up before the controller leaves D0. They need the
++	 * clocks, so they are set before the clocks go off.
++	 */
++	runtime_wake = runtime && wakeup && dwc3_qcom_is_host(qcom);
++	if (runtime_wake && runtime_pwr_event)
++		dwc3_qcom_arm_pwr_event(qcom);
++	if (runtime_wake && runtime_alt_irq)
++		dwc3_qcom_arm_alt_irq(qcom);
++
++	/*
++	 * The Windows power plugin keeps the GDSC and the sleep clock on in the
++	 * idle states it uses with wakeup (D1/D2) and switches the sleep clock
++	 * off only for D3 (power collapse).
++	 */
++	qcom->sleep_clk_on = runtime_wake && runtime_sleep_clk && qcom->sleep_clk;
++	dwc3_qcom_clks_disable(qcom, qcom->sleep_clk_on);
+ 
+ 	ret = dwc3_qcom_interconnect_disable(qcom);
+ 	if (ret)
+@@ -364,6 +623,9 @@ static int dwc3_qcom_suspend(struct dwc3_qcom *qcom, bool wakeup)
+ 		dwc3_qcom_enable_interrupts(qcom);
+ 	}
+ 
++	if (qcom->pwr_event_armed)
++		dwc3_qcom_pwr_event_irqs(qcom, true);
++
+ 	qcom->is_suspended = true;
+ 
+ 	return 0;
+@@ -377,17 +639,23 @@ static int dwc3_qcom_resume(struct dwc3_qcom *qcom, bool wakeup)
+ 	if (!qcom->is_suspended)
+ 		return 0;
+ 
++	dwc3_qcom_pwr_event_irqs(qcom, false);
++
+ 	if (dwc3_qcom_is_host(qcom) && wakeup)
+ 		dwc3_qcom_disable_interrupts(qcom);
+ 
+-	ret = clk_bulk_prepare_enable(qcom->num_clocks, qcom->clks);
++	ret = dwc3_qcom_clks_enable(qcom, qcom->sleep_clk_on);
+ 	if (ret < 0)
+ 		return ret;
++	qcom->sleep_clk_on = false;
+ 
+ 	ret = dwc3_qcom_interconnect_enable(qcom);
+ 	if (ret)
+ 		dev_warn(qcom->dev, "failed to enable interconnect: %d\n", ret);
+ 
++	dwc3_qcom_disarm_alt_irq(qcom);
++	dwc3_qcom_disarm_pwr_event(qcom);
++
+ 	/* Clear existing events from PHY related to L2 in/out */
+ 	for (i = 0; i < qcom->num_ports; i++) {
+ 		dwc3_qcom_setbits(qcom->qscratch_base,
+@@ -404,21 +672,64 @@ static irqreturn_t qcom_dwc3_resume_irq(int irq, void *data)
+ {
+ 	struct dwc3_qcom *qcom = data;
+ 	struct dwc3 *dwc = &qcom->dwc;
++	unsigned int hold = min(READ_ONCE(wake_hold_ms), 5000U);
++	struct device *xhci_dev;
+ 
+ 	/* If pm_suspended then let pm_resume take care of resuming h/w */
+ 	if (qcom->pm_suspended)
+ 		return IRQ_HANDLED;
+ 
++	if (!dwc3_qcom_is_host(qcom))
++		return IRQ_HANDLED;
++
++	dev_dbg(qcom->dev, "wakeup interrupt %d\n", irq);
++
+ 	/*
+ 	 * This is safe as role switching is done from a freezable workqueue
+ 	 * and the wakeup interrupts are disabled as part of resume.
+ 	 */
+-	if (dwc3_qcom_is_host(qcom))
+-		pm_runtime_resume(&dwc->xhci->dev);
++	xhci_dev = &dwc->xhci->dev;
++	if (!hold) {
++		pm_runtime_resume(xhci_dev);
++		return IRQ_HANDLED;
++	}
++
++	/*
++	 * xhci_resume() resumes the root hubs only if a port change is already
++	 * latched, and the xHCI device (autosuspend delay 0) suspends again at
++	 * once otherwise. A device plugged into a suspended controller is not
++	 * latched yet when the controller comes back, so keep the host running
++	 * for a moment: a connect seen in that time raises a port status change
++	 * event, which resumes the root hub.
++	 */
++	if (pm_runtime_resume_and_get(xhci_dev) < 0)
++		return IRQ_HANDLED;
++	msleep(hold);
++	pm_runtime_put(xhci_dev);
+ 
+ 	return IRQ_HANDLED;
+ }
+ 
++static void dwc3_qcom_sync_irqs(struct dwc3_qcom *qcom)
++{
++	struct dwc3_qcom_port *port;
++	int i;
++
++	for (i = 0; i < qcom->num_ports; i++) {
++		port = &qcom->ports[i];
++		if (port->qusb2_phy_irq)
++			synchronize_irq(port->qusb2_phy_irq);
++		if (port->dp_hs_phy_irq)
++			synchronize_irq(port->dp_hs_phy_irq);
++		if (port->dm_hs_phy_irq)
++			synchronize_irq(port->dm_hs_phy_irq);
++		if (port->ss_phy_irq)
++			synchronize_irq(port->ss_phy_irq);
++		if (port->pwr_event_irq)
++			synchronize_irq(port->pwr_event_irq);
++	}
++}
++
+ static void dwc3_qcom_select_utmi_clk(struct dwc3_qcom *qcom)
+ {
+ 	/* Configure dwc3 to use UTMI clock as PIPE clock not present */
+@@ -505,6 +816,22 @@ static int dwc3_qcom_setup_port_irq(struct dwc3_qcom *qcom,
+ 		qcom->ports[port_index].ss_phy_irq = irq;
+ 	}
+ 
++	/* Only enabled in runtime suspend when runtime_pwr_event is set */
++	if (is_multiport)
++		irq_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "pwr_event_%d", port_index + 1);
++	else
++		irq_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "pwr_event");
++	if (!irq_name)
++		return -ENOMEM;
++
++	irq = platform_get_irq_byname_optional(pdev, irq_name);
++	if (irq > 0) {
++		ret = dwc3_qcom_request_irq(qcom, irq, irq_name);
++		if (ret)
++			return ret;
++		qcom->ports[port_index].pwr_event_irq = irq;
++	}
++
+ 	if (is_multiport)
+ 		return 0;
+ 
+@@ -519,6 +846,29 @@ static int dwc3_qcom_setup_port_irq(struct dwc3_qcom *qcom,
+ 	return 0;
+ }
+ 
++/* The USB2 PHY of the first port sits behind an eUSB2 repeater */
++static bool dwc3_qcom_has_eusb2_phy(struct device *dev)
++{
++	struct device_node *np;
++	struct property *prop;
++	const char *compat;
++	bool ret = false;
++
++	np = of_parse_phandle(dev->of_node, "phys", 0);
++	if (!np)
++		return false;
++
++	of_property_for_each_string(np, "compatible", prop, compat) {
++		if (strstr(compat, "eusb2")) {
++			ret = true;
++			break;
++		}
++	}
++	of_node_put(np);
++
++	return ret;
++}
++
+ static int dwc3_qcom_find_num_ports(struct platform_device *pdev)
+ {
+ 	char irq_name[14];
+@@ -614,7 +964,7 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 	struct dwc3_qcom	*qcom;
+ 	struct resource		res;
+ 	struct resource		*r;
+-	int			ret;
++	int			ret, i;
+ 	bool			ignore_pipe_clk;
+ 	bool			wakeup_source;
+ 
+@@ -635,6 +985,13 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, ret, "failed to get clocks\n");
+ 	qcom->num_clocks = ret;
+ 
++	for (i = 0; i < qcom->num_clocks; i++) {
++		if (qcom->clks[i].id && !strcmp(qcom->clks[i].id, "sleep"))
++			qcom->sleep_clk = qcom->clks[i].clk;
++	}
++
++	qcom->has_eusb2_phy = dwc3_qcom_has_eusb2_phy(dev);
++
+ 	ret = reset_control_assert(qcom->resets);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to assert resets, err=%d\n", ret);
+@@ -738,6 +1095,9 @@ static void dwc3_qcom_remove(struct platform_device *pdev)
+ 	if (pm_runtime_resume_and_get(qcom->dev) < 0)
+ 		return;
+ 
++	/* a wakeup handler may still hold the xHCI device (wake_hold_ms) */
++	dwc3_qcom_sync_irqs(qcom);
++
+ 	dwc3_core_remove(&qcom->dwc);
+ 	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
+ 	dwc3_qcom_interconnect_exit(qcom);
+@@ -756,10 +1116,21 @@ static int dwc3_qcom_pm_suspend(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = dwc3_qcom_suspend(qcom, wakeup);
++	ret = dwc3_qcom_suspend(qcom, wakeup, false);
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Already runtime suspended: leave system suspend exactly as without
++	 * the runtime-only wakeup sources (sleep clock off, pwr_event masked at
++	 * the GIC; its QSCRATCH bits are cleared on resume).
++	 */
++	dwc3_qcom_pwr_event_irqs(qcom, false);
++	if (qcom->sleep_clk_on) {
++		clk_disable_unprepare(qcom->sleep_clk);
++		qcom->sleep_clk_on = false;
++	}
++
+ 	qcom->pm_suspended = true;
+ 
+ 	return 0;
+@@ -809,7 +1180,7 @@ static int dwc3_qcom_runtime_suspend(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	return dwc3_qcom_suspend(qcom, true);
++	return dwc3_qcom_suspend(qcom, true, true);
+ }
+ 
+ static int dwc3_qcom_runtime_resume(struct device *dev)
+-- 
+2.43.0
+

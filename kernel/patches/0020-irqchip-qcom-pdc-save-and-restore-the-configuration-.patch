@@ -1,0 +1,134 @@
+From 322c91f57d11ae6ad6d5542912dd44172b32addb Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:50:52 +0000
+Subject: [PATCH] irqchip/qcom-pdc: save and restore the configuration across
+ hibernation
+
+The PDC is reset with the SoC when the machine powers off for hibernation, and the kernel that loads the image
+configures only the interrupts its own drivers use; the restored kernel's view (type, enable, GPIO mask) then no
+longer matches the hardware. During a hibernation (PM notifier) save every pin's IRQ_CFG and the enable banks in a
+syscore suspend callback, right before the snapshot, and write them back in syscore resume, which runs in the
+restored kernel right after the jump (with the X1E enable-bank remapping). Suspend is left alone.
+
+Not upstream.
+---
+ drivers/irqchip/qcom-pdc.c | 82 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 82 insertions(+)
+
+diff --git a/drivers/irqchip/qcom-pdc.c b/drivers/irqchip/qcom-pdc.c
+index ce6d80c7f..fa364a435 100644
+--- a/drivers/irqchip/qcom-pdc.c
++++ b/drivers/irqchip/qcom-pdc.c
+@@ -19,6 +19,8 @@
+ #include <linux/soc/qcom/irq.h>
+ #include <linux/spinlock.h>
+ #include <linux/slab.h>
++#include <linux/suspend.h>
++#include <linux/syscore_ops.h>
+ #include <linux/types.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
+ 
+@@ -652,6 +654,79 @@ static int pdc_setup_pin_mapping(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * Hibernation: the PDC is reset with the SoC, and the kernel that loads the image configures only the interrupts its
++ * own drivers use (a wrong type or a stale enable then fires without end, or never). Save every pin's IRQ_CFG and the
++ * enable banks right before the snapshot and write them back in the restored kernel: syscore_resume() runs right
++ * after the jump, before any device is restored. Only during a hibernation (PM notifier); a suspend is left alone.
++ */
++static bool pdc_hibernating;
++static u32 pdc_nr_pins;
++static u32 pdc_saved_cfg[PDC_MAX_IRQS];
++static u32 pdc_saved_en[PDC_MAX_IRQS / 32];
++
++static int pdc_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
++{
++	if (action == PM_HIBERNATION_PREPARE)
++		pdc_hibernating = true;
++	else if (action == PM_POST_HIBERNATION)
++		pdc_hibernating = false;
++
++	return NOTIFY_OK;
++}
++
++static struct notifier_block pdc_pm_nb = {
++	.notifier_call = pdc_pm_notify,
++};
++
++static int pdc_syscore_suspend(void *data)
++{
++	u32 i;
++
++	if (!pdc_hibernating)
++		return 0;
++
++	for (i = 0; i < pdc_nr_pins; i++)
++		pdc_saved_cfg[i] = pdc_reg_read(pdc->regs->irq_cfg_reg, i);
++	if (pdc->enable_intr == pdc_enable_intr_bank)
++		for (i = 0; i < DIV_ROUND_UP(pdc_nr_pins, 32); i++)
++			pdc_saved_en[i] = pdc_reg_read(pdc->regs->irq_en_reg, i);
++
++	return 0;
++}
++
++static void pdc_syscore_resume(void *data)
++{
++	u32 sts = 0, i;
++
++	if (!pdc_hibernating)
++		return;
++
++	/* the GPIO status bit exists from PDC 3.0 on; write it cleared */
++	if (pdc->version >= PDC_VERSION_3_0)
++		sts = BIT(pdc->cfg_fields->gpio_irq_sts);
++
++	for (i = 0; i < pdc_nr_pins; i++)
++		pdc_reg_write(pdc->regs->irq_cfg_reg, i, pdc_saved_cfg[i] & ~sts);
++	if (pdc->enable_intr == pdc_enable_intr_bank) {
++		for (i = 0; i < DIV_ROUND_UP(pdc_nr_pins, 32); i++) {
++			if (pdc->x1e_quirk)
++				pdc_x1e_irq_enable_write(i, pdc_saved_en[i]);
++			else
++				pdc_reg_write(pdc->regs->irq_en_reg, i, pdc_saved_en[i]);
++		}
++	}
++}
++
++static const struct syscore_ops pdc_syscore_ops = {
++	.suspend = pdc_syscore_suspend,
++	.resume = pdc_syscore_resume,
++};
++
++static struct syscore pdc_syscore = {
++	.ops = &pdc_syscore_ops,
++};
++
+ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *parent)
+ {
+ 	struct irq_domain *parent_domain, *pdc_domain;
+@@ -660,6 +735,7 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
+ 	resource_size_t res_size;
+ 	struct resource res;
+ 	u32 irq_param;
++	u32 i;
+ 	int ret;
+ 
+ 	/* compat with old sm8150 DT which had very small region for PDC */
+@@ -754,6 +830,12 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
+ 
+ 	irq_domain_update_bus_token(pdc_domain, DOMAIN_BUS_WAKEUP);
+ 
++	for (i = 0; i < pdc->region_cnt; i++)
++		pdc_nr_pins = max(pdc_nr_pins, pdc->region[i].pin_base + pdc->region[i].cnt);
++	pdc_nr_pins = min_t(u32, pdc_nr_pins, PDC_MAX_IRQS);
++	register_syscore(&pdc_syscore);
++	register_pm_notifier(&pdc_pm_nb);
++
+ 	return 0;
+ }
+ 
+-- 
+2.43.0
+

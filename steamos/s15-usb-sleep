@@ -1,10 +1,21 @@
 #!/bin/bash
-# systemd-sleep hook: the USB controllers stay powered while the laptop is awake, because on this laptop a
-# runtime-suspended controller does not wake up when a device is plugged in (hot-plugging would not work at all).
-# Before a suspend they switch to runtime PM, the state the standby measurements in docs/power.md were made in,
-# and back after resume. Install as /usr/lib/systemd/system-sleep/s15-usb-sleep.
-case "$1" in pre) v=auto ;; post) v=on ;; *) exit 0 ;; esac
-for f in /sys/bus/platform/drivers/dwc3-qcom/*/power/control /sys/bus/platform/drivers/xhci-hcd/*/power/control; do
-  [ -w "$f" ] && echo "$v" > "$f"
-done
+# systemd-sleep hook: before a suspend all four USB controllers switch to runtime PM (the state the standby
+# measurements in docs/power.md were made in); after resume the awake policy of s15-usb-pm applies again (USB-C
+# controllers runtime-suspended while their Type-C port has no partner, the others on).
+# Not for hibernation: s15-hibernate takes the controllers down and up itself.
+# Install as /usr/lib/systemd/system-sleep/s15-usb-sleep.
+[ "${2:-suspend}" = suspend ] || exit 0
+case "$1" in
+  pre)
+    for f in /sys/bus/platform/drivers/dwc3-qcom/*/power/control /sys/bus/platform/drivers/xhci-hcd/*/power/control; do
+      [ -w "$f" ] && echo auto > "$f"
+    done ;;
+  post)
+    if [ -x /usr/local/sbin/s15-usb-pm ]; then /usr/local/sbin/s15-usb-pm
+    else
+      for f in /sys/bus/platform/drivers/dwc3-qcom/*/power/control /sys/bus/platform/drivers/xhci-hcd/*/power/control; do
+        [ -w "$f" ] && echo on > "$f"
+      done
+    fi ;;
+esac
 exit 0

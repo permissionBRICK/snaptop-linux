@@ -1,0 +1,68 @@
+From 416901cd9ebdcf661a1c913befa0486dfb9ab412 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:33:04 +0000
+Subject: [PATCH 17/17] platform: arm64: qcom-hamoa-ec: re-enable SCI events
+ and fans on restore from hibernation
+
+The EC is reset together with the SoC when the machine powers off for hibernation. The restored driver only sent
+"modern standby exit" and restarted the Tj feed; the SCI events enabled at probe stayed off and the EC interrupt
+kept firing with event 0 ("Unknown EC event: 0", hundreds per second on the ASUS Vivobook S 15). Add a .restore
+callback that enables the SCI events and restores the fan state again before the normal resume.
+
+Not upstream.
+---
+ drivers/platform/arm64/qcom-hamoa-ec.c | 31 +++++++++++++++++++++++---
+ 1 file changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/platform/arm64/qcom-hamoa-ec.c b/drivers/platform/arm64/qcom-hamoa-ec.c
+index d9dfc46b9..8a8ccc674 100644
+--- a/drivers/platform/arm64/qcom-hamoa-ec.c
++++ b/drivers/platform/arm64/qcom-hamoa-ec.c
+@@ -1334,6 +1334,26 @@ static int qcom_ec_resume(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * Restore from hibernation: the EC was reset with the SoC, so the SCI events enabled at probe are off again (the
++ * interrupt then kept firing with event 0) and the fan settings are lost. Redo both, then resume as usual.
++ */
++static int qcom_ec_restore(struct device *dev)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct qcom_ec *ec = i2c_get_clientdata(client);
++	int ret;
++
++	ret = qcom_ec_sci_evt_control(dev, true);
++	if (ret < 0)
++		dev_warn(dev, "Failed to enable SCI events after restore: %d\n", ret);
++
++	if (qcom_ec_owns_fans(ec))
++		qcom_ec_restore_fan_state(ec);
++
++	return qcom_ec_resume(dev);
++}
++
+ static int qcom_ec_suspend(struct device *dev)
+ {
+ 	struct i2c_client *client = to_i2c_client(dev);
+@@ -1704,9 +1724,14 @@ static const struct i2c_device_id qcom_ec_i2c_id_table[] = {
+ };
+ MODULE_DEVICE_TABLE(i2c, qcom_ec_i2c_id_table);
+ 
+-static DEFINE_SIMPLE_DEV_PM_OPS(qcom_ec_pm_ops,
+-		qcom_ec_suspend,
+-		qcom_ec_resume);
++static const struct dev_pm_ops qcom_ec_pm_ops = {
++	.suspend = pm_sleep_ptr(qcom_ec_suspend),
++	.resume = pm_sleep_ptr(qcom_ec_resume),
++	.freeze = pm_sleep_ptr(qcom_ec_suspend),
++	.thaw = pm_sleep_ptr(qcom_ec_resume),
++	.poweroff = pm_sleep_ptr(qcom_ec_suspend),
++	.restore = pm_sleep_ptr(qcom_ec_restore),
++};
+ 
+ static struct i2c_driver qcom_ec_i2c_driver = {
+ 	.driver = {
+-- 
+2.43.0
+

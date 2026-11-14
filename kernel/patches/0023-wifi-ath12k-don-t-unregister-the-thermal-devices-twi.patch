@@ -1,0 +1,53 @@
+From 78a67445d97e444c40f8496617515ef002dcaea3 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:41:06 +0000
+Subject: [PATCH 23/24] wifi: ath12k: don't unregister the thermal devices
+ twice after a failed recovery
+
+ath12k_core_reconfigure_on_crash() unregisters the cooling and hwmon devices before it restarts the firmware;
+ath12k_core_pdev_create() registers them again once the firmware is ready. When that restart fails, the removal of
+the device unregisters them a second time and hwmon_device_unregister(NULL) oopses:
+
+  ath12k_wifi7_pci 0004:01:00.0: failed to receive wmi unified ready event: -110
+  ath12k_wifi7_pci 0004:01:00.0: failed to reconfigure driver on crash recovery
+  ...
+  Unable to handle kernel NULL pointer dereference at virtual address 0000000000000050
+  pc : hwmon_device_unregister+0x34/0xe0
+   ath12k_thermal_cleanup_radio+0x68/0x100 [ath12k]
+   ath12k_thermal_unregister+0x3c/0xdb8 [ath12k]
+   ath12k_core_hw_group_stop+0x98/0x140 [ath12k]
+   ath12k_core_hw_group_cleanup+0x50/0x110 [ath12k]
+   ath12k_pci_remove+0x70/0x148 [ath12k]
+   ...
+   ath12k_wifi7_exit+0x28/0x40 [ath12k_wifi7]
+
+(ASUS Vivobook S 15: the firmware did not come back during a restore from hibernation, a later
+"modprobe -r ath12k_wifi7" to reset Wi-Fi crashed.) The cooling device and the hwmon device are registered and
+unregistered together; skip a radio whose cooling device is not registered.
+
+Not upstream.
+---
+ drivers/net/wireless/ath/ath12k/thermal.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/thermal.c b/drivers/net/wireless/ath/ath12k/thermal.c
+index 97fc49c40..4ce7771ac 100644
+--- a/drivers/net/wireless/ath/ath12k/thermal.c
++++ b/drivers/net/wireless/ath/ath12k/thermal.c
+@@ -257,7 +257,12 @@ static void ath12k_thermal_cleanup_radio(struct ath12k_base *ab, int i)
+ 	struct ath12k *ar;
+ 
+ 	ar = ab->pdevs[i].ar;
+-	if (!ar)
++	/*
++	 * Nothing registered: ath12k_core_reconfigure_on_crash() unregisters before it restarts the
++	 * firmware and registers again only once the firmware is ready. If that restart fails, the
++	 * removal of the device comes here a second time.
++	 */
++	if (!ar || !ar->thermal.cdev)
+ 		return;
+ 
+ 	hwmon_device_unregister(ar->thermal.hwmon_dev);
+-- 
+2.43.0
+

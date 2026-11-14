@@ -1,0 +1,221 @@
+From 83ad676b70928be1c40bbb584966d283c399828e Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:40:57 +0000
+Subject: [PATCH 22/24] drm/msm/a6xx: start the GMU from its reset state after
+ a power-off in hibernation
+
+The first version of the restore hook only programmed the RSC/PDC sequences and the zap shader again. The GPU
+still failed after a restore from hibernation (ASUS Vivobook S 15, X1E80100, Adreno X1-85): "Unable to power on the
+GPU RSC", then "GMU firmware initialization timed out" with GMU context faults at random addresses on the GPU SMMU,
+hangchecks and "cx gdsc didn't collapse".
+
+The GPU's CX domain keeps its registers across GPU power collapses (RETAIN_FF), so the driver tracks some hardware
+state only in software. After a power-off that state is back at reset, as at a cold boot:
+- GMU_STATUS_PDC_SLEEP was still set from the GMU stop before the snapshot, so a6xx_rpmh_start() asked an RSC
+  that came out of reset awake to wake up and waited for an acknowledgement that never came.
+- a6xx_gmu_fw_start() turns TCM retention on before it loads the firmware. After the failed first start the next
+  resume read retention as on, took a warm boot without loading the firmware and started the GMU on whatever was
+  in its TCMs: the context faults (SID 5 is the GMU) and the init timeouts.
+- the fuse setup done through SCM (GMU_STATUS_SECURE_INIT, A750/A8xx) and AOSS's ACD state are gone.
+
+On the first GMU resume after a restore, check whether a GMU ran since the last power-on (TCM retention reads back
+as 0 after power-on). If none did, reset the software state to the cold-boot state: no RSC wake-up handshake,
+SCM fuse setup and ACD message again, RSC/PDC sequences, zap shader. If one did (the kernel that loaded the image
+used the GPU and stopped it before the hand-over, or a test_resume without a power cycle), the RSC sleeps and the
+zap shader is loaded: keep the state. Either way load the GMU firmware (cold boot) until a GMU start succeeds,
+and after any failed cold boot, so a failed start never leads to a warm boot on empty TCMs.
+
+Suspend to RAM and runtime PM are unchanged as long as GMU starts succeed.
+
+Not upstream.
+---
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c | 77 +++++++++++++++++++++++++--
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.h | 10 +++-
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c | 15 ++++--
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.h |  1 +
+ 4 files changed, 92 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index ac79db261..d77192a4d 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -1314,6 +1314,64 @@ static int a6xx_gmu_gxpd_put(struct a6xx_gmu *gmu)
+ 	return 0;
+ }
+ 
++/*
++ * Whether a GMU was started since the GPU was powered on: a6xx_gmu_fw_start() turns TCM retention on
++ * (the register reads back as 0 after power-on, see the cold/warm boot check in a6xx_gmu_resume()).
++ */
++static bool a6xx_gmu_started_since_power_on(struct a6xx_gpu *a6xx_gpu)
++{
++	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
++
++	if (adreno_is_a7xx(adreno_gpu) || adreno_is_a8xx(adreno_gpu))
++		return a6xx_cx_misc_read(a6xx_gpu, REG_A7XX_CX_MISC_TCM_RET_CNTL) == 1;
++
++	return gmu_read(&a6xx_gpu->gmu, REG_A6XX_GMU_GENERAL_7) == 1;
++}
++
++/*
++ * First GMU resume after a restore from hibernation. The GPU's CX domain keeps its registers across
++ * GPU power collapses (RETAIN_FF), so the driver sets several things up only once or keeps track of
++ * them in software. After a power-off they are back in their reset state, unless the kernel that
++ * loaded the image started the GPU itself (it then also stopped it before the hand-over, like we do
++ * before a hibernation, and loaded the zap shader). That is the case without a power cycle too
++ * (hibernation test_resume), so ask the hardware instead of assuming a power cycle.
++ */
++static void a6xx_gmu_power_lost(struct a6xx_gpu *a6xx_gpu)
++{
++	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
++
++	/* The TCMs hold firmware from another kernel or nothing at all */
++	gmu->force_cold_boot = true;
++
++	if (a6xx_gmu_started_since_power_on(a6xx_gpu)) {
++		dev_info(gmu->dev, "restore: the GMU ran since the last power-on, keeping its state\n");
++		return;
++	}
++
++	dev_info(gmu->dev, "restore: the GPU was powered off, setting the GMU up from scratch\n");
++
++	/*
++	 * The RSC came out of reset awake, as at a cold boot: a6xx_rpmh_start() must not ask it to
++	 * wake up (it waits for an acknowledgement that never comes, "Unable to power on the GPU RSC").
++	 */
++	clear_bit(GMU_STATUS_PDC_SLEEP, &gmu->status);
++	clear_bit(GMU_STATUS_FW_START, &gmu->status);
++
++	/* The fuse setup done through SCM is gone */
++	clear_bit(GMU_STATUS_SECURE_INIT, &gmu->status);
++
++	/* RSC/PDC sequences, programmed at probe */
++	a6xx_gmu_rpmh_init(gmu);
++
++	/* AOSS comes out of reset with ACD disabled, a6xx_gmu_acd_probe() told it once */
++	if (gmu->acd_table.enable_by_level && !IS_ERR_OR_NULL(gmu->qmp) &&
++	    qmp_send(gmu->qmp, "{class: gpu, res: acd, val: %d}", 1))
++		DRM_DEV_ERROR(gmu->dev, "Failed to send ACD state to AOSS\n");
++
++	/* The secure world lost the zap shader */
++	a6xx_zap_shader_lost();
++}
++
+ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = &a6xx_gpu->base;
+@@ -1339,10 +1397,9 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 	if (ret)
+ 		goto rpm_put;
+ 
+-	/* After hibernation the RSC/PDC sequences set up at probe are gone */
+-	if (gmu->rpmh_lost) {
+-		a6xx_gmu_rpmh_init(gmu);
+-		gmu->rpmh_lost = false;
++	if (gmu->power_lost) {
++		a6xx_gmu_power_lost(a6xx_gpu);
++		gmu->power_lost = false;
+ 	}
+ 
+ 	ret = a6xx_gmu_secure_init(a6xx_gpu);
+@@ -1361,7 +1418,9 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 	enable_irq(gmu->gmu_irq);
+ 
+ 	/* Check to see if we are doing a cold or warm boot */
+-	if (adreno_is_a7xx(adreno_gpu) || adreno_is_a8xx(adreno_gpu)) {
++	if (gmu->force_cold_boot) {
++		status = GMU_COLD_BOOT;
++	} else if (adreno_is_a7xx(adreno_gpu) || adreno_is_a8xx(adreno_gpu)) {
+ 		status = a6xx_cx_misc_read(a6xx_gpu, REG_A7XX_CX_MISC_TCM_RET_CNTL) == 1 ?
+ 			GMU_WARM_BOOT : GMU_COLD_BOOT;
+ 	} else if (gmu->legacy) {
+@@ -1383,6 +1442,8 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 	if (ret)
+ 		goto disable_irq;
+ 
++	gmu->force_cold_boot = false;
++
+ 	/*
+ 	 * Turn on the GMU firmware fault interrupt after we know the boot
+ 	 * sequence is successful
+@@ -1397,6 +1458,12 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
+ 	return 0;
+ 
+ disable_irq:
++	/*
++	 * a6xx_gmu_fw_start() turned TCM retention on before it loaded the firmware: after a failed
++	 * cold boot the next resume would take a warm boot and start the GMU on whatever is in its TCMs.
++	 */
++	if (status == GMU_COLD_BOOT)
++		gmu->force_cold_boot = true;
+ 	disable_irq(gmu->gmu_irq);
+ 	a6xx_rpmh_stop(gmu);
+ disable_clk:
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+index 0556930d6..84113ee30 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.h
+@@ -114,8 +114,14 @@ struct a6xx_gmu {
+ 	struct a6xx_hfi_queue queues[HFI_MAX_QUEUES];
+ 
+ 	bool initialized;
+-	/* the RSC/PDC sequences must be programmed again (after hibernation) */
+-	bool rpmh_lost;
++	/*
++	 * Restore from hibernation: the GPU may have been powered off since the last GMU stop, so state
++	 * that is set up once and kept across GPU power collapses may be gone. Checked at the next
++	 * a6xx_gmu_resume().
++	 */
++	bool power_lost;
++	/* Load the GMU firmware even if TCM retention is on: the TCMs may not hold it */
++	bool force_cold_boot;
+ 	/* PDC mappings kept from the first a6xx_gmu_rpmh_init() (devm: requested until unbind) */
+ 	void __iomem *pdc_mmio;
+ 	void __iomem *pdc_seq_mmio;
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 9733c4e77..ec7562112 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1141,16 +1141,23 @@ int a6xx_zap_shader_init(struct msm_gpu *gpu)
+ 	return ret;
+ }
+ 
++/* The secure world was reset (power-off): load the zap shader again at the next hw_init */
++void a6xx_zap_shader_lost(void)
++{
++	a6xx_zap_loaded = false;
++}
++
+ /*
+- * Restore from hibernation: the secure world lost the zap shader and the GMU's RSC/PDC sequences are gone; both are
+- * otherwise only set up once.
++ * Restore from hibernation: the GPU may have been powered off. The next GMU resume finds out and
++ * sets up again what is otherwise only set up once (a6xx_gmu_power_lost()).
+  */
+ static void a6xx_power_lost(struct adreno_gpu *adreno_gpu)
+ {
+ 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+ 
+-	a6xx_zap_loaded = false;
+-	a6xx_gpu->gmu.rpmh_lost = true;
++	mutex_lock(&a6xx_gpu->gmu.lock);
++	a6xx_gpu->gmu.power_lost = true;
++	mutex_unlock(&a6xx_gpu->gmu.lock);
+ }
+ 
+ #define A6XX_INT_MASK (A6XX_RBBM_INT_0_MASK_CP_AHB_ERROR | \
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+index b50c57f42..5fad73268 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.h
+@@ -329,6 +329,7 @@ int a6xx_fenced_write(struct a6xx_gpu *gpu, u32 offset, u64 value, u32 mask, boo
+ void a6xx_flush(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+ void a6xx_flush_yield(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+ int a6xx_zap_shader_init(struct msm_gpu *gpu);
++void a6xx_zap_shader_lost(void);
+ 
+ void a8xx_bus_clear_pending_transactions(struct adreno_gpu *adreno_gpu, bool gx_off);
+ int a8xx_fault_handler(void *arg, unsigned long iova, int flags, void *data);
+-- 
+2.43.0
+

@@ -51,6 +51,16 @@ case "$1" in
         [ $busy = 0 ] && break
         sleep 0.2; i=$((i + 1))
     done
+    # The firmware's scanout of its logo is still running in this kernel (kernel patch 0015 keeps its memory clock),
+    # and a display engine that is still reading memory at the hand-over crashed the restore. Let the display driver
+    # take the display over here (it needs the ADSP), so the kernel quiesces it with every other driver before the
+    # jump. msm is in the initramfs but blacklisted (s15-display); an explicit modprobe loads it anyway.
+    modprobe msm 2>/dev/null
+    i=0
+    while [ "$(cat /sys/class/graphics/fb0/name 2>/dev/null)" != msmdrmfb ] && [ $i -lt 100 ]; do
+        sleep 0.1; i=$((i + 1))
+    done
+    log "display: $(cat /sys/class/graphics/fb0/name 2>/dev/null) after $((i / 10)).$((i % 10)) s"
     : > $M
     for n in cdsp adsp; do   # the CDSP first: it never answers the other DSP's state notifications (5 s timeouts)
         for r in $(dsps); do

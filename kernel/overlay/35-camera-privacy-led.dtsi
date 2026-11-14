@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Camera privacy LED of the ASUS Vivobook S 15 (S5507QA, X1E80100), overlay
+ * fragment. The LED next to the webcam lights while the RGB or the IR
+ * camera streams, as on Windows.
+ *
+ * REQUIRES 20-camera-rgb.dtsi and 30-camera-ir.dtsi (sensor nodes, labels
+ * cci0_i2c0, cci1_i2c1 and ir_flash). Must sort after them.
+ *
+ * Origin of the values:
+ *  - DSDT of BIOS 318, \_SB.CAMP (QCOM0C32, camera platform device), _CRS:
+ *    GpioIo index 0 = \_SB.GIO0 pin 0x63 (Shared, PullUp),
+ *    GpioIo index 1 = \_SB.GIO0 pin 0x6E (Exclusive, PullNone).
+ *    GIO0 is the TLMM (QCOM0C0C at 0x0F100000), so index 1 is gpio110. No
+ *    other device in the DSDT uses pin 110.
+ *  - AeoB CAMP_PRLD_QRD (registry value PrldBinaryPath of the Windows
+ *    camera platform driver), entry 0x0506. The driver decodes bits 0-7 as
+ *    the sensor mask (bit 0 rear, bit 1 front, bit 2 aux/IR), bits 8-9 as
+ *    the LED type (1 = GPIO), bits 10-12 as the GpioIo index and bit 13 as
+ *    "active low". So: GPIO type, index 1 (gpio110), active high, for the
+ *    front RGB and the IR camera. The driver reference-counts the LED over
+ *    the sensors.
+ *  - The same gpio110 drives the camera indicator of the Zenbook A14 and
+ *    other X1E laptops in mainline (x1-asus-zenbook-a14.dtsi), whose AeoB
+ *    has the identical PRLD entry.
+ *
+ * Both sensors share one LED; the kernel keeps it lit while either streams
+ * only with the v4l2-subdev patch "keep a shared privacy LED lit while any
+ * of its sensors streams". Without that patch, the IR camera stopping would
+ * switch the LED off while the RGB camera still streams.
+ *
+ * The leds/led-names properties replace those of 30-camera-ir.dtsi on the
+ * IR sensor. Entry 0 must stay the IR illuminator: the hm1092 driver takes
+ * "leds" entry 0 as its flash LED. The v4l2 core finds the privacy LED by
+ * its name.
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+
+&{/} {
+	leds {
+		compatible = "gpio-leds";
+
+		pinctrl-0 = <&cam_privacy_led_default>;
+		pinctrl-names = "default";
+
+		privacy_led: privacy-led {
+			function = LED_FUNCTION_INDICATOR;
+			color = <LED_COLOR_ID_WHITE>;
+			gpios = <&tlmm 110 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+		};
+	};
+};
+
+&tlmm {
+	cam_privacy_led_default: cam-privacy-led-default-state {
+		pins = "gpio110";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+/* RGB camera OV02C10 */
+&cci1_i2c1 {
+	camera@36 {
+		leds = <&privacy_led>;
+		led-names = "privacy";
+	};
+};
+
+/* IR camera HM1092 */
+&cci0_i2c0 {
+	camera@24 {
+#ifndef VIVOBOOK_IR_NO_LED
+		leds = <&ir_flash>, <&privacy_led>;
+		led-names = "ir", "privacy";
+#else
+		/* the hm1092 driver logs that entry 0 is no flash LED; harmless */
+		leds = <&privacy_led>;
+		led-names = "privacy";
+#endif
+	};
+};

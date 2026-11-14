@@ -1,0 +1,146 @@
+From 9e4b12cc7b2e15d41e14ba290b26f6fe3d1f3014 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:41:46 +0000
+Subject: [PATCH 24/24] iommu/arm-smmu-qcom: write the Adreno PRR setup again
+ after a reset
+
+msm sets the PRR page address (ARM_SMMU_GFX_PRR_CFG_LADDR/UADDR) and the PRR bit in the GPU context bank's ACTLR
+once, when the GPU creates its first pagetable. That is enough while the SMMU only goes through GPU power collapses:
+the GPU's CX domain keeps its registers. A power-off resets them (restore from hibernation, ASUS Vivobook S 15,
+X1E80100), and arm_smmu_device_reset() only writes the context banks back, so after a restore sparse (PRR) mappings
+no longer read zeroes and the GPU's writes to them land in the PRR page.
+
+Remember both and write them again from the reset hook of the Adreno MMU-500 implementation. During runtime PM the
+registers still hold the same values.
+
+Not upstream.
+---
+ drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c | 55 +++++++++++++++++++---
+ drivers/iommu/arm/arm-smmu/arm-smmu-qcom.h |  5 ++
+ 2 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+index 795e8ec7e..05776ca91 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.c
+@@ -177,12 +177,23 @@ static void qcom_adreno_smmu_set_stall(const void *cookie, bool enabled)
+ 	}
+ }
+ 
++static void qcom_adreno_smmu_write_prr_bit(struct arm_smmu_device *smmu, int cbndx, bool set)
++{
++	u32 reg;
++
++	reg =  arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_ACTLR);
++	reg &= ~GFX_ACTLR_PRR;
++	if (set)
++		reg |= FIELD_PREP(GFX_ACTLR_PRR, 1);
++	arm_smmu_cb_write(smmu, cbndx, ARM_SMMU_CB_ACTLR, reg);
++}
++
+ static void qcom_adreno_smmu_set_prr_bit(const void *cookie, bool set)
+ {
+ 	struct arm_smmu_domain *smmu_domain = (void *)cookie;
+ 	struct arm_smmu_device *smmu = smmu_domain->smmu;
++	struct qcom_smmu *qsmmu = to_qcom_smmu(smmu);
+ 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+-	u32 reg = 0;
+ 	int ret;
+ 
+ 	ret = pm_runtime_resume_and_get(smmu->dev);
+@@ -191,11 +202,9 @@ static void qcom_adreno_smmu_set_prr_bit(const void *cookie, bool set)
+ 		return;
+ 	}
+ 
+-	reg =  arm_smmu_cb_read(smmu, cfg->cbndx, ARM_SMMU_CB_ACTLR);
+-	reg &= ~GFX_ACTLR_PRR;
+-	if (set)
+-		reg |= FIELD_PREP(GFX_ACTLR_PRR, 1);
+-	arm_smmu_cb_write(smmu, cfg->cbndx, ARM_SMMU_CB_ACTLR, reg);
++	qsmmu->prr_cbndx = cfg->cbndx;
++	qsmmu->prr_bit = set;
++	qcom_adreno_smmu_write_prr_bit(smmu, cfg->cbndx, set);
+ 	pm_runtime_put_autosuspend(smmu->dev);
+ }
+ 
+@@ -211,6 +220,8 @@ static void qcom_adreno_smmu_set_prr_addr(const void *cookie, phys_addr_t page_a
+ 		return;
+ 	}
+ 
++	to_qcom_smmu(smmu)->prr_addr = page_addr;
++	to_qcom_smmu(smmu)->prr_addr_set = true;
+ 	writel_relaxed(lower_32_bits(page_addr),
+ 				smmu->base + ARM_SMMU_GFX_PRR_CFG_LADDR);
+ 	writel_relaxed(upper_32_bits(page_addr),
+@@ -218,6 +229,34 @@ static void qcom_adreno_smmu_set_prr_addr(const void *cookie, phys_addr_t page_a
+ 	pm_runtime_put_autosuspend(smmu->dev);
+ }
+ 
++/*
++ * The PRR address and the PRR bit are written once, when the GPU sets up its first pagetable: the GPU's CX
++ * domain keeps the SMMU's registers across power collapses. A power-off (restore from hibernation) resets them,
++ * and arm_smmu_device_reset() only writes the context banks back. Write them again after every reset; the values
++ * are the ones already in the registers unless they were lost.
++ */
++static int qcom_adreno_smmu500_reset(struct arm_smmu_device *smmu)
++{
++	struct qcom_smmu *qsmmu = to_qcom_smmu(smmu);
++	int ret;
++
++	ret = arm_mmu500_reset(smmu);
++	if (ret)
++		return ret;
++
++	if (qsmmu->prr_addr_set) {
++		writel_relaxed(lower_32_bits(qsmmu->prr_addr),
++			       smmu->base + ARM_SMMU_GFX_PRR_CFG_LADDR);
++		writel_relaxed(upper_32_bits(qsmmu->prr_addr),
++			       smmu->base + ARM_SMMU_GFX_PRR_CFG_UADDR);
++	}
++
++	if (qsmmu->prr_cbndx >= 0)
++		qcom_adreno_smmu_write_prr_bit(smmu, qsmmu->prr_cbndx, qsmmu->prr_bit);
++
++	return 0;
++}
++
+ #define QCOM_ADRENO_SMMU_GPU_SID 0
+ 
+ static bool qcom_adreno_smmu_is_gpu_device(struct device *dev)
+@@ -655,7 +694,7 @@ static const struct arm_smmu_impl qcom_adreno_smmu_v2_impl = {
+ static const struct arm_smmu_impl qcom_adreno_smmu_500_impl = {
+ 	.init_context = qcom_adreno_smmu_init_context,
+ 	.def_domain_type = qcom_smmu_def_domain_type,
+-	.reset = arm_mmu500_reset,
++	.reset = qcom_adreno_smmu500_reset,
+ 	.alloc_context_bank = qcom_adreno_smmu_alloc_context_bank,
+ 	.write_sctlr = qcom_adreno_smmu_write_sctlr,
+ 	.tlb_sync = qcom_smmu_tlb_sync,
+@@ -691,6 +730,8 @@ static struct arm_smmu_device *qcom_smmu_create(struct arm_smmu_device *smmu,
+ 
+ 	qsmmu->smmu.impl = impl;
+ 	qsmmu->data = data;
++	qsmmu->prr_addr_set = false;
++	qsmmu->prr_cbndx = -1;
+ 
+ 	return &qsmmu->smmu;
+ }
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.h b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.h
+index 8addd453f..a017d8927 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.h
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu-qcom.h
+@@ -12,6 +12,11 @@ struct qcom_smmu {
+ 	bool bypass_quirk;
+ 	u8 bypass_cbndx;
+ 	u32 stall_enabled;
++	/* Adreno PRR setup, written again after a reset that lost it (qcom_adreno_smmu500_reset()) */
++	phys_addr_t prr_addr;
++	bool prr_addr_set;
++	bool prr_bit;
++	int prr_cbndx;
+ };
+ 
+ enum qcom_smmu_impl_reg_offset {
+-- 
+2.43.0
+

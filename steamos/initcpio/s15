@@ -9,6 +9,11 @@ build() {
            /drivers/power/sequencing/ /drivers/mfd/ /drivers/pci/ /drivers/iommu/; do
     add_checked_modules "$d"
   done
+  # The USB controllers' eUSB2 PHYs and the multiport's PTN3222 repeaters are outside drivers/phy/qualcomm/; without
+  # them no USB controller binds before the root is mounted (no USB keyboard at the passphrase prompt), and a restore
+  # from hibernation finds USB PHYs that the loading kernel never set up (docs/power.md#hibernation).
+  add_module phy-snps-eusb2
+  add_module phy-nxp-ptn3222
   # Root on NVMe (btrfs comes from the filesystems hook); USB storage for booting from a stick.
   add_module nvme
   add_module phy-qcom-qmp-pcie

@@ -1,0 +1,59 @@
+From da100c4a1f5abbf2a32ed46272fd7f6f8ebef2cf Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:47:30 +0000
+Subject: [PATCH] serial: qcom-geni: set the port up again on restore from
+ hibernation
+
+qcom_geni_serial_port_setup() runs once per boot (port->setup), at the first startup. After a restore from
+hibernation the serial engine was reset with the SoC, and when the kernel that loaded the image never used this
+engine its protocol firmware is gone as well. On the ASUS Vivobook S 15 the Bluetooth UART then stayed dead after the
+resume ("command 0xfc00 tx timeout", "Reading QCA version information failed"). Add a .restore callback that marks
+the setup undone; uart_resume_port() calls ->startup() for an open port, which sets it up again.
+
+Not upstream.
+---
+ drivers/tty/serial/qcom_geni_serial.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/tty/serial/qcom_geni_serial.c b/drivers/tty/serial/qcom_geni_serial.c
+index a851b8f0e..66c9bd175 100644
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -2136,6 +2136,20 @@ static int qcom_geni_serial_resume(struct device *dev)
+ 	return ret;
+ }
+ 
++/*
++ * Restore from hibernation: the serial engine was reset with the SoC, and its protocol firmware may be gone when the
++ * kernel that loaded the image never used this engine. port_setup() runs only once per boot; mark it undone, so
++ * uart_resume_port() -> ->startup() sets an open port up again.
++ */
++static int qcom_geni_serial_restore(struct device *dev)
++{
++	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
++
++	port->setup = false;
++
++	return qcom_geni_serial_resume(dev);
++}
++
+ #if IS_ENABLED(CONFIG_SERIAL_QCOM_GENI_CONSOLE)
+ static const struct qcom_geni_device_data qcom_geni_console_data = {
+ 	.console = true,
+@@ -2173,7 +2187,12 @@ static const struct qcom_geni_device_data sa8255p_qcom_geni_uart_data = {
+ static const struct dev_pm_ops qcom_geni_serial_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(qcom_geni_serial_runtime_suspend,
+ 			   qcom_geni_serial_runtime_resume, NULL)
+-	SYSTEM_SLEEP_PM_OPS(qcom_geni_serial_suspend, qcom_geni_serial_resume)
++	.suspend = pm_sleep_ptr(qcom_geni_serial_suspend),
++	.resume = pm_sleep_ptr(qcom_geni_serial_resume),
++	.freeze = pm_sleep_ptr(qcom_geni_serial_suspend),
++	.thaw = pm_sleep_ptr(qcom_geni_serial_resume),
++	.poweroff = pm_sleep_ptr(qcom_geni_serial_suspend),
++	.restore = pm_sleep_ptr(qcom_geni_serial_restore),
+ };
+ 
+ static void qcom_geni_serial_sys_shutdown(struct platform_device *pdev)
+-- 
+2.43.0
+

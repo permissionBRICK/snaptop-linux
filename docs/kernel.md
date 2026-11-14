@@ -37,9 +37,12 @@ Install a new payload in SteamOS: `sudo steamos/install-kernel.sh <payload>` (ke
    - reverts of the LPASS macro PM-clock conversion (audio)
 3. **Our patches** in `kernel/patches/`, among them 8 bpc on the panel (`0001`, below), the firmware TPM driver
    (`0011`, [tpm](tpm.md)), two boot fixes for the TPM unlock (`0012`, `0013`, below), the SoundWire resume
-   fix (`0014`, below) and the display memory clock at boot (`0015`, below; halves the boot time).
+   fix (`0014`, below), the display memory clock at boot (`0015`, below; halves the boot time), restore fixes for
+   hibernation (`0016`-`0020`, `0022`-`0024`, below), the USB wakeup for runtime PM (`0021`, below) and the shared
+   camera LED (`0025`, below).
 4. **DT overlay** from the same community repo (`overlay/build-overlay.sh --dtbo-only`): audio (WSA8845 speakers,
-   SoundWire, mics), RGB and IR cameras, and optionally the EC node. `build.sh` merges it into the mainline DTB
+   SoundWire, mics), RGB and IR cameras, and optionally the EC node; plus our fragments from `kernel/overlay/`
+   (camera activity LED). `build.sh` merges it into the mainline DTB
    with `fdtoverlay`, and also sets `rotation = <180>` on the HM1092 node (`camera@24`), which the overlay misses.
 5. **Config** `kernel/config-7.3.0-s15`, run through `olddefconfig`.
 
@@ -104,6 +107,45 @@ the firmware framebuffer (`0xe4800000`, 2880x1615); after a firmware change the 
 With it, `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y`: the text console takes the EFI framebuffer only when text
 is printed, so with `quiet` the firmware's logo stays on screen until `msm` takes over (about 4 s after the kernel
 starts).
+
+## Our patches: restore from hibernation (`0016`-`0020`, `0022`-`0024`)
+
+Hibernation powers the SoC off; drivers that only know suspend find their hardware reset after the restore, set up
+by the kernel that loaded the image only as far as its own drivers needed it ([power.md](power.md#hibernation)).
+Experimental, like hibernation itself; suspend to RAM is unchanged by all of them.
+
+- `0016` + `0022` (`drm/msm/a6xx`): the GPU's CX domain keeps its registers across GPU power collapses, so msm sets
+  some things up once (RSC/PDC sequences, zap shader, SCM fuse setup, AOSS ACD state) and tracks other state only in
+  software. After the power-off the RSC is awake and the GMU's memory empty, but msm asked the RSC to wake up
+  ("Unable to power on the GPU RSC") and then took a warm boot without loading the GMU firmware (GMU context faults,
+  init timeouts, hangchecks). On the first GMU resume after a restore it now checks whether a GMU ran since the
+  power-on (TCM retention) and if not starts from the cold-boot state; a failed start always forces a cold boot.
+- `0017` (`qcom-hamoa-ec`): the EC's SCI events (enabled at probe) were off after the restore and its interrupt kept
+  firing with event 0; the restore enables them and restores the fan state.
+- `0018` (`serial: qcom-geni`): the port setup (serial engine firmware) ran once per boot; the Bluetooth UART stayed
+  dead. The restore marks it undone, so the port is set up again when it is opened.
+- `0019` (`pinctrl: qcom`) and `0020` (`irqchip/qcom-pdc`): pin configuration and the PDC's interrupt configuration
+  are saved before the snapshot and written back right after the jump (the EC interrupt line had lost its pull-up and
+  fired without end).
+- `0023` (`ath12k`): when the Wi-Fi firmware did not come back after a restore, unloading the driver later oopsed in
+  `hwmon_device_unregister`; the thermal devices are no longer unregistered twice.
+- `0024` (`iommu/arm-smmu-qcom`): the Adreno SMMU's PRR setup (sparse mappings) is written again after a reset.
+
+## Our patch: shared camera privacy LED (`0025`)
+
+The camera activity LED (TLMM gpio110, `kernel/overlay/35-camera-privacy-led.dtsi`, see
+[steamos.md](steamos.md#cameras-and-browser-access)) serves both the RGB and the IR sensor, as on Windows. The v4l2
+core switched a privacy LED off whenever one of its sensors stopped; `0025` keeps it lit until the last one stops.
+
+## Our patch: USB wakeup from runtime suspend (`0021`)
+
+A runtime-suspended dwc3 controller did not notice a device plugged in: no PHY interrupt arrived at all, so the
+USB-A ports could not use runtime PM while awake ([power.md](power.md)). Windows keeps the controller's 32 kHz sleep
+clock running in D1/D2; `0021` does the same in runtime suspend (`dwc3_qcom.runtime_sleep_clk`, on by default; off
+again for system suspend). With it a plug-in into either USB-A port raises `dp_hs_phy_N` and the device enumerates.
+It also keeps the xHCI host running 500 ms after a wakeup interrupt (`wake_hold_ms`) and arms the eUSB2 wakeup
+lines like the pending upstream series. Further switches from the Windows driver are there for tests and off
+(`runtime_pwr_event`, `runtime_alt_irq`, `icc_windows_bw`, all in `/sys/module/dwc3_qcom/parameters/`).
 
 ## Our patches: boot fixes for the TPM unlock
 
