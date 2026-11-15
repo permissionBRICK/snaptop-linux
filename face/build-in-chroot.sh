@@ -34,12 +34,12 @@ cmake -S "$B/biopass-$V/auth" -B "$T" -DCMAKE_BUILD_TYPE=Release -DPROJECT_VERSI
 log "build ($J jobs)"
 cmake --build "$T" -j "$J" --target biopass-helper biopass_pam biopass-keyring camera_capture_test \
   pixel_convert_test capture_policy_test face_camera_reuse_test face_framing_test face_both_cameras_test \
-  config_validation_test config_golden_test auth_manager_test > "$B/build.log" 2>&1 ||
+  config_validation_test config_golden_test auth_manager_test helper_exit_test > "$B/build.log" 2>&1 ||
   { grep -E -A5 'error|Error' "$B/build.log" | head -60; exit 1; }
 log "unit tests"
 for t in pixel_convert/pixel_convert_test capture_policy/capture_policy_test face_camera_reuse/face_camera_reuse_test \
   face_framing/face_framing_test face_both_cameras/face_both_cameras_test config_validation/config_validation_test \
-  config_golden/config_golden_test auth_manager/auth_manager_test; do
+  config_golden/config_golden_test auth_manager/auth_manager_test helper_exit/helper_exit_test; do
   "$T/test/$t" > "$B/test.log" 2>&1 || { grep FAIL "$B/test.log"; exit 1; }
   echo "  $(basename "$t"): $(tail -1 "$B/test.log")"
 done

@@ -1,0 +1,596 @@
+From 74648acf3a80aaa518c61c5a559820f7ae2c117e Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:40:00 +0000
+Subject: [PATCH] feat(helper): auth --keep-looking: frames without a face use
+ up no try
+
+Biopass counts every attempt against `retries`, whether it compared a
+face or saw none, so a scan is over after a few seconds of nobody in
+front of the camera, and a caller cannot tell "no face" from "a face
+that did not match".
+
+FaceAuth now returns NoFace (new AuthResult) when an attempt compared no
+face: none found, too small or cut off (min_face_height), a capture or
+camera open that failed, or in both-cameras mode a second camera that
+saw no face, saw it too late or did not open. Retry stays for a face
+that did not match. Without the new option AuthManager treats NoFace as
+Retry, so nothing changes.
+
+`biopass-helper auth --keep-looking <ms>` (AuthConfig.keep_looking_ms):
+NoFace attempts use up no try; the method keeps looking, retry_delay
+apart, for up to <ms> (within the time budget). The first attempt that
+compared a face decides: a match is exit 0, a mismatch or an
+anti-spoofing failure exit 1 (no retry). Nothing compared: the new exit
+3 (HelperExit::NoFace). For callers that count failed faces themselves
+and want "nobody there" not to count; the PAM module never passes it
+and maps 3, like any unknown code, to PAM_AUTH_ERR.
+Tests: auth_manager, helper_exit, face_both_cameras, face_camera_reuse.
+---
+ auth/core/auth_manager.cc            | 62 ++++++++++++++++++++++++-
+ auth/core/auth_method.h              | 11 ++++-
+ auth/core/helper_exit.h              | 12 +++--
+ auth/face/face_auth.cc               | 22 +++++----
+ auth/face/face_auth.h                |  2 +
+ auth/pam/helper.cc                   | 14 +++++-
+ auth/test/auth_manager/main.cpp      | 69 ++++++++++++++++++++++++++++
+ auth/test/face_both_cameras/main.cpp | 35 +++++++-------
+ auth/test/face_camera_reuse/main.cpp |  9 ++--
+ auth/test/helper_exit/main.cpp       |  4 +-
+ 10 files changed, 201 insertions(+), 39 deletions(-)
+
+diff --git a/auth/core/auth_manager.cc b/auth/core/auth_manager.cc
+index 3b9c023..809289e 100644
+--- a/auth/core/auth_manager.cc
++++ b/auth/core/auth_manager.cc
+@@ -90,11 +90,53 @@ class DeadlineWatch {
+   std::thread thread_;
+ };
+ 
++// keep_looking (see AuthConfig): attempts with nothing to compare (NoFace)
++// use up no try; the method keeps looking, retry_delay apart, until an
++// attempt compared something, keep_looking_ms passed or `cancel` is set. The
++// first comparison decides: a mismatch (Retry) is a Failure, never retried.
++// Nothing compared (looked until the end, cancelled, or the method went away
++// after looking) = NoFace.
++AuthResult runUntilCompared(IAuthMethod& method, const std::string& username,
++                            const AuthConfig& config, std::atomic<bool>& cancel) {
++  const auto look_until =
++      std::chrono::steady_clock::now() + std::chrono::milliseconds(config.keep_looking_ms);
++  bool looked = false;
++  for (;;) {
++    if (cancel.load()) {
++      return looked ? AuthResult::NoFace : AuthResult::Failure;
++    }
++    if (!looked) {
++      spdlog::debug("AuthManager: Trying {} authentication, looking for up to {} ms",
++                    method.name(), config.keep_looking_ms);
++    }
++    const AuthResult result = method.authenticate(username, config, &cancel);
++    if (result == AuthResult::Unavailable && looked) {
++      return AuthResult::NoFace;
++    }
++    if (result != AuthResult::NoFace) {
++      return result == AuthResult::Retry ? AuthResult::Failure : result;
++    }
++    looked = true;
++    if (std::chrono::steady_clock::now() >= look_until) {
++      spdlog::debug("AuthManager: {} saw nothing to compare in {} ms", method.name(),
++                    config.keep_looking_ms);
++      return AuthResult::NoFace;
++    }
++    if (!sleepUnlessCancelled(std::chrono::milliseconds(method.getRetryDelayMs()), &cancel)) {
++      return AuthResult::NoFace;
++    }
++  }
++}
++
+ // Runs `method`'s attempts until one is final, its retries run out or
+ // `cancel` is set (retry sleeps wake for it too). Cancelled before the first
+-// attempt = Failure.
++// attempt = Failure. Without keep_looking an attempt with nothing to compare
++// (NoFace) is a try like any other (Retry).
+ AuthResult runAttempts(IAuthMethod& method, const std::string& username, const AuthConfig& config,
+                        std::atomic<bool>& cancel) {
++  if (config.keep_looking_ms > 0) {
++    return runUntilCompared(method, username, config, cancel);
++  }
+   RetryStrategy retry_strategy(method.getRetries());
+   uint32_t attempts = 0;
+   AuthResult result = AuthResult::Failure;
+@@ -113,6 +155,9 @@ AuthResult runAttempts(IAuthMethod& method, const std::string& username, const A
+     }
+ 
+     result = method.authenticate(username, config, &cancel);
++    if (result == AuthResult::NoFace) {
++      result = AuthResult::Retry;
++    }
+     attempts++;
+   } while (retry_strategy.shouldRetry(result, attempts) && !cancel.load());
+ 
+@@ -199,6 +244,7 @@ AuthOutcome AuthManager::authenticate(const std::string& username) {
+ 
+ AuthOutcome AuthManager::runSequential(const std::string& username, std::atomic<bool>& cancel) {
+   bool any_attempted = false;
++  bool any_looked = false;
+ 
+   for (auto& method : this->methods_) {
+     if (cancel.load()) {
+@@ -227,9 +273,16 @@ AuthOutcome AuthManager::runSequential(const std::string& username, std::atomic<
+         any_attempted = true;
+         spdlog::debug("AuthManager: {} requested retry but max retries exceeded", method->name());
+         break;
++      case AuthResult::NoFace:
++        any_looked = true;
++        spdlog::debug("AuthManager: {} had nothing to compare, trying next", method->name());
++        break;
+     }
+   }
+ 
++  if (!any_attempted && any_looked) {
++    return AuthOutcome::NoFace;
++  }
+   if (!any_attempted) {
+     spdlog::debug("AuthManager: No methods were able to run for this user, skipping module");
+     return AuthOutcome::Ignore;
+@@ -267,10 +320,13 @@ AuthOutcome AuthManager::runParallel(const std::string& username, std::atomic<bo
+ 
+   bool any_success = false;
+   bool any_attempted = false;
++  bool any_looked = false;
+   for (auto& future : futures) {
+     AuthResult result = future.get();
+     if (result == AuthResult::Success) {
+       any_success = true;
++    } else if (result == AuthResult::NoFace) {
++      any_looked = true;
+     } else if (result != AuthResult::Unavailable) {
+       any_attempted = true;
+     }
+@@ -280,6 +336,10 @@ AuthOutcome AuthManager::runParallel(const std::string& username, std::atomic<bo
+     return AuthOutcome::Success;
+   }
+ 
++  if (!any_attempted && any_looked) {
++    return AuthOutcome::NoFace;
++  }
++
+   if (!any_attempted) {
+     spdlog::debug("AuthManager: All parallel methods became unavailable, skipping module");
+     return AuthOutcome::Ignore;
+diff --git a/auth/core/auth_method.h b/auth/core/auth_method.h
+index 5d9a3cf..f44bba6 100644
+--- a/auth/core/auth_method.h
++++ b/auth/core/auth_method.h
+@@ -5,13 +5,22 @@
+ #include <string>
+ 
+ namespace biopass {
+-enum AuthResult { Success, Failure, Retry, Unavailable };
++// Retry: a sample was compared and did not match. NoFace: there was nothing
++// to compare (face: no face in front of the camera, or a capture that
++// failed); without keep_looking it uses up a try like Retry.
++enum AuthResult { Success, Failure, Retry, Unavailable, NoFace };
+ 
+ struct AuthConfig {
+   bool debug = false;
+   // Log at debug level without what debug also does (saving failed faces):
+   // biopass-helper auth --verbose, run from a terminal.
+   bool verbose = false;
++  // biopass-helper auth --keep-looking <ms>: attempts with nothing to
++  // compare (NoFace) use up no try; the method keeps looking, retry_delay
++  // apart, for up to this long. The first attempt that compared a sample
++  // decides: a mismatch (Retry) ends the run as Failure. 0: off, every
++  // attempt is a try (Biopass's own behaviour).
++  uint32_t keep_looking_ms = 0;
+ };
+ 
+ struct IAuthMethod {
+diff --git a/auth/core/helper_exit.h b/auth/core/helper_exit.h
+index feab86c..9fa6d7a 100644
+--- a/auth/core/helper_exit.h
++++ b/auth/core/helper_exit.h
+@@ -8,10 +8,14 @@ namespace biopass {
+ 
+ // What AuthManager decided. Ignore = no method could even try (none
+ // configured, no camera, no fprintd), so PAM should fall through rather
+-// than count a failed attempt.
+-enum class AuthOutcome { Success, Failure, Ignore };
++// than count a failed attempt. NoFace = only with keep_looking: the methods
++// looked but had nothing to compare (no face in front of the camera).
++enum class AuthOutcome { Success, Failure, Ignore, NoFace };
+ 
+-enum class HelperExit : int { Ok = 0, AuthErr = 1, Ignore = 2 };
++// NoFace is only ever returned with `auth --keep-looking`, which the PAM
++// module never passes; the module maps it, like any unknown code, to
++// PAM_AUTH_ERR.
++enum class HelperExit : int { Ok = 0, AuthErr = 1, Ignore = 2, NoFace = 3 };
+ 
+ constexpr HelperExit toHelperExit(AuthOutcome outcome) {
+   switch (outcome) {
+@@ -19,6 +23,8 @@ constexpr HelperExit toHelperExit(AuthOutcome outcome) {
+       return HelperExit::Ok;
+     case AuthOutcome::Ignore:
+       return HelperExit::Ignore;
++    case AuthOutcome::NoFace:
++      return HelperExit::NoFace;
+     case AuthOutcome::Failure:
+       break;
+   }
+diff --git a/auth/face/face_auth.cc b/auth/face/face_auth.cc
+index b88c4b2..4e2c8f2 100644
+--- a/auth/face/face_auth.cc
++++ b/auth/face/face_auth.cc
+@@ -245,15 +245,15 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+   if (!camera_session_ || !camera_session_->isOpen()) {
+     spdlog::error("FaceAuth: Could not open camera");
+     // One more open tells a missing camera (Unavailable) from a passing
+-    // failure (Retry). A session it gets is kept for the next attempt. The
+-    // dead session is freed first.
++    // failure (NoFace: nothing was compared). A session it gets is kept for
++    // the next attempt. The dead session is freed first.
+     camera_session_.reset();
+     camera_session_ = openMainCamera();
+     if (!camera_session_ || !camera_session_->isOpen()) {
+       camera_session_.reset();
+       return AuthResult::Unavailable;
+     }
+-    return AuthResult::Retry;
++    return AuthResult::NoFace;
+   }
+ 
+   const std::vector<std::string> enrolled = enrolledFaces(username, FaceSet::Main);
+@@ -281,7 +281,7 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+ 
+   const std::optional<Sighting> seen = lookForFace(camera_session_, cameraName(false, false));
+   if (!seen) {
+-    return AuthResult::Retry;
++    return AuthResult::NoFace;
+   }
+   const ImageRGB& face = seen->face.image;
+ 
+@@ -323,7 +323,9 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+ // opens while the first face is matched; a match there too, on a frame at
+ // most kBothCamerasMaxGap after the first, is a success. Nothing falls back
+ // to one camera: a camera that sees no face (no light for the colour camera,
+-// a covered lens) fails the attempt.
++// a covered lens) fails the attempt. NoFace when no face was compared, or
++// only the first camera's (the second saw none, too late, or did not open);
++// Retry when a face did not match.
+ AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthConfig& config,
+                                         std::atomic<bool>* cancel_signal) {
+   const auto& ir_camera = face_config_.anti_spoofing.ir_camera;
+@@ -372,7 +374,7 @@ AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthC
+     if (!first_slot || !first_slot->isOpen()) {
+       spdlog::error("FaceAuth: Could not open the {}", name(first));
+       first_slot.reset();
+-      return AuthResult::Retry;
++      return AuthResult::NoFace;
+     }
+   }
+ 
+@@ -383,7 +385,7 @@ AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthC
+ 
+   const std::optional<Sighting> first_seen = lookForFace(first_slot, name(first));
+   if (!first_seen) {
+-    return AuthResult::Retry;
++    return AuthResult::NoFace;
+   }
+   if (cancel_signal && cancel_signal->load()) {
+     return AuthResult::Failure;
+@@ -420,12 +422,12 @@ AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthC
+   if (!second_slot || !second_slot->isOpen()) {
+     spdlog::error("FaceAuth: Could not open the {}", name(second));
+     second_slot.reset();
+-    return AuthResult::Retry;
++    return AuthResult::NoFace;
+   }
+ 
+   const std::optional<Sighting> second_seen = lookForFace(second_slot, name(second));
+   if (!second_seen) {
+-    return AuthResult::Retry;
++    return AuthResult::NoFace;
+   }
+   const auto gap = second_seen->at - first_seen->at;
+   const long long gap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(gap).count();
+@@ -433,7 +435,7 @@ AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthC
+     spdlog::error("FaceAuth: The {} frame came {} ms after the {} frame (at most {} ms), not "
+                   "one moment",
+                   name(second), gap_ms, name(first), kBothCamerasMaxGap.count());
+-    return AuthResult::Retry;
++    return AuthResult::NoFace;
+   }
+   if (cancel_signal && cancel_signal->load()) {
+     return AuthResult::Failure;
+diff --git a/auth/face/face_auth.h b/auth/face/face_auth.h
+index 7104034..d0a0a07 100644
+--- a/auth/face/face_auth.h
++++ b/auth/face/face_auth.h
+@@ -95,6 +95,8 @@ class FaceAuth : public IAuthMethod {
+   };
+ 
+   // One attempt; authenticate() wraps it so nothing it throws escapes.
++  // NoFace when no face was compared (none found, too small or cut off, a
++  // capture or camera open that failed), Retry when one did not match.
+   AuthResult attempt(const std::string& username, const AuthConfig& config,
+                      std::atomic<bool>* cancel_signal);
+   // One attempt with ir_recognition: a match on the camera that is open, then
+diff --git a/auth/pam/helper.cc b/auth/pam/helper.cc
+index 4353715..66bc318 100644
+--- a/auth/pam/helper.cc
++++ b/auth/pam/helper.cc
+@@ -323,7 +323,7 @@ int previewSession(const std::string& cameraPath, const std::string& modelPath,
+ }
+ 
+ biopass::HelperExit authenticate(const std::string& username, const std::string& service,
+-                                 bool verbose) {
++                                 bool verbose, uint32_t keep_looking_ms) {
+   using biopass::HelperExit;
+   const char* pUsername = username.c_str();
+   // Counted from here so config and model loading come out of the budget too.
+@@ -346,6 +346,7 @@ biopass::HelperExit authenticate(const std::string& username, const std::string&
+   biopass::AuthConfig runtime_config;
+   runtime_config.debug = config.strategy.debug;
+   runtime_config.verbose = verbose;
++  runtime_config.keep_looking_ms = keep_looking_ms;
+ 
+   biopass::AuthManager manager;
+   manager.setMode(config.strategy.execution_mode);
+@@ -413,6 +414,15 @@ int main(int argc, char** argv) {
+   auth_cmd->add_flag("--verbose", verbose,
+                      "Log each step (face size, match scores) to stderr, for testing from a "
+                      "terminal; the PAM module never passes it");
++  uint32_t keepLookingMs = 0;
++  auth_cmd
++      ->add_option("--keep-looking", keepLookingMs,
++                   "Attempts without a face use up no try: keep looking for up to this many ms "
++                   "(within the time budget); the first face compared decides. Exit 3 when no "
++                   "face was compared. For callers that count failed faces themselves; the PAM "
++                   "module never passes it")
++      ->check(CLI::Range(1u, static_cast<uint32_t>(std::chrono::milliseconds(
++                                 biopass::kAuthBudget).count())));
+ 
+   try {
+     app.parse(argc, argv);
+@@ -471,7 +481,7 @@ int main(int argc, char** argv) {
+     // An unexpected exception (config, model loading, thread start) would
+     // otherwise abort with a core dump. Fail closed with AuthErr instead.
+     try {
+-      const biopass::HelperExit result = authenticate(username, pamService, verbose);
++      const biopass::HelperExit result = authenticate(username, pamService, verbose, keepLookingMs);
+       if (result == biopass::HelperExit::Ok) {
+         // Its own try: a keyring problem must not turn a match into AuthErr.
+         bool finished = true;
+diff --git a/auth/test/auth_manager/main.cpp b/auth/test/auth_manager/main.cpp
+index c3e6373..6c1312f 100644
+--- a/auth/test/auth_manager/main.cpp
++++ b/auth/test/auth_manager/main.cpp
+@@ -332,6 +332,73 @@ void checkLogLevel() {
+   spdlog::set_level(spdlog::level::off);
+ }
+ 
++// biopass-helper auth --keep-looking: attempts with nothing to compare
++// (NoFace) use up no try, the first comparison decides, and a run that never
++// compared anything ends as NoFace (exit 3), not as a failure. Without it a
++// NoFace attempt is a try like Retry.
++void checkKeepLooking(ExecutionMode mode, const char* label) {
++  auto name = [label](const std::string& what) { return std::string(label) + ": " + what; };
++  auto runLooking = [mode](const std::vector<Spec>& specs, uint32_t look_ms,
++                           std::vector<Calls>* calls = nullptr,
++                           std::chrono::milliseconds budget = std::chrono::milliseconds(0)) {
++    std::vector<Calls> local;
++    AuthManager manager;
++    setUp(manager, mode, specs, calls ? *calls : local);
++    biopass::AuthConfig config;
++    config.keep_looking_ms = look_ms;
++    manager.setConfig(config);
++    if (budget.count() > 0) {
++      manager.setDeadline(std::chrono::steady_clock::now() + budget);
++    }
++    return manager.authenticate("someone");
++  };
++  using R = AuthResult;
++  std::vector<Calls> calls;
++
++  expect(runLooking({Spec{{R::NoFace, R::NoFace, R::NoFace, R::NoFace, R::Success}, true, 1}},
++                    5000, &calls) == Outcome::Success,
++         name("keep looking: no face 4 times, then a match -> success"));
++  expect(calls[0].authenticate == 5, name("keep looking: no-face attempts use up no try (5 with 1 try)"));
++
++  expect(runLooking({Spec{{R::NoFace, R::Retry, R::Success}, true, 5}}, 5000, &calls) ==
++             Outcome::Failure,
++         name("keep looking: the first face compared decides, a mismatch -> failure"));
++  expect(calls[0].authenticate == 2, name("keep looking: a mismatch is not retried"));
++
++  expect(runLooking({Spec{{R::NoFace, R::Failure}, true, 5}}, 5000) == Outcome::Failure,
++         name("keep looking: anti-spoofing failure -> failure"));
++
++  const auto start = std::chrono::steady_clock::now();
++  expect(runLooking({Spec{{R::NoFace}, true, 1, 20}}, 150, &calls) == Outcome::NoFace,
++         name("keep looking: nothing compared within the time -> no face"));
++  const long long took = msSince(start);
++  expect(took >= 150 && took < kQuickMs,
++         name("keep looking: stops after the look time (" + std::to_string(took) + " ms)"));
++  expect(calls[0].authenticate > 2, name("keep looking: retry_delay apart, not one attempt"));
++
++  expect(runLooking({Spec{{R::NoFace}, true, 1, 20}}, 5000, nullptr,
++                    std::chrono::milliseconds(200)) == Outcome::NoFace,
++         name("keep looking: the time budget ends the look -> no face, not failure"));
++
++  expect(runLooking({Spec{{R::NoFace, R::Unavailable}, true, 1}}, 5000) == Outcome::NoFace,
++         name("keep looking: camera gone after looking -> no face"));
++  expect(runLooking({Spec{{R::Unavailable}}}, 5000) == Outcome::Ignore,
++         name("keep looking: unavailable at once -> ignore"));
++  expect(runLooking({Spec{{R::NoFace}, true, 1, 0}, Spec{{R::Retry}, true, 1}}, 50) ==
++             Outcome::Failure,
++         name("keep looking: no face + a mismatch elsewhere -> failure"));
++  expect(runLooking({Spec{{R::NoFace}, true, 1, 0}, Spec{{R::Success}, true, 1, 0, 100}}, 5000) ==
++             Outcome::Success,
++         name("keep looking: no face + a success elsewhere -> success"));
++
++  // Without keep_looking: Biopass's own behaviour, NoFace uses up a try.
++  expect(run(mode, {Spec{{R::NoFace}, true, 3}}, &calls) == Outcome::Failure,
++         name("no keep looking: no face 3 times with 3 tries -> failure"));
++  expect(calls[0].authenticate == 3, name("no keep looking: each no-face attempt is a try"));
++  expect(run(mode, {Spec{{R::NoFace, R::Retry, R::Success}, true, 3}}) == Outcome::Success,
++         name("no keep looking: no face, mismatch, match within 3 tries -> success"));
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -347,6 +414,8 @@ int main() {
+ 
+   checkTiming();
+   checkLogLevel();
++  checkKeepLooking(ExecutionMode::Sequential, "sequential");
++  checkKeepLooking(ExecutionMode::Parallel, "parallel");
+ 
+   if (g_failures != 0) {
+     std::printf("%d FAILED\n", g_failures);
+diff --git a/auth/test/face_both_cameras/main.cpp b/auth/test/face_both_cameras/main.cpp
+index 388d0ce..5e95ff5 100644
+--- a/auth/test/face_both_cameras/main.cpp
++++ b/auth/test/face_both_cameras/main.cpp
+@@ -5,7 +5,8 @@
+ // that is open, switches once a face is found there, and leaves the other
+ // camera open for the next attempt. Nothing falls back to one camera. And
+ // detection.min_face_height: a face that is too small or cut off is never
+-// matched, on either camera.
++// matched, on either camera. An attempt that compared no face is NoFace, one
++// whose face did not match is Retry.
+ // Fake cameras, detector, matcher and clock: no camera or model needed.
+ // Exits non-zero on any failure.
+ 
+@@ -176,8 +177,8 @@ void checkNoFallbackToIr() {
+   FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
+   face.isAvailable();
+   for (int i = 0; i < 3; ++i) {
+-    expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
+-           "no colour face: attempt " + std::to_string(i + 1) + " retries");
++    expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++           "no colour face: attempt " + std::to_string(i + 1) + " has nothing to compare");
+   }
+   expect(joined(rig.opens) == "rgb", "no colour face: the IR camera is never opened (" +
+                                          joined(rig.opens) + ")");
+@@ -190,10 +191,10 @@ void checkFraming() {
+   rig.seen[kRgbWidth] = {Seen::Small, Seen::Edge};
+   FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
+   face.isAvailable();
+-  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
+-         "small colour face: retry");
+-  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
+-         "colour face at the edge: retry");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "small colour face: nothing compared");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "colour face at the edge: nothing compared");
+   expect(rig.matched_sets.empty() && joined(rig.opens) == "rgb",
+          "small or cut-off colour face: neither matched nor switched");
+ 
+@@ -202,8 +203,8 @@ void checkFraming() {
+   rig2.seen[kIrWidth] = {Seen::Small};
+   FaceAuth face2(bothConfig(), kUser, opener(rig2), seams(rig2));
+   face2.isAvailable();
+-  expect(face2.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
+-         "small IR face: retry");
++  expect(face2.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "small IR face: no face compared on the second camera");
+   expect(joined(rig2.matched_sets) == "rgb", "small IR face: not matched");
+ }
+ 
+@@ -249,8 +250,8 @@ void checkGap() {
+   rig.capture_time[kIrWidth] = biopass::kBothCamerasMaxGap + milliseconds(1);
+   FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
+   face.isAvailable();
+-  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
+-         "IR frame after the gap: retry although both would match");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "IR frame after the gap: not compared although both would match");
+   expect(joined(rig.matched_sets) == "rgb", "IR frame after the gap: not matched");
+ 
+   Rig rig2;
+@@ -314,10 +315,10 @@ void checkSingleCameraFraming() {
+   one.anti_spoofing.ir_recognition = false;
+   FaceAuth face(one, kUser, opener(rig), seams(rig));
+   face.isAvailable();
+-  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
+-         "one camera, small face: retry");
+-  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
+-         "one camera, face at the edge: retry");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "one camera, small face: nothing compared");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "one camera, face at the edge: nothing compared");
+   expect(rig.matched_sets.empty(), "one camera: small or cut-off faces not matched");
+   expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
+          "one camera, face in front: success");
+@@ -331,8 +332,8 @@ void checkSecondOpenFails() {
+   rig.fail_opens[kIr] = 1;
+   FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
+   face.isAvailable();
+-  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
+-         "IR camera does not open: retry");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "IR camera does not open: nothing compared there");
+   expect(rig.live == 0, "IR camera does not open: no session left");
+   expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
+          "next attempt: success");
+diff --git a/auth/test/face_camera_reuse/main.cpp b/auth/test/face_camera_reuse/main.cpp
+index 1690294..7f1f520 100644
+--- a/auth/test/face_camera_reuse/main.cpp
++++ b/auth/test/face_camera_reuse/main.cpp
+@@ -129,14 +129,15 @@ void checkAttemptOpenFailsTwice() {
+   expect(log.opens == 2, "both opens fail: two open attempts");
+ }
+ 
+-// A second open that works means a passing glitch (Retry), as before; the
+-// session it opened is kept, so the next attempt doesn't open again.
++// A second open that works means a passing glitch (NoFace: nothing was
++// compared, so with --keep-looking it uses up no try); the session it opened
++// is kept, so the next attempt doesn't open again.
+ void checkAttemptOpenRecovers() {
+   CameraLog log;
+   log.results = {Open::Fail, Open::Ok};
+   biopass::FaceAuth face(biopass::FaceMethodConfig{}, kUser, fakeOpener(log));
+   auto result = face.authenticate(kUser, biopass::AuthConfig{});
+-  expect(result == biopass::AuthResult::Retry, "first open fails, second works: Retry");
++  expect(result == biopass::AuthResult::NoFace, "first open fails, second works: NoFace");
+   expect(log.opens == 2, "first open fails, second works: two opens");
+   expect(log.closes == 0, "the working session is kept");
+ 
+@@ -159,7 +160,7 @@ void checkDeadSessionFreedBeforeReopen() {
+ 
+   log.results = {Open::Dead, Open::Ok};
+   const auto result = face.authenticate(kUser, biopass::AuthConfig{});
+-  expect(result == biopass::AuthResult::Retry, "dead session, then a working one: Retry");
++  expect(result == biopass::AuthResult::NoFace, "dead session, then a working one: NoFace");
+   expect(log.max_live_at_open == 0, "no session alive when the camera is opened again (max=" +
+                                         std::to_string(log.max_live_at_open) + ")");
+ }
+diff --git a/auth/test/helper_exit/main.cpp b/auth/test/helper_exit/main.cpp
+index 7e4193b..6cd12b2 100644
+--- a/auth/test/helper_exit/main.cpp
++++ b/auth/test/helper_exit/main.cpp
+@@ -47,16 +47,18 @@ int main() {
+   expect(biopass::exitCode(HelperExit::Ok) == 0, "Ok is exit 0");
+   expect(biopass::exitCode(HelperExit::AuthErr) == 1, "AuthErr is exit 1");
+   expect(biopass::exitCode(HelperExit::Ignore) == 2, "Ignore is exit 2");
++  expect(biopass::exitCode(HelperExit::NoFace) == 3, "NoFace is exit 3");
+ 
+   expect(biopass::toHelperExit(AuthOutcome::Success) == HelperExit::Ok, "Success -> Ok");
+   expect(biopass::toHelperExit(AuthOutcome::Failure) == HelperExit::AuthErr, "Failure -> AuthErr");
+   expect(biopass::toHelperExit(AuthOutcome::Ignore) == HelperExit::Ignore, "Ignore -> Ignore");
++  expect(biopass::toHelperExit(AuthOutcome::NoFace) == HelperExit::NoFace, "NoFace -> NoFace");
+ 
+   expect(biopass::pamCodeForHelperStatus(childStatus(0)) == PAM_SUCCESS, "exit 0 -> PAM_SUCCESS");
+   expect(biopass::pamCodeForHelperStatus(childStatus(1)) == PAM_AUTH_ERR, "exit 1 -> PAM_AUTH_ERR");
+   expect(biopass::pamCodeForHelperStatus(childStatus(2)) == PAM_IGNORE, "exit 2 -> PAM_IGNORE");
+   expect(biopass::pamCodeForHelperStatus(childStatus(3)) == PAM_AUTH_ERR,
+-         "unknown exit 3 -> PAM_AUTH_ERR");
++         "exit 3 (NoFace, only with --keep-looking) -> PAM_AUTH_ERR");
+   expect(biopass::pamCodeForHelperStatus(childStatus(255)) == PAM_AUTH_ERR,
+          "unknown exit 255 -> PAM_AUTH_ERR");
+   expect(biopass::pamCodeForHelperStatus(childStatus(0, SIGKILL)) == PAM_AUTH_ERR,
+-- 
+2.43.0
+
