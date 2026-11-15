@@ -537,13 +537,12 @@ def check_sddm():
     fake.start()
     expect(not m.sddm_login(USER, sess, f"{d}/c", timeout=5), "SDDM: no answer (closed) -> False")
     expect(not m.sddm_login(USER, sess, f"{d}/none", timeout=1), "SDDM: no socket -> False")
-    lines = ["0000000000000000: 00000002 00000000 00010000 0001 01 58406 /tmp/sddm-auth-1a1c3451-5238",
-             "0000000000000000: 00000002 00000000 00010000 0001 01 58500 /tmp/sddm--gyeEMW",
-             "0000000000000000: 00000003 00000000 00000000 0001 03 58501 /tmp/sddm--gyeEMW",
-             "0000000000000000: 00000002 00000000 00010000 0001 01 58432 /tmp/.XBnoku/s"]
-    expect(m.greeter_socket_path({"58406", "58500", "58432"}, lines) == "/tmp/sddm--gyeEMW",
-           "SDDM: the greeter socket, not sddm-auth-* or others")
-    expect(m.greeter_socket_path({"58501"}, lines) is None, "SDDM: a connected (not listening) socket is not it")
+    greeter = ["/usr/bin/sddm-greeter-qt6", "--socket", "/tmp/sddm--gyeEMW", "--theme", "/usr/share/sddm/themes/breeze"]
+    expect(m.socket_from_argv(greeter) == "/tmp/sddm--gyeEMW", "SDDM: the greeter's --socket")
+    expect(m.socket_from_argv(["x", "--socket", "/tmp/sddm-auth-1a1c3451"]) is None and
+           m.socket_from_argv(["x", "--socket", "/tmp/sddm-/../etc/x"]) is None and
+           m.socket_from_argv(["x", "--socket"]) is None and m.socket_from_argv(["x"]) is None,
+           "SDDM: not sddm-auth-*, no other paths, no argument -> none")
     st = f"{d}/state.conf"
     open(st, "w").write("[Last]\n# Name of the last logged-in user.\nUser=steamos\n\n"
                         "Session=/usr/share/wayland-sessions/plasma.desktop \n")

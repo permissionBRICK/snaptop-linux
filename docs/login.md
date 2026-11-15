@@ -330,7 +330,9 @@ streams at a time, and the camera light is on while either does.
     lock needs no password (`--nolock`). Until 2026-11-15 it never tapped: it runs with `ProtectSystem=strict`, and
     reading the count opened its file for writing, which failed there, so every lock screen was skipped silently.
 - The login screen (SDDM 0.21, read from its source): SDDM runs PAM only when its greeter sends `Login` over the
-  daemon's greeter socket (`/tmp/sddm-<display>-<random>`, `src/daemon/SocketServer.cpp`; QDataStream: quint32 1,
+  daemon's greeter socket (`/tmp/sddm-<display>-<random>`, `src/daemon/SocketServer.cpp`; found from the greeter's
+  `--socket` argument: Qt binds it under a temporary name and renames it, so `/proc/net/unix` does not show it;
+  QDataStream: quint32 1,
   QString user, QString password, the session as quint32 type and QString desktop file). While SDDM's greeter
   session is active on seat0, `s15-face-wake` runs `s15-face-run greeter <user>` (the last user from
   `/var/lib/sddm/state.conf`): the lock screen's loop as root, with the same display rule and lockout. A match
