@@ -1,0 +1,795 @@
+From 3fba20e1f407e7d357b50a02e248e19f5053e781 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:17:35 +0000
+Subject: [PATCH] feat(app): face unlock lockout settings of snaptop-linux's
+ s15-face
+
+snaptop-linux (a SteamOS install on the ASUS Vivobook S 15) runs
+Biopass's helper through its own gate, s15-face, which counts false
+faces like wrong PINs: a run ends after some, face waits after more and
+turns off until a password login. Those numbers are root's
+(/etc/s15-face.conf): any program running as the user can write
+config.yaml.
+
+A card shows them (`s15-face lockout keys` and `s15-face lockout`) with
+the user's count (`s15-face status <user>`), and changes them in one go
+through `pkexec /usr/lib/s15-face/s15-face-lockout set KEY VALUE ...` or
+`reset-defaults` (its own polkit action, administrator password, shipped
+by snaptop-linux, not here). Without /usr/local/sbin/s15-face the card
+is not shown. Not for upstream: it names snaptop-linux's paths.
+Tests: lockout (parsing, arguments, exit codes, reading through a stub
+tool), lockoutInputs.test.ts.
+---
+ app/src-tauri/src/bindings.rs                 |   5 +-
+ app/src-tauri/src/lib.rs                      |   1 +
+ app/src-tauri/src/lockout.rs                  | 310 ++++++++++++++++++
+ .../configuration/-components/LockoutCard.tsx | 161 +++++++++
+ .../-components/lockoutInputs.test.ts         |  40 +++
+ .../-components/lockoutInputs.ts              |  43 +++
+ app/src/app/configuration/page.tsx            |   2 +
+ app/src/bindings.ts                           |  31 ++
+ app/src/commands/index.ts                     |   2 +
+ app/src/commands/lockout.ts                   |  21 ++
+ app/src/types/config.ts                       |   2 +
+ 11 files changed, 617 insertions(+), 1 deletion(-)
+ create mode 100644 app/src-tauri/src/lockout.rs
+ create mode 100644 app/src/app/configuration/-components/LockoutCard.tsx
+ create mode 100644 app/src/app/configuration/-components/lockoutInputs.test.ts
+ create mode 100644 app/src/app/configuration/-components/lockoutInputs.ts
+ create mode 100644 app/src/commands/lockout.ts
+
+diff --git a/app/src-tauri/src/bindings.rs b/app/src-tauri/src/bindings.rs
+index 863964c..2e0ea8c 100644
+--- a/app/src-tauri/src/bindings.rs
++++ b/app/src-tauri/src/bindings.rs
+@@ -5,7 +5,7 @@
+ use tauri_specta::{collect_commands, Builder, ErrorHandlingMode};
+ 
+ use crate::config::{self, CONFIG_LIMITS};
+-use crate::{cameras, face, face_session, fingerprint, keyring, models, scan, system};
++use crate::{cameras, face, face_session, fingerprint, keyring, lockout, models, scan, system};
+ 
+ pub fn builder() -> Builder<tauri::Wry> {
+     Builder::<tauri::Wry>::new()
+@@ -35,6 +35,9 @@ pub fn builder() -> Builder<tauri::Wry> {
+             keyring::get_keyring_status,
+             keyring::save_keyring_password,
+             keyring::forget_keyring_password,
++            lockout::get_face_lockout,
++            lockout::set_face_lockout,
++            lockout::reset_face_lockout,
+         ])
+         .typ::<models::DownloadProgress>()
+         .constant("CONFIG_LIMITS", CONFIG_LIMITS)
+diff --git a/app/src-tauri/src/lib.rs b/app/src-tauri/src/lib.rs
+index 195280a..15a3509 100644
+--- a/app/src-tauri/src/lib.rs
++++ b/app/src-tauri/src/lib.rs
+@@ -10,6 +10,7 @@ pub mod fingerprint_ffi;
+ #[cfg(test)]
+ mod golden;
+ pub mod keyring;
++pub mod lockout;
+ pub mod models;
+ pub mod paths;
+ pub mod scan;
+diff --git a/app/src-tauri/src/lockout.rs b/app/src-tauri/src/lockout.rs
+new file mode 100644
+index 0000000..31bd787
+--- /dev/null
++++ b/app/src-tauri/src/lockout.rs
+@@ -0,0 +1,310 @@
++//! The lockout of snaptop-linux's face unlock gate (s15-face, see its
++//! docs/login.md#face-unlock): after how many false faces a run ends, face
++//! unlock waits, and turns off until a password login. Root's settings
++//! (/etc/s15-face.conf), not the user's: any program running as the user can
++//! write config.yaml. Read with `s15-face lockout`, changed through
++//! `pkexec s15-face-lockout` (polkit action org.snaptop-linux.s15-face.lockout,
++//! administrator password). Absent on other systems: the app then shows
++//! nothing of it.
++
++use std::io::Read;
++use std::path::Path;
++use std::process::{Command, Stdio};
++use std::time::{Duration, Instant};
++
++use serde::{Deserialize, Serialize};
++
++use crate::blocking::run_blocking;
++
++const TASK: &str = "Lockout";
++const S15_FACE: &str = "/usr/local/sbin/s15-face";
++const LOCKOUT_TOOL: &str = "/usr/lib/s15-face/s15-face-lockout";
++const PKEXEC: &str = "/usr/bin/pkexec";
++const READ_TIMEOUT: Duration = Duration::from_secs(15);
++const MAX_OUTPUT: u64 = 64 * 1024;
++
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct LockoutSetting {
++    pub key: String,
++    #[specta(type = specta_typescript::Number)]
++    pub value: u64,
++    #[specta(type = specta_typescript::Number)]
++    pub default: u64,
++    #[specta(type = specta_typescript::Number)]
++    pub min: u64,
++    #[specta(type = specta_typescript::Number)]
++    pub max: u64,
++    /// "faces" or "seconds".
++    pub unit: String,
++    pub meaning: String,
++}
++
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct FaceLockout {
++    pub settings: Vec<LockoutSetting>,
++    /// `s15-face status <user>`: the user's false faces since the last
++    /// success, whether face unlock is allowed now, the mode.
++    pub status: Vec<String>,
++}
++
++#[derive(Debug, Deserialize, Clone, PartialEq, specta::Type)]
++pub struct LockoutValue {
++    pub key: String,
++    #[specta(type = specta_typescript::Number)]
++    pub value: u64,
++}
++
++/// `s15-face lockout keys` (KEY DEFAULT MIN MAX UNIT MEANING) with the values
++/// of `s15-face lockout` (KEY=VALUE). A key without a value is left out.
++fn parse_settings(keys: &str, values: &str) -> Vec<LockoutSetting> {
++    let value_of = |key: &str| {
++        values.lines().find_map(|line| {
++            let (k, v) = line.trim().split_once('=')?;
++            (k == key).then(|| v.parse::<u64>().ok()).flatten()
++        })
++    };
++    keys.lines()
++        .filter_map(|line| {
++            let mut f = line.trim().splitn(6, ' ');
++            let key = f.next()?.to_string();
++            let default = f.next()?.parse().ok()?;
++            let min = f.next()?.parse().ok()?;
++            let max = f.next()?.parse().ok()?;
++            let unit = f.next()?.to_string();
++            let meaning = f.next().unwrap_or("").to_string();
++            let value = value_of(&key)?;
++            Some(LockoutSetting {
++                key,
++                value,
++                default,
++                min,
++                max,
++                unit,
++                meaning,
++            })
++        })
++        .collect()
++}
++
++/// Runs `program args`, its stdout (exit 0) or an error.
++fn output_of(program: &str, args: &[&str]) -> Result<String, String> {
++    let mut child = Command::new(program)
++        .args(args)
++        .stdin(Stdio::null())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .map_err(|e| format!("Failed to start {program}: {e}"))?;
++    let stdout = child.stdout.take().ok_or("missing stdout")?;
++    let reader = std::thread::spawn(move || {
++        let mut text = String::new();
++        let _ = stdout.take(MAX_OUTPUT).read_to_string(&mut text);
++        text
++    });
++    let deadline = Instant::now() + READ_TIMEOUT;
++    let status = loop {
++        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
++            break status;
++        }
++        if Instant::now() >= deadline {
++            let _ = child.kill();
++            let _ = child.wait();
++            return Err(format!("{program} did not answer in time"));
++        }
++        std::thread::sleep(Duration::from_millis(50));
++    };
++    let text = reader.join().unwrap_or_default();
++    if status.success() {
++        Ok(text)
++    } else {
++        Err(format!("{program} {} failed ({status})", args.join(" ")))
++    }
++}
++
++fn read_lockout(s15_face: &str, user: Option<&str>) -> Result<FaceLockout, String> {
++    let keys = output_of(s15_face, &["lockout", "keys"])?;
++    let values = output_of(s15_face, &["lockout"])?;
++    let settings = parse_settings(&keys, &values);
++    if settings.is_empty() {
++        return Err("s15-face lockout listed no settings".to_string());
++    }
++    // Only shown: a status that cannot be read leaves it empty.
++    let status = user
++        .and_then(|u| output_of(s15_face, &["status", u]).ok())
++        .map(|text| text.lines().map(str::to_string).collect())
++        .unwrap_or_default();
++    Ok(FaceLockout { settings, status })
++}
++
++/// The lockout settings, None when this system has no s15-face.
++#[tauri::command]
++#[specta::specta]
++pub async fn get_face_lockout() -> Result<Option<FaceLockout>, String> {
++    run_blocking(TASK, || {
++        if !Path::new(S15_FACE).exists() {
++            return Ok(None);
++        }
++        let user = crate::system::get_current_username().ok();
++        read_lockout(S15_FACE, user.as_deref()).map(Some)
++    })
++    .await
++}
++
++/// The arguments of `s15-face-lockout set`: KEY VALUE pairs. Keys are
++/// checked here only for shape; the tool checks names and ranges.
++fn set_args(values: &[LockoutValue]) -> Result<Vec<String>, String> {
++    if values.is_empty() {
++        return Err("Nothing to change.".to_string());
++    }
++    let mut args = vec!["set".to_string()];
++    for v in values {
++        if v.key.is_empty() || !v.key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
++            return Err(format!("Not a lockout setting: {}", v.key));
++        }
++        args.push(v.key.clone());
++        args.push(v.value.to_string());
++    }
++    Ok(args)
++}
++
++/// The message for s15-face-lockout's exit code, or pkexec's own (126,
++/// 127). None on success.
++fn exit_message(code: Option<i32>) -> Option<String> {
++    let msg = match code {
++        Some(0) => return None,
++        Some(126) => "Authentication was cancelled.",
++        Some(127) => "Not authorized: changing the lockout needs an administrator password.",
++        Some(2) => "A value is out of range or not a lockout setting.",
++        Some(1) => "The lockout settings could not be written.",
++        Some(other) => return Some(format!("s15-face-lockout failed (exit code {other}).")),
++        None => "s15-face-lockout was killed.",
++    };
++    Some(msg.to_string())
++}
++
++fn run_tool(args: &[String]) -> Result<(), String> {
++    let status = Command::new(PKEXEC)
++        .arg(LOCKOUT_TOOL)
++        .args(args)
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null())
++        .status()
++        .map_err(|e| format!("Failed to start pkexec: {e}"))?;
++    match exit_message(status.code()) {
++        None => Ok(()),
++        Some(msg) => Err(msg),
++    }
++}
++
++/// Changes lockout settings (one administrator authentication for all).
++#[tauri::command]
++#[specta::specta]
++pub async fn set_face_lockout(values: Vec<LockoutValue>) -> Result<(), String> {
++    let args = set_args(&values)?;
++    run_blocking(TASK, move || run_tool(&args)).await
++}
++
++/// All lockout settings back to their defaults.
++#[tauri::command]
++#[specta::specta]
++pub async fn reset_face_lockout() -> Result<(), String> {
++    run_blocking(TASK, || run_tool(&["reset-defaults".to_string()])).await
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const KEYS: &str = "\
++run_false_faces 3 1 10 faces false faces after which a run ends (the next on Enter or when the display comes on again)
++free_false_faces 6 0 100 faces false faces since the last success before the first wait
++first_wait 60 0 86400 seconds the first wait, doubled with every further false face; 0: no waits
++";
++
++    #[test]
++    fn parses_keys_with_their_values() {
++        let values = "run_false_faces=4\nfree_false_faces=6\nfirst_wait=0\n";
++        let settings = parse_settings(KEYS, values);
++        assert_eq!(settings.len(), 3);
++        assert_eq!(
++            settings[0],
++            LockoutSetting {
++                key: "run_false_faces".into(),
++                value: 4,
++                default: 3,
++                min: 1,
++                max: 10,
++                unit: "faces".into(),
++                meaning:
++                    "false faces after which a run ends (the next on Enter or when the display \
++                          comes on again)"
++                        .into(),
++            }
++        );
++        assert_eq!(settings[2].value, 0);
++        assert_eq!(settings[2].unit, "seconds");
++    }
++
++    #[test]
++    fn skips_keys_without_a_value_and_bad_lines() {
++        let keys = format!("{KEYS}broken line\nmax_wait x 0 1 seconds bad default\n");
++        let settings = parse_settings(&keys, "run_false_faces=3\nfirst_wait=-1\n");
++        assert_eq!(
++            settings.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
++            vec!["run_false_faces"]
++        );
++    }
++
++    #[test]
++    fn set_takes_pairs_of_plain_keys() {
++        let v = |key: &str, value| LockoutValue {
++            key: key.into(),
++            value,
++        };
++        assert_eq!(
++            set_args(&[v("first_wait", 30), v("off_after", 10)]).unwrap(),
++            vec!["set", "first_wait", "30", "off_after", "10"]
++        );
++        assert!(set_args(&[]).is_err());
++        assert!(set_args(&[v("--help", 1)]).is_err());
++        assert!(set_args(&[v("a b", 1)]).is_err());
++        assert!(set_args(&[v("", 1)]).is_err());
++    }
++
++    #[test]
++    fn exit_codes_have_messages() {
++        assert_eq!(exit_message(Some(0)), None);
++        for code in [126, 127, 2, 1] {
++            let msg = exit_message(Some(code)).unwrap();
++            assert!(!msg.contains("exit code"), "{code}");
++        }
++        assert!(exit_message(Some(9)).unwrap().contains("exit code 9"));
++        assert!(exit_message(None).is_some());
++    }
++
++    #[test]
++    fn reads_through_the_tool() {
++        let dir = tempfile::tempdir().unwrap();
++        let tool = dir.path().join("s15-face");
++        std::fs::write(
++            &tool,
++            format!(
++                "#!/bin/sh\ncase \"$*\" in\n  'lockout keys') printf '%s' '{KEYS}' ;;\n  lockout) printf 'run_false_faces=3\\nfree_false_faces=6\\nfirst_wait=60\\n' ;;\n  'status u') echo 'u: 2 false faces since the last success' ;;\n  *) exit 2 ;;\nesac\n"
++            ),
++        )
++        .unwrap();
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
++        let tool = tool.to_str().unwrap();
++        let lockout = read_lockout(tool, Some("u")).unwrap();
++        assert_eq!(lockout.settings.len(), 3);
++        assert_eq!(
++            lockout.status,
++            vec!["u: 2 false faces since the last success"]
++        );
++        // The status is only shown: without one the settings still load.
++        assert!(read_lockout(tool, Some("other")).unwrap().status.is_empty());
++        assert!(read_lockout("/nonexistent/s15-face", None).is_err());
++    }
++}
+diff --git a/app/src/app/configuration/-components/LockoutCard.tsx b/app/src/app/configuration/-components/LockoutCard.tsx
+new file mode 100644
+index 0000000..9edcb44
+--- /dev/null
++++ b/app/src/app/configuration/-components/LockoutCard.tsx
+@@ -0,0 +1,161 @@
++import { Loader2, RotateCcw, ShieldAlert } from "lucide-react";
++import { useCallback, useEffect, useState } from "react";
++import { toast } from "sonner";
++import { cmd } from "@/commands";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { Label } from "@/components/ui/label";
++import type { FaceLockout } from "@/types/config";
++import { changedValues, invalidInput, TITLES } from "./lockoutInputs";
++
++/**
++ * The lockout of face unlock (snaptop-linux's s15-face): root's settings,
++ * changed with the administrator password (pkexec), never through the
++ * config page's Save. Not shown on systems without it.
++ */
++export function LockoutCard() {
++  const [lockout, setLockout] = useState<FaceLockout | null>(null);
++  const [inputs, setInputs] = useState<Record<string, string>>({});
++  const [busy, setBusy] = useState(false);
++
++  const refresh = useCallback(async () => {
++    try {
++      const next = await cmd.lockout.get();
++      setLockout(next);
++      setInputs(
++        Object.fromEntries(
++          (next?.settings ?? []).map((s) => [s.key, String(s.value)]),
++        ),
++      );
++    } catch (err) {
++      console.error("Failed to read the face unlock lockout:", err);
++    }
++  }, []);
++
++  useEffect(() => {
++    void refresh();
++  }, [refresh]);
++
++  if (!lockout) return null;
++
++  const changes = changedValues(lockout.settings, inputs);
++  const invalid = invalidInput(lockout.settings, inputs);
++
++  async function apply() {
++    if (busy || invalid || changes.length === 0) return;
++    setBusy(true);
++    try {
++      await cmd.lockout.set(changes);
++      toast.success("Face unlock lockout changed.");
++    } catch (err) {
++      toast.error(`Lockout not changed: ${err}`);
++    } finally {
++      setBusy(false);
++      void refresh();
++    }
++  }
++
++  async function resetDefaults() {
++    if (busy) return;
++    setBusy(true);
++    try {
++      await cmd.lockout.resetDefaults();
++      toast.success("Face unlock lockout back to its defaults.");
++    } catch (err) {
++      toast.error(`Lockout not changed: ${err}`);
++    } finally {
++      setBusy(false);
++      void refresh();
++    }
++  }
++
++  const allDefault = lockout.settings.every((s) => s.value === s.default);
++
++  return (
++    <div className="rounded-xl border border-border/50 bg-card/50 backdrop-blur-sm p-6 shadow-lg">
++      <h2 className="text-xl font-semibold mb-1 flex items-center gap-2">
++        <span className="w-8 h-8 rounded-lg bg-linear-to-br from-rose-500 to-red-500 flex items-center justify-center">
++          <ShieldAlert className="w-4 h-4 text-white" />
++        </span>
++        Face Unlock Lockout
++      </h2>
++      <p className="text-xs text-muted-foreground mb-4">
++        A false face is one that was seen but did not match (or anti-spoofing
++        flagged it); no face at all does not count. Counted since the last
++        success, like wrong PINs. These are the system's settings (not your
++        Biopass settings): changing them asks for the administrator password.
++      </p>
++
++      {lockout.status.length > 0 && (
++        <pre className="mb-4 rounded bg-muted p-2 text-[11px] leading-relaxed whitespace-pre-wrap">
++          {lockout.status.join("\n")}
++        </pre>
++      )}
++
++      <div className="grid gap-3">
++        {lockout.settings.map((s) => (
++          <div
++            key={s.key}
++            className="grid grid-cols-[1fr_9rem] items-center gap-4 p-3 rounded-lg border border-border"
++          >
++            <div className="grid gap-0.5">
++              <Label htmlFor={`lockout-${s.key}`} className="text-sm">
++                {TITLES[s.key] ?? s.key}
++              </Label>
++              <p className="text-xs text-muted-foreground">
++                {s.meaning} (default {s.default} {s.unit}, {s.min}-{s.max})
++              </p>
++            </div>
++            <div className="flex items-center gap-2">
++              <Input
++                id={`lockout-${s.key}`}
++                type="number"
++                min={s.min}
++                max={s.max}
++                step={1}
++                value={inputs[s.key] ?? ""}
++                disabled={busy}
++                onChange={(e) =>
++                  setInputs((prev) => ({ ...prev, [s.key]: e.target.value }))
++                }
++                onKeyDown={(e) => {
++                  // Enter applies here; it must not submit the config form.
++                  if (e.key === "Enter") {
++                    e.preventDefault();
++                    void apply();
++                  }
++                }}
++                className="h-9"
++              />
++              <span className="text-xs text-muted-foreground w-12">
++                {s.unit === "seconds" ? "s" : s.unit}
++              </span>
++            </div>
++          </div>
++        ))}
++      </div>
++
++      {invalid && <p className="mt-2 text-xs text-destructive">{invalid}</p>}
++
++      <div className="mt-4 flex justify-end gap-2">
++        <Button
++          type="button"
++          variant="outline"
++          onClick={resetDefaults}
++          disabled={busy || allDefault}
++        >
++          <RotateCcw className="w-4 h-4" />
++          Defaults
++        </Button>
++        <Button
++          type="button"
++          onClick={apply}
++          disabled={busy || !!invalid || changes.length === 0}
++        >
++          {busy && <Loader2 className="w-4 h-4 animate-spin" />}
++          Apply
++        </Button>
++      </div>
++    </div>
++  );
++}
+diff --git a/app/src/app/configuration/-components/lockoutInputs.test.ts b/app/src/app/configuration/-components/lockoutInputs.test.ts
+new file mode 100644
+index 0000000..39ec1ff
+--- /dev/null
++++ b/app/src/app/configuration/-components/lockoutInputs.test.ts
+@@ -0,0 +1,40 @@
++import { describe, expect, test } from "bun:test";
++import type { LockoutSetting } from "@/types/config";
++import { changedValues, invalidInput } from "./lockoutInputs";
++
++function setting(key: string, value: number, min = 0, max = 100) {
++  return {
++    key,
++    value,
++    default: value,
++    min,
++    max,
++    unit: "faces",
++    meaning: "",
++  } satisfies LockoutSetting;
++}
++
++const settings = [
++  setting("run_false_faces", 3, 1, 10),
++  setting("off_after", 15, 1, 100),
++];
++
++describe("lockout inputs", () => {
++  test("only changed values are sent", () => {
++    expect(
++      changedValues(settings, { run_false_faces: "3", off_after: "10" }),
++    ).toEqual([{ key: "off_after", value: 10 }]);
++    expect(changedValues(settings, { run_false_faces: "3" })).toEqual([]);
++  });
++
++  test("whole numbers within the range only", () => {
++    expect(
++      invalidInput(settings, { run_false_faces: "3", off_after: "15" }),
++    ).toBeNull();
++    for (const bad of ["", "0", "11", "2.5", "x"]) {
++      expect(
++        invalidInput(settings, { run_false_faces: bad, off_after: "15" }),
++      ).not.toBeNull();
++    }
++  });
++});
+diff --git a/app/src/app/configuration/-components/lockoutInputs.ts b/app/src/app/configuration/-components/lockoutInputs.ts
+new file mode 100644
+index 0000000..1b6e31d
+--- /dev/null
++++ b/app/src/app/configuration/-components/lockoutInputs.ts
+@@ -0,0 +1,43 @@
++import type { LockoutSetting } from "@/types/config";
++
++/** Short names of the lockout settings (s15-face lockout keys). */
++export const TITLES: Record<string, string> = {
++  run_false_faces: "False faces per run",
++  free_false_faces: "False faces before the first wait",
++  first_wait: "First wait",
++  max_wait: "Longest wait",
++  off_after: "Off after false faces",
++};
++
++/** Settings whose input differs from the value in effect. */
++export function changedValues(
++  settings: readonly LockoutSetting[],
++  inputs: Readonly<Record<string, string>>,
++): { key: string; value: number }[] {
++  return settings.flatMap((s) => {
++    const text = inputs[s.key];
++    if (text === undefined || text.trim() === "") return [];
++    const value = Number(text);
++    return value === s.value ? [] : [{ key: s.key, value }];
++  });
++}
++
++/** An input outside its whole-number range, or null when all are valid. */
++export function invalidInput(
++  settings: readonly LockoutSetting[],
++  inputs: Readonly<Record<string, string>>,
++): string | null {
++  for (const s of settings) {
++    const text = (inputs[s.key] ?? "").trim();
++    const value = Number(text);
++    if (
++      text === "" ||
++      !Number.isInteger(value) ||
++      value < s.min ||
++      value > s.max
++    ) {
++      return `${TITLES[s.key] ?? s.key}: a whole number from ${s.min} to ${s.max}`;
++    }
++  }
++  return null;
++}
+diff --git a/app/src/app/configuration/page.tsx b/app/src/app/configuration/page.tsx
+index bda7f44..8632447 100644
+--- a/app/src/app/configuration/page.tsx
++++ b/app/src/app/configuration/page.tsx
+@@ -16,6 +16,7 @@ import {
+ } from "./-components/face/savedSettings";
+ import { withStablePaths } from "./-components/face/selectValue";
+ import { KeyringCard } from "./-components/KeyringCard";
++import { LockoutCard } from "./-components/LockoutCard";
+ import { MethodConfig } from "./-components/MethodConfig";
+ import { StrategyConfig } from "./-components/StrategyConfig";
+ import { biopassConfigSchema, validateConfig } from "./-components/validation";
+@@ -211,6 +212,7 @@ function ConfigurationForm({
+           <div className="grid gap-6">
+             <StrategyConfig />
+             <MethodConfig />
++            <LockoutCard />
+             <KeyringCard />
+           </div>
+         </form>
+diff --git a/app/src/bindings.ts b/app/src/bindings.ts
+index b0d3660..8c7b4cc 100644
+--- a/app/src/bindings.ts
++++ b/app/src/bindings.ts
+@@ -52,6 +52,12 @@ export const commands = {
+ 	getKeyringStatus: () => __TAURI_INVOKE<KeyringStatus_Serialize>("get_keyring_status"),
+ 	saveKeyringPassword: (password: string, bindPcr7: boolean) => __TAURI_INVOKE<null>("save_keyring_password", { password, bindPcr7 }),
+ 	forgetKeyringPassword: () => __TAURI_INVOKE<null>("forget_keyring_password"),
++	/**  The lockout settings, None when this system has no s15-face. */
++	getFaceLockout: () => __TAURI_INVOKE<FaceLockout | null>("get_face_lockout"),
++	/**  Changes lockout settings (one administrator authentication for all). */
++	setFaceLockout: (values: LockoutValue[]) => __TAURI_INVOKE<null>("set_face_lockout", { values }),
++	/**  All lockout settings back to their defaults. */
++	resetFaceLockout: () => __TAURI_INVOKE<null>("reset_face_lockout"),
+ };
+ 
+ /* Constants */
+@@ -228,6 +234,15 @@ export type FaceDir =
+  */
+ "faces-rgb";
+ 
++export type FaceLockout = {
++	settings: LockoutSetting[],
++	/**
++	 *  `s15-face status <user>`: the user's false faces since the last
++	 *  success, whether face unlock is allowed now, the mode.
++	 */
++	status: string[],
++};
++
+ export type FaceMethodConfig = FaceMethodConfig_Serialize | FaceMethodConfig_Deserialize;
+ 
+ export type FaceMethodConfig_Deserialize = {
+@@ -332,6 +347,22 @@ export type KeyringStatus_Serialize = {
+ 	pcr7: boolean | null,
+ };
+ 
++export type LockoutSetting = {
++	key: string,
++	value: number,
++	default: number,
++	min: number,
++	max: number,
++	/**  "faces" or "seconds". */
++	unit: string,
++	meaning: string,
++};
++
++export type LockoutValue = {
++	key: string,
++	value: number,
++};
++
+ export type MethodsConfig = MethodsConfig_Serialize | MethodsConfig_Deserialize;
+ 
+ export type MethodsConfig_Deserialize = {
+diff --git a/app/src/commands/index.ts b/app/src/commands/index.ts
+index d995b1f..cc928fd 100644
+--- a/app/src/commands/index.ts
++++ b/app/src/commands/index.ts
+@@ -3,6 +3,7 @@ import { face } from "./face";
+ import { file } from "./file";
+ import { fingerprint } from "./fingerprint";
+ import { keyring } from "./keyring";
++import { lockout } from "./lockout";
+ import { models } from "./models";
+ import { system } from "./system";
+ 
+@@ -12,6 +13,7 @@ export const cmd = {
+   file,
+   fingerprint,
+   keyring,
++  lockout,
+   models,
+   system,
+ };
+diff --git a/app/src/commands/lockout.ts b/app/src/commands/lockout.ts
+new file mode 100644
+index 0000000..e64f373
+--- /dev/null
++++ b/app/src/commands/lockout.ts
+@@ -0,0 +1,21 @@
++import { commands, type LockoutValue } from "@/bindings";
++
++/** The face unlock lockout (s15-face), null on systems without it. */
++function get() {
++  return commands.getFaceLockout();
++}
++
++/** Changes settings through pkexec (administrator password). */
++async function set(values: LockoutValue[]): Promise<void> {
++  await commands.setFaceLockout(values);
++}
++
++async function resetDefaults(): Promise<void> {
++  await commands.resetFaceLockout();
++}
++
++export const lockout = {
++  get,
++  set,
++  resetDefaults,
++};
+diff --git a/app/src/types/config.ts b/app/src/types/config.ts
+index 9ad8b53..69806a3 100644
+--- a/app/src/types/config.ts
++++ b/app/src/types/config.ts
+@@ -12,9 +12,11 @@ export type {
+   CameraInfo,
+   ExecutionMode,
+   FaceDir,
++  FaceLockout,
+   FaceScore,
+   FaceSet,
+   FacesMoved,
++  LockoutSetting,
+   ModelTask,
+   ScanOutcome,
+   VideoDeviceInfo,
+-- 
+2.43.0
+

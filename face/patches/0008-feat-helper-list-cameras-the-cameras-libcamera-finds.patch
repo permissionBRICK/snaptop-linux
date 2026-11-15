@@ -1,0 +1,244 @@
+From 3cd105a72eab44a167bead355de31e91e00053a2 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:12:57 +0000
+Subject: [PATCH] feat(helper): list-cameras, the cameras libcamera finds by id
+
+Platform cameras behind one CSI-2 receiver (e.g. Qualcomm CAMSS on
+Snapdragon laptops) share all their /dev/video nodes, so the app's
+device list cannot tell an IR sensor from the colour sensor next to it:
+only libcamera's camera id names one (config.yaml's `camera` and
+`anti_spoofing.ir_camera` already take it, see findCameraByPath).
+
+`biopass-helper list-cameras` prints one line per camera: id, `mono` or
+`colour` (a sensor without colour filters, as libcamera reports it: an
+IR camera), its video nodes and its model, tab-separated
+(face/common/camera_list.h). CameraDeviceInfo carries the mono flag.
+Test: camera_list.
+---
+ auth/CMakeLists.txt                  |  1 +
+ auth/face/common/camera_capture.cc   |  1 +
+ auth/face/common/camera_capture.h    |  5 ++-
+ auth/face/common/camera_list.h       | 40 +++++++++++++++++++++++
+ auth/pam/helper.cc                   | 19 +++++++++++
+ auth/test/camera_list/CMakeLists.txt | 10 ++++++
+ auth/test/camera_list/main.cpp       | 49 ++++++++++++++++++++++++++++
+ 7 files changed, 124 insertions(+), 1 deletion(-)
+ create mode 100644 auth/face/common/camera_list.h
+ create mode 100644 auth/test/camera_list/CMakeLists.txt
+ create mode 100644 auth/test/camera_list/main.cpp
+
+diff --git a/auth/CMakeLists.txt b/auth/CMakeLists.txt
+index 439cc8c..8388940 100644
+--- a/auth/CMakeLists.txt
++++ b/auth/CMakeLists.txt
+@@ -92,6 +92,7 @@ if(BUILD_TESTS)
+     add_subdirectory(test/keyring_store)
+     add_subdirectory(test/keyring_tpm)
+     add_subdirectory(test/runpath)
++    add_subdirectory(test/camera_list)
+ endif()
+ 
+ install(
+diff --git a/auth/face/common/camera_capture.cc b/auth/face/common/camera_capture.cc
+index 34c43d0..77524a8 100644
+--- a/auth/face/common/camera_capture.cc
++++ b/auth/face/common/camera_capture.cc
+@@ -967,6 +967,7 @@ std::vector<CameraDeviceInfo> listCameraDevices() {
+     const auto model = camera->properties().get(libcamera::properties::Model);
+     info.model = model ? std::string(*model) : info.id;
+     info.video_paths = videoPathsForCamera(*camera);
++    info.mono = isMonoCamera(*camera);
+     result.push_back(std::move(info));
+   }
+   return result;
+diff --git a/auth/face/common/camera_capture.h b/auth/face/common/camera_capture.h
+index e9205b1..335eb24 100644
+--- a/auth/face/common/camera_capture.h
++++ b/auth/face/common/camera_capture.h
+@@ -43,11 +43,14 @@ ImageRGB captureImageByIRCamera(const std::string& device_path,
+                                 int warmup_frames = kIrCaptureWarmupFrames,
+                                 int capture_timeout_ms = kIrCaptureTimeoutMs);
+ 
+-// Used by camera_capture_test for field debugging.
++// Used by camera_capture_test for field debugging, and by `biopass-helper
++// list-cameras` for the app's camera pickers (face/common/camera_list.h).
+ struct CameraDeviceInfo {
+   std::string id;
+   std::string model;
+   std::vector<std::string> video_paths;
++  // A sensor without colour filters (an IR camera), as libcamera reports it.
++  bool mono = false;
+ };
+ std::vector<CameraDeviceInfo> listCameraDevices();
+ 
+diff --git a/auth/face/common/camera_list.h b/auth/face/common/camera_list.h
+new file mode 100644
+index 0000000..0305b73
+--- /dev/null
++++ b/auth/face/common/camera_list.h
+@@ -0,0 +1,40 @@
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "camera_capture.h"
++
++namespace biopass {
++
++// One line per camera for `biopass-helper list-cameras`, read by the app:
++//   <id> TAB <mono|colour> TAB <video paths, space-separated> TAB <model> NL
++// The id is what config.yaml's `camera` and `anti_spoofing.ir_camera` take
++// (findCameraByPath accepts it): platform cameras behind one CSI-2 receiver
++// can share all their video nodes, so only the id names one of them. Tabs
++// and line breaks inside a field become spaces, so every line has 4 fields.
++inline std::string formatCameraList(const std::vector<CameraDeviceInfo>& cameras) {
++  const auto clean = [](std::string text) {
++    for (char& c : text) {
++      if (c == '\t' || c == '\n' || c == '\r') {
++        c = ' ';
++      }
++    }
++    return text;
++  };
++  std::string out;
++  for (const auto& camera : cameras) {
++    std::string paths;
++    for (const auto& path : camera.video_paths) {
++      if (!paths.empty()) {
++        paths += ' ';
++      }
++      paths += clean(path);
++    }
++    out += clean(camera.id) + '\t' + (camera.mono ? "mono" : "colour") + '\t' + paths + '\t' +
++           clean(camera.model) + '\n';
++  }
++  return out;
++}
++
++}  // namespace biopass
+diff --git a/auth/pam/helper.cc b/auth/pam/helper.cc
+index 66bc318..302297f 100644
+--- a/auth/pam/helper.cc
++++ b/auth/pam/helper.cc
+@@ -26,6 +26,7 @@
+ #include "auth_manager.h"
+ #include "authtok_channel.h"
+ #include "common/camera_capture.h"
++#include "common/camera_list.h"
+ #include "detection/face_detection.h"
+ #include "face_auth.h"
+ #include "fingerprint_auth.h"
+@@ -322,6 +323,16 @@ int previewSession(const std::string& cameraPath, const std::string& modelPath,
+   return 0;
+ }
+ 
++// The cameras libcamera finds, one line each (face/common/camera_list.h),
++// for the app's camera pickers. Only libcamera's own errors go to stderr.
++int listCameras() {
++  spdlog::set_default_logger(std::make_shared<spdlog::logger>(
++      "biopass", std::make_shared<spdlog::sinks::stderr_sink_mt>()));
++  spdlog::set_level(spdlog::level::err);
++  std::cout << biopass::formatCameraList(biopass::listCameraDevices()) << std::flush;
++  return 0;
++}
++
+ biopass::HelperExit authenticate(const std::string& username, const std::string& service,
+                                  bool verbose, uint32_t keep_looking_ms) {
+   using biopass::HelperExit;
+@@ -399,6 +410,10 @@ int main(int argc, char** argv) {
+   preview_cmd->add_option("--quality,-q", previewQuality,
+                           "JPEG encoding quality 1-100 (default 70)");
+ 
++  auto list_cameras_cmd = app.add_subcommand(
++      "list-cameras",
++      "List the cameras libcamera finds: id, mono or colour, video nodes, model (tab-separated)");
++
+   std::string username;
+   std::string pamService;
+   int statusFd = -1;
+@@ -442,6 +457,10 @@ int main(int argc, char** argv) {
+     return previewSession(previewCameraPath, previewModelPath, previewQuality);
+   }
+ 
++  if (app.got_subcommand(list_cameras_cmd)) {
++    return listCameras();
++  }
++
+   if (app.got_subcommand(auth_cmd)) {
+     // spdlog's default logger writes to stdout, which belongs to the PAM
+     // caller (see setupBiopassLogger). Silence it before anything can log;
+diff --git a/auth/test/camera_list/CMakeLists.txt b/auth/test/camera_list/CMakeLists.txt
+new file mode 100644
+index 0000000..7ccfa83
+--- /dev/null
++++ b/auth/test/camera_list/CMakeLists.txt
+@@ -0,0 +1,10 @@
++set(CAMERA_LIST_TEST camera_list_test)
++
++add_executable(${CAMERA_LIST_TEST} main.cpp)
++
++target_include_directories(${CAMERA_LIST_TEST} PRIVATE
++    ${CMAKE_SOURCE_DIR}/face
++    ${CMAKE_SOURCE_DIR}/face/common
++)
++
++add_test(NAME camera_list COMMAND ${CAMERA_LIST_TEST})
+diff --git a/auth/test/camera_list/main.cpp b/auth/test/camera_list/main.cpp
+new file mode 100644
+index 0000000..70f6292
+--- /dev/null
++++ b/auth/test/camera_list/main.cpp
+@@ -0,0 +1,49 @@
++// Checks the line format of `biopass-helper list-cameras`
++// (face/common/camera_list.h), which the app parses (cameras.rs). Exits
++// non-zero on any failure.
++
++#include <cstdio>
++#include <string>
++
++#include "common/camera_list.h"
++
++namespace {
++
++int g_failures = 0;
++
++void expect(bool cond, const char* what) {
++  std::printf("[%s] %s\n", cond ? "PASS" : "FAIL", what);
++  if (!cond) {
++    g_failures++;
++  }
++}
++
++}  // namespace
++
++int main() {
++  using biopass::CameraDeviceInfo;
++  using biopass::formatCameraList;
++
++  expect(formatCameraList({}).empty(), "no cameras: no lines");
++
++  CameraDeviceInfo ir{"/base/soc@0/cci@ac15000/i2c-bus@0/camera@24",
++                      "hm1092",
++                      {"/dev/video0", "/dev/video1"},
++                      true};
++  CameraDeviceInfo colour{"/base/soc@0/cci@ac16000/i2c-bus@1/camera@36", "ov02c10", {}, false};
++  expect(formatCameraList({ir, colour}) ==
++             "/base/soc@0/cci@ac15000/i2c-bus@0/camera@24\tmono\t/dev/video0 /dev/video1\thm1092\n"
++             "/base/soc@0/cci@ac16000/i2c-bus@1/camera@36\tcolour\t\tov02c10\n",
++         "id, mono or colour, video paths, model");
++
++  CameraDeviceInfo odd{"usb\tcam", "Integrated\nCamera", {"/dev/video\t2"}, false};
++  expect(formatCameraList({odd}) == "usb cam\tcolour\t/dev/video 2\tIntegrated Camera\n",
++         "tabs and line breaks in fields become spaces");
++
++  if (g_failures != 0) {
++    std::printf("%d FAILED\n", g_failures);
++    return 1;
++  }
++  std::printf("ALL PASS\n");
++  return 0;
++}
+-- 
+2.43.0
+

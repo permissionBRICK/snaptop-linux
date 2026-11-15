@@ -1,0 +1,4119 @@
+From 73d2b16b87e077a889f546e0c80a9d40a796c3be Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:16:13 +0000
+Subject: [PATCH] feat(app): cameras by libcamera id, IR/colour/both modes,
+ every camera's faces, test scan
+
+For laptops whose IR and colour cameras sit behind one CSI-2 receiver
+(Snapdragon X: they share all their /dev/video nodes) face login can
+now be set up in the app alone:
+
+- Cameras: the camera pickers list libcamera's cameras by id
+  (biopass-helper list-cameras; IR = monochrome sensor), then video
+  devices that belong to none of them. A mode sets `camera`,
+  `anti_spoofing.ir_camera` and `ir_recognition`: ir (the IR camera
+  recognises; AI anti-spoofing off, its models are trained on colour
+  pictures), rgb (colour recognises, IR presence check), both (each
+  recognises against its own faces). Choosing one writes a minimum face
+  size of 0.2 and a threshold of 0.6 where the settings have none or a
+  looser one. The settings page edits these fields and never writes
+  camera profiles any more; profiles of an earlier save are read as
+  the camera settings and replaced on save. The minimum face size has
+  a slider, the threshold a hint.
+- Faces: each camera keeps its own (faces/ the main camera's, faces-ir/
+  the IR camera's while the colour camera is the main one, faces-rgb/
+  the colour camera's while the IR camera is). Saving a change between
+  the IR and the colour camera as the main camera moves them
+  (face::move_faces_for_main_camera) and says so. The page lists every
+  directory, labelled by camera and whether this mode uses it, with
+  delete and delete all (re-enrolling). Enrolment uses the saved
+  settings' cameras: in both mode each picture is a pair, the colour
+  camera's into faces/ and the IR camera's into faces-ir/ (the preview
+  switches cameras: they stream one at a time); "Add 5" takes five,
+  two seconds apart. The preview restarts on another camera.
+- Test: one `biopass-helper auth --verbose --keep-looking 6000` with the
+  saved settings shows the outcome (match, no match, no face, not
+  tried), the steps (face size against the minimum, scores) and each
+  compared face's best score on its picture, red when not above the
+  threshold: faces that do not score well against the user are easy to
+  find and replace. The asset scope adds faces-ir/ and faces-rgb/.
+Tests: cameras, face (sets, moves, deletes), scan (steps, scores),
+config, webview_security, faceMode.test.ts, selectValue.test.ts.
+---
+ app/src-tauri/src/bindings.rs                 |   5 +-
+ app/src-tauri/src/cameras.rs                  | 144 ++++++++
+ app/src-tauri/src/config.rs                   |  78 +++-
+ app/src-tauri/src/face.rs                     | 284 ++++++++++++++-
+ app/src-tauri/src/face_session.rs             | 107 ++++--
+ app/src-tauri/src/lib.rs                      |   2 +
+ app/src-tauri/src/paths.rs                    |   2 +-
+ app/src-tauri/src/scan.rs                     | 333 ++++++++++++++++++
+ app/src-tauri/tauri.conf.json                 |   6 +-
+ app/src-tauri/tests/webview_security.rs       |  12 +-
+ .../-components/face/AntiSpoofingSection.tsx  |  13 +
+ .../face/CameraProfilesSection.tsx            | 225 ------------
+ .../-components/face/CameraSelect.tsx         |  83 +++++
+ .../-components/face/CamerasSection.tsx       | 226 ++++++++++++
+ .../-components/face/FaceCapture.tsx          | 147 --------
+ .../-components/face/FaceEnrolment.tsx        | 199 +++++++++++
+ .../-components/face/FaceModelsSection.tsx    |  14 +
+ .../-components/face/FaceSets.tsx             | 188 ++++++++++
+ .../-components/face/FaceSetting.tsx          |  98 +++++-
+ .../-components/face/TestScan.tsx             |  96 +++++
+ .../-components/face/VideoDeviceSelect.tsx    | 103 ------
+ .../-components/face/faceMode.test.ts         | 240 +++++++++++++
+ .../-components/face/faceMode.ts              | 199 +++++++++++
+ .../-components/face/savedSettings.tsx        |  23 ++
+ .../-components/face/selectValue.test.ts      |  15 +
+ .../-components/face/selectValue.ts           |  12 +-
+ .../-components/face/useCameras.ts            |  80 +++++
+ .../-components/face/useFaceImages.ts         |  48 ---
+ .../-components/face/useFaceSets.ts           |  23 ++
+ .../-components/face/useVideoDevices.ts       |  22 --
+ .../configuration/-components/validation.ts   |  49 ++-
+ app/src/app/configuration/page.tsx            | 128 ++++---
+ app/src/bindings.ts                           | 142 +++++++-
+ app/src/commands/config.ts                    |   6 +-
+ app/src/commands/face.ts                      |  28 +-
+ app/src/types/config.ts                       |   8 +
+ 36 files changed, 2714 insertions(+), 674 deletions(-)
+ create mode 100644 app/src-tauri/src/cameras.rs
+ create mode 100644 app/src-tauri/src/scan.rs
+ delete mode 100644 app/src/app/configuration/-components/face/CameraProfilesSection.tsx
+ create mode 100644 app/src/app/configuration/-components/face/CameraSelect.tsx
+ create mode 100644 app/src/app/configuration/-components/face/CamerasSection.tsx
+ delete mode 100644 app/src/app/configuration/-components/face/FaceCapture.tsx
+ create mode 100644 app/src/app/configuration/-components/face/FaceEnrolment.tsx
+ create mode 100644 app/src/app/configuration/-components/face/FaceSets.tsx
+ create mode 100644 app/src/app/configuration/-components/face/TestScan.tsx
+ delete mode 100644 app/src/app/configuration/-components/face/VideoDeviceSelect.tsx
+ create mode 100644 app/src/app/configuration/-components/face/faceMode.test.ts
+ create mode 100644 app/src/app/configuration/-components/face/faceMode.ts
+ create mode 100644 app/src/app/configuration/-components/face/savedSettings.tsx
+ create mode 100644 app/src/app/configuration/-components/face/useCameras.ts
+ delete mode 100644 app/src/app/configuration/-components/face/useFaceImages.ts
+ create mode 100644 app/src/app/configuration/-components/face/useFaceSets.ts
+ delete mode 100644 app/src/app/configuration/-components/face/useVideoDevices.ts
+
+diff --git a/app/src-tauri/src/bindings.rs b/app/src-tauri/src/bindings.rs
+index d62eb2e..863964c 100644
+--- a/app/src-tauri/src/bindings.rs
++++ b/app/src-tauri/src/bindings.rs
+@@ -5,7 +5,7 @@
+ use tauri_specta::{collect_commands, Builder, ErrorHandlingMode};
+ 
+ use crate::config::{self, CONFIG_LIMITS};
+-use crate::{face, face_session, fingerprint, keyring, models, system};
++use crate::{cameras, face, face_session, fingerprint, keyring, models, scan, system};
+ 
+ pub fn builder() -> Builder<tauri::Wry> {
+     Builder::<tauri::Wry>::new()
+@@ -18,8 +18,11 @@ pub fn builder() -> Builder<tauri::Wry> {
+             face_session::stop_face_preview,
+             face_session::capture_face_in_session,
+             face::list_faces,
++            face::list_face_sets,
+             system::list_video_devices,
++            cameras::list_cameras,
+             face::delete_face,
++            scan::test_face_scan,
+             fingerprint::enroll_fingerprint,
+             fingerprint::remove_fingerprint,
+             fingerprint::list_enrolled_fingerprints,
+diff --git a/app/src-tauri/src/cameras.rs b/app/src-tauri/src/cameras.rs
+new file mode 100644
+index 0000000..52447ce
+--- /dev/null
++++ b/app/src-tauri/src/cameras.rs
+@@ -0,0 +1,144 @@
++//! The cameras libcamera finds, by id (`biopass-helper list-cameras`). Platform
++//! cameras behind one CSI-2 receiver (e.g. Qualcomm CAMSS on Snapdragon
++//! laptops) share all their /dev/video nodes, so only libcamera's id tells
++//! them apart; config.yaml's `camera` and `anti_spoofing.ir_camera` take it.
++
++use std::io::Read;
++use std::process::{Command, Stdio};
++use std::time::{Duration, Instant};
++
++use serde::Serialize;
++
++use crate::blocking::run_blocking;
++use crate::face_session::helper_path;
++
++const TASK: &str = "Cameras";
++// Starting libcamera's camera manager takes well under a second; a stuck
++// helper must not hang the settings page.
++const LIST_TIMEOUT: Duration = Duration::from_secs(15);
++const MAX_OUTPUT: u64 = 64 * 1024;
++
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct CameraInfo {
++    /// What config.yaml saves, e.g. "/base/soc@0/cci@ac15000/i2c-bus@0/camera@24".
++    pub id: String,
++    /// The sensor's model, e.g. "hm1092"; the id when libcamera has none.
++    pub model: String,
++    /// A sensor without colour filters: an IR camera.
++    pub mono: bool,
++    /// The /dev/video nodes it streams through (several cameras may share them).
++    pub video_paths: Vec<String>,
++}
++
++/// Lines of `biopass-helper list-cameras` (auth/face/common/camera_list.h):
++/// id TAB mono|colour TAB video paths TAB model. Other lines are skipped.
++fn parse_camera_list(text: &str) -> Vec<CameraInfo> {
++    text.lines()
++        .filter_map(|line| {
++            let mut fields = line.splitn(4, '\t');
++            let id = fields.next()?.trim();
++            let kind = fields.next()?;
++            let paths = fields.next()?;
++            let model = fields.next()?.trim();
++            let mono = match kind {
++                "mono" => true,
++                "colour" => false,
++                _ => return None,
++            };
++            (!id.is_empty()).then(|| CameraInfo {
++                id: id.to_string(),
++                model: if model.is_empty() { id } else { model }.to_string(),
++                mono,
++                video_paths: paths.split_whitespace().map(String::from).collect(),
++            })
++        })
++        .collect()
++}
++
++fn run_list(helper: &str) -> Result<String, String> {
++    let mut child = Command::new(helper)
++        .arg("list-cameras")
++        .stdin(Stdio::null())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .map_err(|e| format!("Failed to start {helper}: {e}"))?;
++    let stdout = child.stdout.take().ok_or("missing stdout")?;
++    let reader = std::thread::spawn(move || {
++        let mut text = String::new();
++        let _ = stdout.take(MAX_OUTPUT).read_to_string(&mut text);
++        text
++    });
++    let deadline = Instant::now() + LIST_TIMEOUT;
++    let status = loop {
++        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
++            break status;
++        }
++        if Instant::now() >= deadline {
++            let _ = child.kill();
++            let _ = child.wait();
++            return Err("Listing the cameras timed out".to_string());
++        }
++        std::thread::sleep(Duration::from_millis(50));
++    };
++    let text = reader.join().unwrap_or_default();
++    if !status.success() {
++        return Err(format!("biopass-helper list-cameras failed ({status})"));
++    }
++    Ok(text)
++}
++
++#[tauri::command]
++#[specta::specta]
++pub async fn list_cameras() -> Result<Vec<CameraInfo>, String> {
++    run_blocking(TASK, || Ok(parse_camera_list(&run_list(&helper_path())?))).await
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_the_helpers_lines() {
++        let text = "/base/cam@24\tmono\t/dev/video0 /dev/video1\thm1092\n\
++                    /base/cam@36\tcolour\t\tov02c10\n";
++        assert_eq!(
++            parse_camera_list(text),
++            vec![
++                CameraInfo {
++                    id: "/base/cam@24".into(),
++                    model: "hm1092".into(),
++                    mono: true,
++                    video_paths: vec!["/dev/video0".into(), "/dev/video1".into()],
++                },
++                CameraInfo {
++                    id: "/base/cam@36".into(),
++                    model: "ov02c10".into(),
++                    mono: false,
++                    video_paths: vec![],
++                },
++            ]
++        );
++    }
++
++    #[test]
++    fn skips_lines_that_are_not_cameras() {
++        let text = "[0:00:01] ERROR V4L2 noise\n\
++                    id-only\n\
++                    cam\tgrey\t\tmodel\n\
++                    \tcolour\t\tno id\n\
++                    usb-cam\tcolour\t/dev/video4\t\n";
++        let cams = parse_camera_list(text);
++        assert_eq!(cams.len(), 1);
++        // No model: the id stands in.
++        assert_eq!(cams[0].model, "usb-cam");
++        // A model may contain tabs after the third field.
++        assert_eq!(parse_camera_list("a\tmono\t\tX\tY\n")[0].model, "X\tY");
++    }
++
++    #[test]
++    fn a_helper_that_fails_is_an_error() {
++        assert!(run_list("/bin/false").is_err());
++        assert!(run_list("/nonexistent/biopass-helper").is_err());
++    }
++}
+diff --git a/app/src-tauri/src/config.rs b/app/src-tauri/src/config.rs
+index a6a5e15..7813862 100644
+--- a/app/src-tauri/src/config.rs
++++ b/app/src-tauri/src/config.rs
+@@ -5,7 +5,8 @@ use std::io::Write;
+ use std::path::Path;
+ use tauri::AppHandle;
+ 
+-use crate::paths::{ensure_private_dir, get_config_dir, get_config_path};
++use crate::face::{move_faces_for_main_camera, FacesMoved};
++use crate::paths::{ensure_private_dir, get_config_dir, get_config_path, get_data_dir};
+ 
+ /// Bump on incompatible config.yaml changes. Keep in sync with
+ /// CURRENT_SCHEMA_VERSION in auth/core/auth_config.h.
+@@ -356,17 +357,44 @@ fn read_config_file(path: &Path) -> Result<BiopassConfig, String> {
+     parse_config(&content).map_err(|e| format!("{}: {}", path.display(), e))
+ }
+ 
++/// What save_config did besides writing config.yaml.
++#[derive(Debug, Serialize, Clone, PartialEq, Type)]
++pub struct SaveOutcome {
++    /// The enrolled faces moved because the main camera changed between the
++    /// IR camera and another one (see face::move_faces_for_main_camera).
++    pub faces_moved: Option<FacesMoved>,
++}
++
+ /// Writes `config` into config.yaml, keeping every value of the file that
+ /// `config` has no field for (settings of a newer helper, of other tools,
+-/// or added by hand), see merged_yaml.
++/// or added by hand), see merged_yaml. When the main camera changes between
++/// the IR camera and another one, the enrolled faces move with it (faces/
++/// always holds the main camera's).
+ #[tauri::command]
+ #[specta::specta]
+-pub fn save_config(app: AppHandle, config: BiopassConfig) -> Result<(), String> {
++pub fn save_config(app: AppHandle, config: BiopassConfig) -> Result<SaveOutcome, String> {
+     let config_path = get_config_path(&app)?;
+     let old = read_optional(&config_path)?;
+     let yaml_content = merged_yaml(old.as_deref(), &config)
+         .map_err(|e| format!("{}: {}", config_path.display(), e))?;
+-    write_config_file(&app, &yaml_content)
++    let was_ir_main = old
++        .as_deref()
++        .and_then(|text| parse_config(text).ok())
++        .is_some_and(|old| main_camera_is_ir(&old.methods.face));
++    write_config_file(&app, &yaml_content)?;
++
++    let now_ir_main = main_camera_is_ir(&config.methods.face);
++    let faces_moved = if was_ir_main == now_ir_main {
++        None
++    } else {
++        let data_dir = get_data_dir(&app)?;
++        Some(
++            move_faces_for_main_camera(&data_dir, now_ir_main).map_err(|e| {
++                format!("Settings saved, but the enrolled faces were not moved: {e}")
++            })?,
++        )
++    };
++    Ok(SaveOutcome { faces_moved })
+ }
+ 
+ /// The file's text, None when there is none.
+@@ -431,6 +459,26 @@ fn merge_value(into: &mut yaml_serde::Value, from: yaml_serde::Value) {
+     }
+ }
+ 
++/// Whether `face`'s main camera is its IR camera (the IR camera recognises):
++/// then faces/ holds IR faces. With camera profiles, the first one's cameras
++/// (an older save of the app).
++pub fn main_camera_is_ir(face: &FaceMethodConfig) -> bool {
++    let (main, ir) = match face.camera_profiles.first() {
++        Some(profile) => (
++            profile.camera.as_deref(),
++            profile
++                .ir_camera
++                .as_deref()
++                .or(face.anti_spoofing.ir_camera.as_deref()),
++        ),
++        None => (
++            face.camera.as_deref(),
++            face.anti_spoofing.ir_camera.as_deref(),
++        ),
++    };
++    matches!((main, ir), (Some(main), Some(ir)) if !main.is_empty() && main == ir)
++}
++
+ /// Returns `content` (None: no config yet) with only `appearance` changed.
+ /// Works on the raw YAML so the user's other values, including fields this
+ /// app doesn't know, are kept. Errors instead of replacing a config it can't
+@@ -977,6 +1025,28 @@ mod tests {
+         assert!(face.anti_spoofing.ir_recognition);
+     }
+ 
++    #[test]
++    fn main_camera_is_ir_when_camera_is_the_ir_camera() {
++        let mut face = get_default_config().methods.face;
++        assert!(!main_camera_is_ir(&face));
++        face.anti_spoofing.ir_camera = Some("ir".to_string());
++        assert!(!main_camera_is_ir(&face));
++        face.camera = Some("colour".to_string());
++        assert!(!main_camera_is_ir(&face));
++        face.camera = Some("ir".to_string());
++        assert!(main_camera_is_ir(&face));
++        // An older save: the first profile's cameras decide.
++        face.camera_profiles = vec![CameraProfile {
++            camera: Some("colour".to_string()),
++            ir_camera: Some("ir".to_string()),
++            allow_without_ir: false,
++        }];
++        assert!(!main_camera_is_ir(&face));
++        face.camera_profiles[0].camera = Some("ir".to_string());
++        face.camera_profiles[0].ir_camera = None;
++        assert!(main_camera_is_ir(&face));
++    }
++
+     #[test]
+     fn set_appearance_changes_only_appearance() {
+         let yaml = yaml_serde::to_string(&custom_config()).unwrap() + "added_later: 1\n";
+diff --git a/app/src-tauri/src/face.rs b/app/src-tauri/src/face.rs
+index 01329ef..d6d78e8 100644
+--- a/app/src-tauri/src/face.rs
++++ b/app/src-tauri/src/face.rs
+@@ -1,9 +1,73 @@
++use serde::{Deserialize, Serialize};
+ use std::fs;
+ use std::os::unix::ffi::OsStrExt;
+ use std::path::{Path, PathBuf};
+ use tauri::AppHandle;
+ 
+-use crate::paths::get_faces_dir;
++use crate::paths::{ensure_private_dir, get_data_dir, get_faces_dir};
++
++/// A directory of enrolled faces in the data dir. Faces match only the
++/// camera that took them, so each camera keeps its own:
++#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, specta::Type)]
++pub enum FaceDir {
++    /// faces/: the main camera's (`camera`), which the helper matches.
++    #[serde(rename = "faces")]
++    Main,
++    /// faces-ir/: the IR camera's while another camera is the main one; the
++    /// helper matches them with `anti_spoofing.ir_recognition`.
++    #[serde(rename = "faces-ir")]
++    Ir,
++    /// faces-rgb/: the colour camera's, kept aside while the IR camera is the
++    /// main one; the helper never reads them.
++    #[serde(rename = "faces-rgb")]
++    Colour,
++}
++
++impl FaceDir {
++    pub const ALL: [FaceDir; 3] = [FaceDir::Main, FaceDir::Ir, FaceDir::Colour];
++
++    pub fn name(self) -> &'static str {
++        match self {
++            FaceDir::Main => "faces",
++            FaceDir::Ir => "faces-ir",
++            FaceDir::Colour => "faces-rgb",
++        }
++    }
++
++    pub fn path_in(self, data_dir: &Path) -> PathBuf {
++        data_dir.join(self.name())
++    }
++}
++
++/// The face images in one face directory.
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct FaceSet {
++    pub dir: FaceDir,
++    pub paths: Vec<String>,
++}
++
++/// Every face directory with its images (empty when it is missing), in
++/// FaceDir::ALL's order.
++#[tauri::command]
++#[specta::specta]
++pub fn list_face_sets(app: AppHandle) -> Result<Vec<FaceSet>, String> {
++    face_sets_in(&get_data_dir(&app)?)
++}
++
++fn face_sets_in(data_dir: &Path) -> Result<Vec<FaceSet>, String> {
++    FaceDir::ALL
++        .into_iter()
++        .map(|dir| {
++            let path = dir.path_in(data_dir);
++            let paths = if path.exists() {
++                face_files_in(&path)?
++            } else {
++                Vec::new()
++            };
++            Ok(FaceSet { dir, paths })
++        })
++        .collect()
++}
+ 
+ #[tauri::command]
+ #[specta::specta]
+@@ -30,14 +94,106 @@ fn face_files_in(faces_dir: &Path) -> Result<Vec<String>, String> {
+     Ok(files)
+ }
+ 
++/// Deletes a face image of any face directory (see FaceDir).
+ #[tauri::command]
+ #[specta::specta]
+ pub fn delete_face(app: AppHandle, path: String) -> Result<(), String> {
+-    let faces_dir = get_faces_dir(&app)?;
+-    let target = resolve_face_file(&faces_dir, Path::new(&path))?;
++    let data_dir = get_data_dir(&app)?;
++    let target = resolve_in_face_dirs(&data_dir, Path::new(&path))?;
+     fs::remove_file(&target).map_err(|e| format!("Failed to delete file: {}", e))
+ }
+ 
++/// `path` when it names a face image directly inside one of the face
++/// directories (see resolve_face_file).
++fn resolve_in_face_dirs(data_dir: &Path, path: &Path) -> Result<PathBuf, String> {
++    let mut last = Err(format!("Not a face image: {}", path.display()));
++    for dir in FaceDir::ALL {
++        last = resolve_face_file(&dir.path_in(data_dir), path);
++        if last.is_ok() {
++            break;
++        }
++    }
++    last
++}
++
++/// What move_faces_for_main_camera moved.
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct FacesMoved {
++    /// faces/ now holds the IR camera's faces (else the colour camera's).
++    pub main_is_ir: bool,
++    /// Moved out of faces/: into faces-rgb/ when the IR camera became the
++    /// main camera, else into faces-ir/.
++    pub set_aside: u32,
++    /// Moved into faces/: from faces-ir/ when the IR camera became the main
++    /// camera, else from faces-rgb/.
++    pub restored: u32,
++}
++
++/// Keeps every camera's faces with it when the main camera changes between
++/// the IR camera and the colour camera: faces/ holds the main camera's,
++/// faces-ir/ the IR camera's otherwise, faces-rgb/ the colour camera's
++/// otherwise. A name already taken in the target gets a -1, -2, ... suffix.
++/// Only face images move (see is_face_file); anything else stays.
++pub fn move_faces_for_main_camera(
++    data_dir: &Path,
++    now_ir_main: bool,
++) -> Result<FacesMoved, String> {
++    let (aside, from) = if now_ir_main {
++        (FaceDir::Colour, FaceDir::Ir)
++    } else {
++        (FaceDir::Ir, FaceDir::Colour)
++    };
++    let main = FaceDir::Main.path_in(data_dir);
++    let set_aside = move_face_files(&main, &aside.path_in(data_dir))?;
++    let restored = move_face_files(&from.path_in(data_dir), &main)?;
++    Ok(FacesMoved {
++        main_is_ir: now_ir_main,
++        set_aside,
++        restored,
++    })
++}
++
++fn move_face_files(from: &Path, to: &Path) -> Result<u32, String> {
++    if !from.exists() {
++        return Ok(0);
++    }
++    let files = face_files_in(from)?;
++    if files.is_empty() {
++        return Ok(0);
++    }
++    ensure_private_dir(to).map_err(|e| format!("Failed to create {}: {}", to.display(), e))?;
++    for file in &files {
++        let file = Path::new(file);
++        let target = free_name(to, file);
++        fs::rename(file, &target).map_err(|e| {
++            format!(
++                "Failed to move {} to {}: {}",
++                file.display(),
++                target.display(),
++                e
++            )
++        })?;
++    }
++    Ok(files.len() as u32)
++}
++
++/// `file`'s name in `dir`, or with a -1, -2, ... suffix while that is taken.
++fn free_name(dir: &Path, file: &Path) -> PathBuf {
++    let name = file.file_name().unwrap_or_default();
++    let mut target = dir.join(name);
++    let stem = file.file_stem().unwrap_or_default().to_string_lossy();
++    let ext = file
++        .extension()
++        .map(|e| format!(".{}", e.to_string_lossy()))
++        .unwrap_or_default();
++    let mut i = 1;
++    while fs::symlink_metadata(&target).is_ok() {
++        target = dir.join(format!("{stem}-{i}{ext}"));
++        i += 1;
++    }
++    target
++}
++
+ /// Returns the path to delete only if `path` names a face image (see
+ /// `is_face_file`) directly inside `faces_dir` (the same set `list_faces` returns).
+ fn resolve_face_file(faces_dir: &Path, path: &Path) -> Result<PathBuf, String> {
+@@ -200,6 +356,128 @@ mod tests {
+         assert!(cases > 0);
+     }
+ 
++    fn write_faces(dir: &Path, names: &[&str]) {
++        fs::create_dir_all(dir).unwrap();
++        for name in names {
++            fs::write(dir.join(name), name.as_bytes()).unwrap();
++        }
++    }
++
++    fn names(dir: &Path) -> Vec<String> {
++        let mut names: Vec<String> = fs::read_dir(dir)
++            .map(|entries| {
++                entries
++                    .filter_map(|e| e.ok())
++                    .map(|e| e.file_name().to_string_lossy().to_string())
++                    .collect()
++            })
++            .unwrap_or_default();
++        names.sort();
++        names
++    }
++
++    #[test]
++    fn lists_every_face_dir_in_order() {
++        let tmp = TempDir::new("sets");
++        write_faces(&tmp.0.join("faces-ir"), &["b.jpg", "a.jpg", "notes.txt"]);
++        let sets = face_sets_in(&tmp.0).unwrap();
++        assert_eq!(
++            sets.iter().map(|s| s.dir).collect::<Vec<_>>(),
++            vec![FaceDir::Main, FaceDir::Ir, FaceDir::Colour]
++        );
++        assert!(sets[0].paths.is_empty());
++        let ir = tmp.0.join("faces-ir");
++        assert_eq!(
++            sets[1].paths,
++            vec![
++                ir.join("a.jpg").to_string_lossy().to_string(),
++                ir.join("b.jpg").to_string_lossy().to_string()
++            ]
++        );
++        assert!(sets[2].paths.is_empty());
++    }
++
++    #[test]
++    fn face_dir_names_are_the_json_values() {
++        for dir in FaceDir::ALL {
++            assert_eq!(
++                serde_json::to_value(dir).unwrap(),
++                serde_json::json!(dir.name())
++            );
++        }
++    }
++
++    #[test]
++    fn deletes_only_inside_a_face_dir() {
++        let tmp = TempDir::new("delete-dirs");
++        write_faces(&tmp.0.join("faces-rgb"), &["a.jpg"]);
++        write_faces(&tmp.0.join("other"), &["a.jpg"]);
++        let rgb = tmp.0.join("faces-rgb").join("a.jpg");
++        assert_eq!(
++            resolve_in_face_dirs(&tmp.0, &rgb).unwrap(),
++            fs::canonicalize(&rgb).unwrap()
++        );
++        assert!(resolve_in_face_dirs(&tmp.0, &tmp.0.join("other").join("a.jpg")).is_err());
++        assert!(resolve_in_face_dirs(&tmp.0, &tmp.0.join("faces-ir").join("a.jpg")).is_err());
++    }
++
++    #[test]
++    fn ir_becoming_main_sets_colour_faces_aside() {
++        let tmp = TempDir::new("to-ir");
++        write_faces(&tmp.faces(), &["c1.jpg", "c2.png"]);
++        write_faces(&tmp.0.join("faces-ir"), &["i1.jpg"]);
++        let moved = move_faces_for_main_camera(&tmp.0, true).unwrap();
++        assert_eq!(
++            moved,
++            FacesMoved {
++                main_is_ir: true,
++                set_aside: 2,
++                restored: 1
++            }
++        );
++        assert_eq!(names(&tmp.faces()), vec!["i1.jpg"]);
++        assert_eq!(names(&tmp.0.join("faces-rgb")), vec!["c1.jpg", "c2.png"]);
++        assert!(names(&tmp.0.join("faces-ir")).is_empty());
++    }
++
++    #[test]
++    fn colour_becoming_main_sets_ir_faces_aside() {
++        let tmp = TempDir::new("to-colour");
++        write_faces(&tmp.faces(), &["i1.jpg"]);
++        write_faces(&tmp.0.join("faces-rgb"), &["c1.jpg"]);
++        let moved = move_faces_for_main_camera(&tmp.0, false).unwrap();
++        assert_eq!((moved.set_aside, moved.restored), (1, 1));
++        assert_eq!(names(&tmp.faces()), vec!["c1.jpg"]);
++        assert_eq!(names(&tmp.0.join("faces-ir")), vec!["i1.jpg"]);
++        assert!(names(&tmp.0.join("faces-rgb")).is_empty());
++    }
++
++    #[test]
++    fn moving_keeps_names_apart_and_leaves_other_files() {
++        let tmp = TempDir::new("collide");
++        write_faces(&tmp.faces(), &["a.jpg", "readme.txt"]);
++        write_faces(&tmp.0.join("faces-ir"), &["a.jpg", "a-1.jpg"]);
++        move_faces_for_main_camera(&tmp.0, false).unwrap();
++        assert_eq!(
++            names(&tmp.0.join("faces-ir")),
++            vec!["a-1.jpg", "a-2.jpg", "a.jpg"]
++        );
++        assert_eq!(
++            fs::read(tmp.0.join("faces-ir").join("a-2.jpg")).unwrap(),
++            b"a.jpg"
++        );
++        assert_eq!(names(&tmp.faces()), vec!["readme.txt"]);
++    }
++
++    #[test]
++    fn moving_nothing_creates_no_dirs() {
++        let tmp = TempDir::new("empty");
++        let moved = move_faces_for_main_camera(&tmp.0, true).unwrap();
++        assert_eq!((moved.set_aside, moved.restored), (0, 0));
++        assert!(!tmp.0.join("faces-rgb").exists());
++        assert!(!tmp.0.join("faces-ir").exists());
++    }
++
+     #[test]
+     fn rejects_directory_and_missing_file() {
+         let tmp = TempDir::new("dir");
+diff --git a/app/src-tauri/src/face_session.rs b/app/src-tauri/src/face_session.rs
+index 5f09534..e10a3c9 100644
+--- a/app/src-tauri/src/face_session.rs
++++ b/app/src-tauri/src/face_session.rs
+@@ -13,7 +13,8 @@ use tauri::{AppHandle, Emitter, State};
+ use crate::blocking::run_blocking;
+ use crate::config::{load_config, BiopassConfig};
+ use crate::db;
+-use crate::paths::{ensure_private_dir, get_faces_dir};
++use crate::face::FaceDir;
++use crate::paths::{ensure_private_dir, get_data_dir};
+ 
+ const PREVIEW_EVENT: &str = "face-preview-frame";
+ const FRAME_INTERVAL_MS: u64 = 33; // ~30fps ceiling
+@@ -185,6 +186,8 @@ impl Drop for ChildGuard {
+ }
+ 
+ struct PreviewSession {
++    /// The camera it was started with (None: auto-select).
++    camera: Option<String>,
+     child: Arc<ChildGuard>,
+     io: Arc<Mutex<ChildIO>>,
+     stop: Arc<AtomicBool>,
+@@ -219,7 +222,7 @@ type Slot = Arc<Mutex<Option<PreviewSession>>>;
+ #[derive(Default)]
+ pub struct PreviewState(Slot);
+ 
+-fn helper_path() -> String {
++pub(crate) fn helper_path() -> String {
+     pick_helper(|p| Path::new(p).exists())
+ }
+ 
+@@ -368,13 +371,23 @@ fn lock_slot(slot: &Slot) -> Result<MutexGuard<'_, Option<PreviewSession>>, Stri
+ }
+ 
+ fn start(app: &AppHandle, slot: &Slot, camera: Option<String>) -> Result<(), String> {
++    let camera = camera.filter(|c| !c.is_empty());
+     let mut guard = lock_slot(slot)?;
+-    if guard.as_ref().is_some_and(PreviewSession::is_alive) {
++    if guard
++        .as_ref()
++        .is_some_and(|s| s.is_alive() && s.camera == camera)
++    {
+         return Ok(());
+     }
+-    // A session whose helper died is dropped here and restarted below.
++    // A session whose helper died, or on another camera, is dropped here
++    // (closing its camera) and the new one started below.
+     *guard = None;
++    *guard = Some(open_session(app, camera)?);
++    Ok(())
++}
+ 
++/// Starts the helper's preview session on `camera` and its frame loop.
++fn open_session(app: &AppHandle, camera: Option<String>) -> Result<PreviewSession, String> {
+     let config: BiopassConfig = load_config(app.clone())?;
+     let conn = db::open(app)?;
+     let model_id = &config.methods.face.detection.model_id;
+@@ -388,7 +401,7 @@ fn start(app: &AppHandle, slot: &Slot, camera: Option<String>) -> Result<(), Str
+         .stdin(Stdio::piped())
+         .stdout(Stdio::piped())
+         .stderr(Stdio::null());
+-    if let Some(cam) = camera.filter(|c| !c.is_empty()) {
++    if let Some(cam) = &camera {
+         cmd.arg("--camera").arg(cam);
+     }
+ 
+@@ -415,42 +428,82 @@ fn start(app: &AppHandle, slot: &Slot, camera: Option<String>) -> Result<(), Str
+         thread::spawn(move || frame_loop(app, io, child, stop))
+     };
+ 
+-    *guard = Some(PreviewSession {
++    Ok(PreviewSession {
++        camera,
+         child,
+         io,
+         stop,
+         thread: Some(thread),
+-    });
+-    Ok(())
++    })
+ }
+ 
+-fn capture(app: &AppHandle, slot: &Slot) -> Result<String, String> {
+-    let guard = lock_slot(slot)?;
++/// Saves a face from the running session into faces/. With `ir_camera`
++/// (the IR camera recognises too, `anti_spoofing.ir_recognition`) it then
++/// takes the same moment's face with the IR camera into faces-ir/, under the
++/// same name: the session switches to the IR camera and back (cameras behind
++/// one capture pipeline stream one at a time), and the preview shows each.
++/// Either both are saved or neither. Returns the saved paths.
++fn capture(app: &AppHandle, slot: &Slot, ir_camera: Option<String>) -> Result<Vec<String>, String> {
++    let mut guard = lock_slot(slot)?;
+     let sess = guard.as_ref().ok_or("No active preview session")?;
++    let main_camera = sess.camera.clone();
++    let ir_camera = ir_camera.filter(|c| !c.is_empty() && Some(c) != main_camera.as_ref());
+ 
+-    let faces_dir = get_faces_dir(app)?;
+-    ensure_private_dir(&faces_dir).map_err(|e| format!("Failed to create faces directory: {e}"))?;
+-
++    let data_dir = get_data_dir(app)?;
+     let ts = std::time::SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map_err(|e| format!("Failed to get timestamp: {e}"))?
+         .as_millis();
+-    let file_path = faces_dir.join(face_file_name(ts));
++    let main_path = face_path(&data_dir, FaceDir::Main, ts)?;
++    capture_in(sess, &main_path, "")?;
++    let Some(ir_camera) = ir_camera else {
++        return Ok(vec![main_path.to_string_lossy().to_string()]);
++    };
++
++    // The colour camera closes before the IR camera opens.
++    *guard = None;
++    let ir_result = face_path(&data_dir, FaceDir::Ir, ts).and_then(|ir_path| {
++        let ir_sess = open_session(app, Some(ir_camera))?;
++        capture_in(&ir_sess, &ir_path, "IR camera: ")?;
++        Ok(ir_path)
++    });
++    if ir_result.is_err() {
++        let _ = std::fs::remove_file(&main_path);
++    }
++    // Back to the main camera (dropping the IR session first).
++    let reopened = open_session(app, main_camera);
++    let ir_path = ir_result?;
++    *guard = Some(reopened.map_err(|e| format!("Saved, but the preview did not restart: {e}"))?);
++    Ok(vec![
++        main_path.to_string_lossy().to_string(),
++        ir_path.to_string_lossy().to_string(),
++    ])
++}
++
++/// Where a face captured at `ts` goes in `dir` (created 0700 if missing).
++fn face_path(data_dir: &Path, dir: FaceDir, ts: u128) -> Result<std::path::PathBuf, String> {
++    let dir_path = dir.path_in(data_dir);
++    ensure_private_dir(&dir_path)
++        .map_err(|e| format!("Failed to create {}: {e}", dir_path.display()))?;
++    Ok(dir_path.join(face_file_name(ts)))
++}
+ 
++/// One CAPTURE in `sess` to `path`; `label` prefixes the errors.
++fn capture_in(sess: &PreviewSession, path: &Path, label: &str) -> Result<(), String> {
+     let reply = {
+         let mut io = sess.io.lock().map_err(|e| e.to_string())?;
+-        request_capture(&mut io, &file_path, CAPTURE_TIMEOUT)
++        request_capture(&mut io, path, CAPTURE_TIMEOUT)
+     };
+     match reply {
+-        Ok(CaptureReply::Saved) => Ok(file_path.to_string_lossy().to_string()),
+-        Ok(CaptureReply::NoFace) => {
+-            Err("No face detected. Please position your face in front of the camera.".into())
+-        }
+-        Ok(CaptureReply::Failed(msg)) => Err(msg),
++        Ok(CaptureReply::Saved) => Ok(()),
++        Ok(CaptureReply::NoFace) => Err(format!(
++            "{label}No face detected. Please position your face in front of the camera."
++        )),
++        Ok(CaptureReply::Failed(msg)) => Err(format!("{label}{msg}")),
+         Err(e) => {
+             // Stuck or out of sync: kill it, which also ends the frame loop.
+             sess.child.kill();
+-            Err(format!("Helper failed: {e}"))
++            Err(format!("{label}Helper failed: {e}"))
+         }
+     }
+ }
+@@ -487,9 +540,17 @@ pub async fn stop_face_preview(state: State<'_, PreviewState>) -> Result<(), Str
+ pub async fn capture_face_in_session(
+     app: AppHandle,
+     state: State<'_, PreviewState>,
+-) -> Result<String, String> {
++    ir_camera: Option<String>,
++) -> Result<Vec<String>, String> {
+     let slot = state.0.clone();
+-    run_blocking(TASK, move || capture(&app, &slot)).await
++    run_blocking(TASK, move || capture(&app, &slot, ir_camera)).await
++}
++
++/// Stops the preview (if any), so a face scan (scan.rs) can open the camera.
++pub fn stop_preview_now(state: &PreviewState) -> Result<(), String> {
++    let sess = lock_slot(&state.0)?.take();
++    drop(sess);
++    Ok(())
+ }
+ #[cfg(test)]
+ mod tests {
+diff --git a/app/src-tauri/src/lib.rs b/app/src-tauri/src/lib.rs
+index 38996f5..195280a 100644
+--- a/app/src-tauri/src/lib.rs
++++ b/app/src-tauri/src/lib.rs
+@@ -1,5 +1,6 @@
+ pub mod bindings;
+ pub mod blocking;
++pub mod cameras;
+ pub mod config;
+ pub mod db;
+ pub mod face;
+@@ -11,6 +12,7 @@ mod golden;
+ pub mod keyring;
+ pub mod models;
+ pub mod paths;
++pub mod scan;
+ pub mod system;
+ 
+ use face_session::PreviewState;
+diff --git a/app/src-tauri/src/paths.rs b/app/src-tauri/src/paths.rs
+index d4590fd..d09da63 100644
+--- a/app/src-tauri/src/paths.rs
++++ b/app/src-tauri/src/paths.rs
+@@ -65,7 +65,7 @@ pub fn ensure_private_file(file: &Path) -> io::Result<()> {
+ pub fn restrict_private_paths(app: &AppHandle) {
+     let mut paths = Vec::new();
+     if let Ok(data) = get_data_dir(app) {
+-        for sub in ["faces", "debugs", "logs", "models"] {
++        for sub in ["faces", "faces-ir", "faces-rgb", "debugs", "logs", "models"] {
+             paths.push((data.join(sub), 0o700));
+         }
+         paths.push((data, 0o700));
+diff --git a/app/src-tauri/src/scan.rs b/app/src-tauri/src/scan.rs
+new file mode 100644
+index 0000000..7c41334
+--- /dev/null
++++ b/app/src-tauri/src/scan.rs
+@@ -0,0 +1,333 @@
++//! One face scan with the saved settings, as login runs it, with each step
++//! shown: `biopass-helper auth --verbose` (face found or not, its size
++//! against the minimum, match scores, anti-spoofing), for trying the
++//! settings without locking the screen.
++
++use std::io::Read;
++use std::os::unix::fs::MetadataExt;
++use std::process::{Command, Stdio};
++use std::time::{Duration, Instant};
++
++use serde::Serialize;
++use tauri::State;
++
++use crate::blocking::run_blocking;
++use crate::face_session::{helper_path, stop_preview_now, PreviewState};
++
++const TASK: &str = "Face scan";
++/// Frames without a face use up no try for this long (auth --keep-looking):
++/// the first face compared decides, as on the login screen.
++const KEEP_LOOKING_MS: u32 = 6000;
++/// The helper ends itself within its time budget (kAuthBudget, 40 s).
++const SCAN_TIMEOUT: Duration = Duration::from_secs(50);
++const MAX_LOG: u64 = 1 << 20;
++
++#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq, specta::Type)]
++#[serde(rename_all = "snake_case")]
++pub enum ScanOutcome {
++    /// Recognised: login would succeed (exit 0).
++    Match,
++    /// A face was compared and did not match, or anti-spoofing flagged it (1).
++    NoMatch,
++    /// Nothing to try: no settings, no enrolled faces or no camera (2).
++    NotTried,
++    /// No face was seen in time (3).
++    NoFace,
++    /// Killed, timed out or an unknown exit code.
++    Failed,
++}
++
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct ScanResult {
++    pub outcome: ScanOutcome,
++    /// The steps of the scan, one per line: time, then what happened.
++    pub steps: Vec<String>,
++    /// How well each enrolled face compared (cosine similarity, 1 = the
++    /// same), its best over the scan's attempts, in the order first compared.
++    /// A face compared after a match is not listed: matching stops there.
++    pub scores: Vec<FaceScore>,
++    /// The recognition threshold the scan used: a face matches above it.
++    #[specta(type = Option<specta_typescript::Number>)]
++    pub threshold: Option<f64>,
++    #[specta(type = specta_typescript::Number)]
++    pub duration_ms: u64,
++}
++
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct FaceScore {
++    /// The enrolled face image (in faces/ or faces-ir/).
++    pub path: String,
++    #[specta(type = specta_typescript::Number)]
++    pub score: f64,
++}
++
++/// The per-face lines of the helper's debug log:
++/// "FaceAuth: Recognition | face='<path>' score=0.4813 threshold=0.600 similar=0".
++fn scores_from_log(log: &str) -> (Vec<FaceScore>, Option<f64>) {
++    let mut scores: Vec<FaceScore> = Vec::new();
++    let mut threshold = None;
++    for line in log.lines() {
++        let Some((_, message)) = split_log_line(line) else {
++            continue;
++        };
++        let Some(rest) = message.strip_prefix("FaceAuth: Recognition | face='") else {
++            continue;
++        };
++        let Some((path, rest)) = rest.split_once('\'') else {
++            continue;
++        };
++        let field = |name: &str| {
++            rest.split_whitespace()
++                .find_map(|kv| kv.strip_prefix(name)?.parse::<f64>().ok())
++        };
++        let Some(score) = field("score=").filter(|s| s.is_finite()) else {
++            continue;
++        };
++        threshold = field("threshold=").or(threshold);
++        match scores.iter_mut().find(|s| s.path == path) {
++            Some(known) => known.score = known.score.max(score),
++            None => scores.push(FaceScore {
++                path: path.to_string(),
++                score,
++            }),
++        }
++    }
++    (scores, threshold)
++}
++
++fn outcome_for(code: Option<i32>) -> ScanOutcome {
++    match code {
++        Some(0) => ScanOutcome::Match,
++        Some(1) => ScanOutcome::NoMatch,
++        Some(2) => ScanOutcome::NotTried,
++        Some(3) => ScanOutcome::NoFace,
++        _ => ScanOutcome::Failed,
++    }
++}
++
++/// The steps worth showing from the helper's debug log, shortened:
++/// "[2026-11-15 14:00:01.234] [biopass] [debug] FaceAuth: Face on ..." ->
++/// "14:00:01.234 Face on ...". Enrolled faces show as faces*/<name>.
++fn steps_from_log(log: &str) -> Vec<String> {
++    const STEPS: [&str; 11] = [
++        "Face on",
++        "No face",
++        "Recognition PASSED",
++        "Recognition FAILED",
++        "Recognised on both",
++        "Could not",
++        "Both cameras must",
++        "Anti-spoofing failed",
++        "AI anti-spoofing detected spoof",
++        "AI anti-spoofing check passed",
++        "IR presence check",
++    ];
++    log.lines()
++        .filter_map(|line| {
++            let (time, message) = split_log_line(line)?;
++            let step = message.strip_prefix("FaceAuth: ");
++            let shown = match step {
++                Some(step) => {
++                    STEPS.iter().any(|s| step.starts_with(s))
++                        || (step.starts_with("The ") && step.contains(" frame came"))
++                }
++                None => false,
++            } || message.contains("camera appears covered");
++            if !shown {
++                return None;
++            }
++            let text = step.unwrap_or(message);
++            let text = text.split(" (NOTE:").next().unwrap_or(text);
++            Some(format!("{time} {}", short_face_paths(text)))
++        })
++        .collect()
++}
++
++/// (time, message) of a spdlog line "[date time] [logger] [level] message".
++fn split_log_line(line: &str) -> Option<(&str, &str)> {
++    let rest = line.strip_prefix('[')?;
++    let (stamp, rest) = rest.split_once("] [")?;
++    let time = stamp.split_once(' ').map_or(stamp, |(_, t)| t);
++    let (_logger, rest) = rest.split_once("] [")?;
++    let (_level, message) = rest.split_once("] ")?;
++    Some((time, message))
++}
++
++/// face='/home/u/.local/share/com.ticklab.biopass/faces-ir/a.jpg' -> faces-ir/a.jpg
++fn short_face_paths(text: &str) -> String {
++    let mut out = String::new();
++    let mut rest = text;
++    while let Some(start) = rest.find("face='") {
++        out.push_str(&rest[..start]);
++        let after = &rest[start + 6..];
++        let Some(end) = after.find('\'') else {
++            out.push_str(&rest[start..]);
++            return out;
++        };
++        let path = &after[..end];
++        let short = path.rfind("/faces").map_or(path, |i| &path[i + 1..]);
++        out.push_str(short);
++        rest = &after[end + 1..];
++    }
++    out.push_str(rest);
++    out
++}
++
++/// The login name of `uid` in passwd(5) text.
++fn name_for_uid(passwd: &str, uid: u32) -> Option<String> {
++    passwd.lines().find_map(|line| {
++        let mut fields = line.split(':');
++        let name = fields.next()?;
++        let uid_field = fields.nth(1)?;
++        (uid_field.parse::<u32>().ok()? == uid && !name.is_empty()).then(|| name.to_string())
++    })
++}
++
++/// This process's user: its uid's name in /etc/passwd, else $USER.
++fn current_user() -> Result<String, String> {
++    let uid = std::fs::metadata("/proc/self")
++        .map(|m| m.uid())
++        .map_err(|e| format!("Could not determine the current user: {e}"))?;
++    std::fs::read_to_string("/etc/passwd")
++        .ok()
++        .and_then(|text| name_for_uid(&text, uid))
++        .or_else(|| crate::system::get_current_username().ok())
++        .ok_or_else(|| "Could not determine the current user".to_string())
++}
++
++fn scan(helper: &str, user: &str) -> Result<ScanResult, String> {
++    let started = Instant::now();
++    let mut child = Command::new(helper)
++        .args(["auth", "--username", user, "--verbose", "--keep-looking"])
++        .arg(KEEP_LOOKING_MS.to_string())
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::piped())
++        .spawn()
++        .map_err(|e| format!("Failed to start {helper}: {e}"))?;
++    let stderr = child.stderr.take().ok_or("missing stderr")?;
++    let reader = std::thread::spawn(move || {
++        let mut bytes = Vec::new();
++        let _ = stderr.take(MAX_LOG).read_to_end(&mut bytes);
++        String::from_utf8_lossy(&bytes).into_owned()
++    });
++    let status = loop {
++        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
++            break Some(status);
++        }
++        if started.elapsed() >= SCAN_TIMEOUT {
++            let _ = child.kill();
++            let _ = child.wait();
++            break None;
++        }
++        std::thread::sleep(Duration::from_millis(50));
++    };
++    let log = reader.join().unwrap_or_default();
++    let (scores, threshold) = scores_from_log(&log);
++    Ok(ScanResult {
++        outcome: outcome_for(status.and_then(|s| s.code())),
++        steps: steps_from_log(&log),
++        scores,
++        threshold,
++        duration_ms: started.elapsed().as_millis() as u64,
++    })
++}
++
++/// One scan with the saved settings (the camera preview stops first: the
++/// helper needs the camera). Counts nowhere: no PAM, no lockout.
++#[tauri::command]
++#[specta::specta]
++pub async fn test_face_scan(state: State<'_, PreviewState>) -> Result<ScanResult, String> {
++    stop_preview_now(&state)?;
++    run_blocking(TASK, || scan(&helper_path(), &current_user()?)).await
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn exit_codes_map_to_outcomes() {
++        assert_eq!(outcome_for(Some(0)), ScanOutcome::Match);
++        assert_eq!(outcome_for(Some(1)), ScanOutcome::NoMatch);
++        assert_eq!(outcome_for(Some(2)), ScanOutcome::NotTried);
++        assert_eq!(outcome_for(Some(3)), ScanOutcome::NoFace);
++        assert_eq!(outcome_for(Some(9)), ScanOutcome::Failed);
++        assert_eq!(outcome_for(None), ScanOutcome::Failed);
++    }
++
++    #[test]
++    fn keeps_and_shortens_the_steps() {
++        let log = "\
++[2026-11-15 14:00:01.100] [biopass] [debug] FaceAuth: Recognition model loaded | threshold=0.600
++[2026-11-15 14:00:01.234] [biopass] [debug] FaceAuth: Face on the IR camera 0.31 of the frame height (min 0.20): in front
++[2026-11-15 14:00:01.300] [biopass] [debug] FaceAuth: Recognition | face='/home/u/.local/share/com.ticklab.biopass/faces/a.jpg' score=0.71
++[2026-11-15 14:00:01.400] [biopass] [debug] FaceAuth: Recognition PASSED on the IR camera | matched face='/home/u/.local/share/com.ticklab.biopass/faces-ir/face_1.jpg' score=0.7100
++[2026-11-15 14:00:02.000] [biopass] [error] FaceAuth: No face detected on the colour camera | luma mean=3.0 stddev=1.0 (NOTE: dark)
++[2026-11-15 14:00:02.500] [biopass] [error] FaceAuth: The IR camera frame came 3000 ms after the colour camera frame (at most 2500 ms), not combined
++[2026-11-15 14:00:03.000] [biopass] [warn] Biopass: the camera appears covered
++libcamera noise without brackets
++";
++        assert_eq!(
++            steps_from_log(log),
++            vec![
++                "14:00:01.234 Face on the IR camera 0.31 of the frame height (min 0.20): in front",
++                "14:00:01.400 Recognition PASSED on the IR camera | matched faces-ir/face_1.jpg score=0.7100",
++                "14:00:02.000 No face detected on the colour camera | luma mean=3.0 stddev=1.0",
++                "14:00:02.500 The IR camera frame came 3000 ms after the colour camera frame (at most 2500 ms), not combined",
++                "14:00:03.000 Biopass: the camera appears covered",
++            ]
++        );
++    }
++
++    #[test]
++    fn scores_per_face_keep_the_best() {
++        let log = "\
++[2026-11-15 14:00:01.300] [biopass] [debug] FaceAuth: Recognition | face='/h/faces/a.jpg' score=0.4813 threshold=0.600 similar=0
++[2026-11-15 14:00:01.310] [biopass] [debug] FaceAuth: Recognition | face='/h/faces/b.jpg' score=0.5120 threshold=0.600 similar=0
++[2026-11-15 14:00:02.300] [biopass] [debug] FaceAuth: Recognition | face='/h/faces/a.jpg' score=0.6512 threshold=0.600 similar=1
++[2026-11-15 14:00:02.300] [biopass] [debug] FaceAuth: Recognition | face='/h/faces/c.jpg' score=nan threshold=0.600 similar=0
++[2026-11-15 14:00:02.310] [biopass] [debug] FaceAuth: Recognition PASSED on the colour camera | matched face='/h/faces/a.jpg' score=0.6512
++";
++        let (scores, threshold) = scores_from_log(log);
++        assert_eq!(
++            scores,
++            vec![
++                FaceScore {
++                    path: "/h/faces/a.jpg".into(),
++                    score: 0.6512
++                },
++                FaceScore {
++                    path: "/h/faces/b.jpg".into(),
++                    score: 0.512
++                },
++            ]
++        );
++        assert_eq!(threshold, Some(0.6));
++        assert_eq!(scores_from_log("nothing\n"), (vec![], None));
++    }
++
++    #[test]
++    fn face_paths_without_a_faces_dir_stay() {
++        assert_eq!(short_face_paths("face='x.jpg' a"), "x.jpg a");
++        assert_eq!(short_face_paths("face='unterminated"), "face='unterminated");
++    }
++
++    #[test]
++    fn finds_the_login_name_of_a_uid() {
++        let passwd =
++            "root:x:0:0::/root:/bin/bash\nsteamos:x:1000:1000::/home/steamos:/bin/bash\nbroken\n";
++        assert_eq!(name_for_uid(passwd, 1000).as_deref(), Some("steamos"));
++        assert_eq!(name_for_uid(passwd, 0).as_deref(), Some("root"));
++        assert_eq!(name_for_uid(passwd, 1001), None);
++    }
++
++    #[test]
++    fn a_helper_that_cannot_start_is_an_error() {
++        assert!(scan("/nonexistent/biopass-helper", "u").is_err());
++        // /bin/false ignores its arguments and exits 1: a face that did not match.
++        let result = scan("/bin/false", "u").unwrap();
++        assert_eq!(result.outcome, ScanOutcome::NoMatch);
++        assert!(result.steps.is_empty());
++    }
++}
+diff --git a/app/src-tauri/tauri.conf.json b/app/src-tauri/tauri.conf.json
+index 13bd45f..5af8e05 100644
+--- a/app/src-tauri/tauri.conf.json
++++ b/app/src-tauri/tauri.conf.json
+@@ -20,7 +20,11 @@
+       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'",
+       "assetProtocol": {
+         "enable": true,
+-        "scope": ["$APPDATA/faces/**"]
++        "scope": [
++          "$APPDATA/faces/**",
++          "$APPDATA/faces-ir/**",
++          "$APPDATA/faces-rgb/**"
++        ]
+       }
+     }
+   },
+diff --git a/app/src-tauri/tests/webview_security.rs b/app/src-tauri/tests/webview_security.rs
+index a3be65d..22ea3c2 100644
+--- a/app/src-tauri/tests/webview_security.rs
++++ b/app/src-tauri/tests/webview_security.rs
+@@ -62,10 +62,18 @@ fn csp_is_set_and_strict() {
+ }
+ 
+ #[test]
+-fn asset_scope_is_only_the_faces_dir() {
++fn asset_scope_is_only_the_face_dirs() {
+     let conf = tauri_conf();
+     let scope = &conf["app"]["security"]["assetProtocol"]["scope"];
+-    assert_eq!(scope, &serde_json::json!(["$APPDATA/faces/**"]));
++    // faces/ (the main camera's), faces-ir/ and faces-rgb/ (src/face.rs FaceDir).
++    assert_eq!(
++        scope,
++        &serde_json::json!([
++            "$APPDATA/faces/**",
++            "$APPDATA/faces-ir/**",
++            "$APPDATA/faces-rgb/**"
++        ])
++    );
+ }
+ 
+ #[test]
+diff --git a/app/src/app/configuration/-components/face/AntiSpoofingSection.tsx b/app/src/app/configuration/-components/face/AntiSpoofingSection.tsx
+index dcd1b48..6e88e7c 100644
+--- a/app/src/app/configuration/-components/face/AntiSpoofingSection.tsx
++++ b/app/src/app/configuration/-components/face/AntiSpoofingSection.tsx
+@@ -11,6 +11,7 @@ import {
+ import { useModelFileStatus } from "@/hooks/useModelFileStatus";
+ import type { BiopassConfig, Model } from "@/types/config";
+ import { Threshold } from "../methods/shared/Threshold";
++import { faceModeOf } from "./faceMode";
+ import { DISABLED_OPTION, selectValueFor } from "./selectValue";
+ 
+ const UNAVAILABLE_AI_MODEL_OPTION = "__unavailable_ai_model__";
+@@ -32,6 +33,12 @@ export function AntiSpoofingSection({ antiSpoofModels }: Props) {
+   const antiSpoofing = useWatch<BiopassConfig, "methods.face.anti_spoofing">({
+     name: "methods.face.anti_spoofing",
+   });
++  const face = useWatch<BiopassConfig, "methods.face">({
++    name: "methods.face",
++  });
++  // The models are trained on colour pictures: on IR frames they reject real
++  // faces at random, so they stay off while the IR camera recognises.
++  const irMode = faceModeOf(face) === "ir";
+   const antiSpoofStatusMap = useModelFileStatus(antiSpoofModels);
+ 
+   const aiModelValue = selectValueFor(
+@@ -53,6 +60,7 @@ export function AntiSpoofingSection({ antiSpoofModels }: Props) {
+           </Label>
+           <Select
+             value={aiModelValue}
++            disabled={irMode}
+             onValueChange={(value) => {
+               if (value === DISABLED_OPTION) {
+                 setValue("methods.face.anti_spoofing.enable", false, {
+@@ -102,6 +110,11 @@ export function AntiSpoofingSection({ antiSpoofModels }: Props) {
+               )}
+             </SelectContent>
+           </Select>
++          <p className="text-xs text-muted-foreground">
++            {irMode
++              ? "Off while the IR camera recognises: the models are trained on colour pictures."
++              : "Checks the colour picture. MiniFASNet V2 is the one to try: MobileNetV3 took real faces for spoofs on some cameras. Both may reject real faces in poor light."}
++          </p>
+           {errors.methods?.face?.anti_spoofing?.model?.model_id && (
+             <p className="text-xs text-destructive">
+               {errors.methods.face.anti_spoofing.model.model_id.message}
+diff --git a/app/src/app/configuration/-components/face/CameraProfilesSection.tsx b/app/src/app/configuration/-components/face/CameraProfilesSection.tsx
+deleted file mode 100644
+index b913836..0000000
+--- a/app/src/app/configuration/-components/face/CameraProfilesSection.tsx
++++ /dev/null
+@@ -1,225 +0,0 @@
+-import { ChevronDown, ChevronUp, Plus, Trash2 } from "lucide-react";
+-import { useState } from "react";
+-import { useFieldArray, useFormContext, useWatch } from "react-hook-form";
+-import { Button } from "@/components/ui/button";
+-import {
+-  Dialog,
+-  DialogContent,
+-  DialogDescription,
+-  DialogFooter,
+-  DialogHeader,
+-  DialogTitle,
+-} from "@/components/ui/dialog";
+-import { Label } from "@/components/ui/label";
+-import type { BiopassConfig, VideoDeviceInfo } from "@/types/config";
+-import { VideoDeviceSelect } from "./VideoDeviceSelect";
+-
+-interface Props {
+-  videoDevices: VideoDeviceInfo[];
+-}
+-
+-const OPTIONS = { shouldDirty: true, shouldValidate: true } as const;
+-
+-/**
+- * Ordered camera + IR camera pairs (methods.face.camera_profiles), the only
+- * camera setting; face login needs at least one. Auth uses the first whose
+- * camera is connected; see pickCameraProfile in auth/core/camera_profile.h.
+- */
+-export function CameraProfilesSection({ videoDevices }: Props) {
+-  const {
+-    control,
+-    formState: { errors },
+-    setValue,
+-  } = useFormContext<BiopassConfig>();
+-  const { fields, append, remove, move } = useFieldArray({
+-    control,
+-    name: "methods.face.camera_profiles",
+-  });
+-  const profiles = useWatch<BiopassConfig, "methods.face.camera_profiles">({
+-    name: "methods.face.camera_profiles",
+-  });
+-
+-  // Profile index whose "None" IR choice awaits confirmation.
+-  const [confirmNoIr, setConfirmNoIr] = useState<number | null>(null);
+-  const profilesError = errors.methods?.face?.camera_profiles;
+-  const profilesErrorMessage =
+-    profilesError?.root?.message ?? profilesError?.message;
+-
+-  return (
+-    <div className="p-4 rounded-lg bg-muted/50 border border-border/50 space-y-3">
+-      <div>
+-        <h4 className="font-medium text-sm">Camera Profiles</h4>
+-        <p className="text-xs text-muted-foreground">
+-          The first profile whose camera is connected is used. Add at least one.
+-        </p>
+-      </div>
+-
+-      {fields.map((field, index) => {
+-        const profile = profiles?.[index];
+-        const hasIr = Boolean(profile?.ir_camera);
+-        const cameraError = profilesError?.[index]?.camera?.message;
+-        const irError = profilesError?.[index]?.ir_camera?.message;
+-        return (
+-          <div key={field.id} className="space-y-2">
+-            <div className="flex items-end gap-2">
+-              <div className="grid min-w-0 flex-1 gap-1">
+-                <Label
+-                  htmlFor={`profile-camera-${index}`}
+-                  className="text-xs text-muted-foreground"
+-                >
+-                  {index + 1}. Camera
+-                </Label>
+-                <VideoDeviceSelect
+-                  id={`profile-camera-${index}`}
+-                  value={profile?.camera}
+-                  onChange={(value) =>
+-                    setValue(
+-                      `methods.face.camera_profiles.${index}.camera`,
+-                      value,
+-                      OPTIONS,
+-                    )
+-                  }
+-                  videoDevices={videoDevices}
+-                  unavailableLabel="Camera not connected"
+-                  placeholder="Select camera"
+-                />
+-                {cameraError && (
+-                  <p className="text-xs text-destructive">{cameraError}</p>
+-                )}
+-              </div>
+-              <div className="grid min-w-0 flex-1 gap-1">
+-                <Label
+-                  htmlFor={`profile-ir-${index}`}
+-                  className="text-xs text-muted-foreground"
+-                >
+-                  IR Camera
+-                </Label>
+-                <VideoDeviceSelect
+-                  id={`profile-ir-${index}`}
+-                  value={profile?.ir_camera}
+-                  onChange={(value) => {
+-                    if (!value) {
+-                      setConfirmNoIr(index);
+-                      return;
+-                    }
+-                    setValue(
+-                      `methods.face.camera_profiles.${index}.ir_camera`,
+-                      value,
+-                      OPTIONS,
+-                    );
+-                    setValue(
+-                      `methods.face.camera_profiles.${index}.allow_without_ir`,
+-                      false,
+-                      OPTIONS,
+-                    );
+-                  }}
+-                  videoDevices={videoDevices}
+-                  offLabel="None"
+-                  unavailableLabel="IR camera not connected"
+-                  placeholder="Select IR camera"
+-                  unset={!profile?.allow_without_ir}
+-                />
+-                {irError && (
+-                  <p className="text-xs text-destructive">{irError}</p>
+-                )}
+-              </div>
+-              <Button
+-                type="button"
+-                variant="ghost"
+-                size="icon"
+-                aria-label="Move up"
+-                disabled={index === 0}
+-                onClick={() => move(index, index - 1)}
+-              >
+-                <ChevronUp />
+-              </Button>
+-              <Button
+-                type="button"
+-                variant="ghost"
+-                size="icon"
+-                aria-label="Move down"
+-                disabled={index === fields.length - 1}
+-                onClick={() => move(index, index + 1)}
+-              >
+-                <ChevronDown />
+-              </Button>
+-              <Button
+-                type="button"
+-                variant="ghost"
+-                size="icon"
+-                aria-label="Remove profile"
+-                onClick={() => remove(index)}
+-              >
+-                <Trash2 />
+-              </Button>
+-            </div>
+-            {hasIr && profile?.camera === profile?.ir_camera && (
+-              <p className="text-xs text-muted-foreground">
+-                IR camera is also the main camera: enrol and sign in with IR
+-                only.
+-              </p>
+-            )}
+-          </div>
+-        );
+-      })}
+-
+-      <Dialog
+-        open={confirmNoIr !== null}
+-        onOpenChange={(open) => {
+-          if (!open) setConfirmNoIr(null);
+-        }}
+-      >
+-        <DialogContent>
+-          <DialogHeader>
+-            <DialogTitle>Use this profile without IR?</DialogTitle>
+-            <DialogDescription>
+-              Face login with profile {(confirmNoIr ?? 0) + 1} won't check the
+-              IR camera, so a photo or screen may pass. Anyone who plugs in a
+-              camera matching this profile gets the same.
+-            </DialogDescription>
+-          </DialogHeader>
+-          <DialogFooter>
+-            <Button
+-              type="button"
+-              variant="outline"
+-              onClick={() => setConfirmNoIr(null)}
+-            >
+-              Cancel
+-            </Button>
+-            <Button
+-              type="button"
+-              variant="destructive"
+-              onClick={() => {
+-                if (confirmNoIr !== null) {
+-                  const base =
+-                    `methods.face.camera_profiles.${confirmNoIr}` as const;
+-                  setValue(`${base}.ir_camera`, null, OPTIONS);
+-                  setValue(`${base}.allow_without_ir`, true, OPTIONS);
+-                }
+-                setConfirmNoIr(null);
+-              }}
+-            >
+-              Use without IR
+-            </Button>
+-          </DialogFooter>
+-        </DialogContent>
+-      </Dialog>
+-
+-      {profilesErrorMessage && (
+-        <p className="text-xs text-destructive">{profilesErrorMessage}</p>
+-      )}
+-
+-      <Button
+-        type="button"
+-        variant="outline"
+-        size="sm"
+-        onClick={() =>
+-          append({ camera: null, ir_camera: null, allow_without_ir: false })
+-        }
+-      >
+-        <Plus />
+-        Add profile
+-      </Button>
+-    </div>
+-  );
+-}
+diff --git a/app/src/app/configuration/-components/face/CameraSelect.tsx b/app/src/app/configuration/-components/face/CameraSelect.tsx
+new file mode 100644
+index 0000000..1edb7ee
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/CameraSelect.tsx
+@@ -0,0 +1,83 @@
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
++import type { CameraChoice } from "./useCameras";
++
++const UNAVAILABLE = "__unavailable_camera__";
++
++interface Props {
++  id: string;
++  value: string | null;
++  onChange: (value: string) => void;
++  choices: readonly CameraChoice[];
++  placeholder: string;
++  disabled?: boolean;
++}
++
++/** A camera picker over libcamera's cameras and other video devices. */
++export function CameraSelect({
++  id,
++  value,
++  onChange,
++  choices,
++  placeholder,
++  disabled,
++}: Props) {
++  const listed = value !== null && choices.some((c) => c.value === value);
++  const selectValue = value === null ? "" : listed ? value : UNAVAILABLE;
++  const selected = choices.find((c) => c.value === value);
++
++  return (
++    <Select
++      value={selectValue}
++      disabled={disabled}
++      onValueChange={(next) => {
++        if (next !== UNAVAILABLE) onChange(next);
++      }}
++    >
++      <SelectTrigger id={id} className="h-10 w-full min-w-0">
++        <SelectValue
++          className="min-w-0 flex-1 overflow-hidden text-left"
++          placeholder={placeholder}
++        >
++          {selected ? (
++            <span className="truncate">{selected.label}</span>
++          ) : (
++            value !== null && (
++              <span className="truncate text-muted-foreground">
++                Not found: {value}
++              </span>
++            )
++          )}
++        </SelectValue>
++      </SelectTrigger>
++      <SelectContent>
++        {!listed && value !== null && (
++          <SelectItem value={UNAVAILABLE} disabled>
++            Not found: {value}
++          </SelectItem>
++        )}
++        {choices.length > 0 ? (
++          choices.map((c) => (
++            <SelectItem key={c.value} value={c.value}>
++              <span className="flex min-w-0 flex-col">
++                <span className="truncate">{c.label}</span>
++                <span className="truncate text-xs text-muted-foreground">
++                  {c.details}
++                </span>
++              </span>
++            </SelectItem>
++          ))
++        ) : (
++          <SelectItem value="__no_cameras__" disabled>
++            No cameras found
++          </SelectItem>
++        )}
++      </SelectContent>
++    </Select>
++  );
++}
+diff --git a/app/src/app/configuration/-components/face/CamerasSection.tsx b/app/src/app/configuration/-components/face/CamerasSection.tsx
+new file mode 100644
+index 0000000..17ab6ed
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/CamerasSection.tsx
+@@ -0,0 +1,226 @@
++import { TriangleAlert } from "lucide-react";
++import { useEffect, useState } from "react";
++import { useFormContext, useWatch } from "react-hook-form";
++import { Label } from "@/components/ui/label";
++import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
++import { Slider } from "@/components/ui/slider";
++import type { BiopassConfig, CameraInfo } from "@/types/config";
++import { CameraSelect } from "./CameraSelect";
++import {
++  colourCameraOf,
++  defaultCameras,
++  FACE_MODES,
++  type FaceMode,
++  faceModeOf,
++  RECOMMENDED_MIN_FACE_HEIGHT,
++  withFaceMode,
++} from "./faceMode";
++import { useSavedSettings } from "./savedSettings";
++import type { CameraChoice } from "./useCameras";
++
++const OPTIONS = { shouldDirty: true, shouldValidate: true } as const;
++
++const MODE_TEXT: Record<FaceMode, { title: string; text: string }> = {
++  ir: {
++    title: "IR camera",
++    text: "The IR camera recognises you, in any light and in the dark (its own infrared light). A phone or monitor shows nothing in infrared. AI anti-spoofing stays off: its models are trained on colour pictures.",
++  },
++  both: {
++    title: "Both cameras (strictest)",
++    text: "The colour and the IR camera each recognise you, against their own faces, within 2.5 seconds. Needs room light; never falls back to one camera.",
++  },
++  rgb: {
++    title: "Colour camera",
++    text: "The colour camera recognises you; the IR camera only checks that it sees a face, which a printed photo can pass. Needs room light.",
++  },
++};
++
++interface Props {
++  cameras: readonly CameraInfo[];
++  choices: readonly CameraChoice[];
++  camerasError: string | null;
++}
++
++/**
++ * Which camera recognises (methods.face.camera, anti_spoofing.ir_camera and
++ * anti_spoofing.ir_recognition, by libcamera id) and the minimum face size.
++ * Never camera profiles: face unlock here refuses them.
++ */
++export function CamerasSection({ cameras, choices, camerasError }: Props) {
++  const {
++    setValue,
++    formState: { errors },
++  } = useFormContext<BiopassConfig>();
++  const face = useWatch<BiopassConfig, "methods.face">({
++    name: "methods.face",
++  });
++  const saved = useSavedSettings();
++  const mode = faceModeOf(face);
++  const detected = defaultCameras(cameras);
++  const ir = face.anti_spoofing.ir_camera || detected.ir;
++  // The colour camera to use when a mode with one is chosen; in ir mode the
++  // settings have none, so it is kept here.
++  const [colour, setColour] = useState<string | null>(
++    colourCameraOf(face) ?? detected.colour,
++  );
++  useEffect(() => {
++    setColour((c) => c ?? colourCameraOf(face) ?? detected.colour);
++  }, [face, detected.colour]);
++
++  function choose(next: FaceMode) {
++    if (!ir) return;
++    setValue(
++      "methods.face",
++      withFaceMode(face, next, { ir, colour: colour ?? detected.colour }),
++      OPTIONS,
++    );
++  }
++
++  function chooseIr(next: string) {
++    if (mode === "ir") setValue("methods.face.camera", next, OPTIONS);
++    setValue("methods.face.anti_spoofing.ir_camera", next, OPTIONS);
++  }
++
++  function chooseColour(next: string) {
++    setColour(next);
++    if (mode === "rgb" || mode === "both") {
++      setValue("methods.face.camera", next, OPTIONS);
++    }
++  }
++
++  const minHeight = face.detection.min_face_height;
++  const cameraError =
++    errors.methods?.face?.camera?.message ??
++    errors.methods?.face?.anti_spoofing?.ir_camera?.message;
++
++  return (
++    <div className="p-4 rounded-lg bg-muted/50 border border-border/50 space-y-4">
++      <div>
++        <h4 className="font-medium text-sm">Cameras</h4>
++        <p className="text-xs text-muted-foreground">
++          Which camera recognises you. Faces stay with the camera that took
++          them: switching keeps them for when you switch back.
++        </p>
++      </div>
++
++      {saved.hadProfiles && (
++        <p className="flex gap-2 text-xs text-amber-600 dark:text-amber-400">
++          <TriangleAlert className="w-4 h-4 shrink-0" />
++          Your settings have camera profiles from an earlier save, which face
++          unlock refuses. Saving replaces them with the cameras below.
++        </p>
++      )}
++      {camerasError && (
++        <p className="text-xs text-destructive">
++          Could not list the cameras: {camerasError}
++        </p>
++      )}
++
++      <RadioGroup
++        value={mode ?? ""}
++        onValueChange={(v) => choose(v as FaceMode)}
++        className="gap-2"
++      >
++        {FACE_MODES.map((m) => (
++          <Label
++            key={m}
++            htmlFor={`face-mode-${m}`}
++            className="flex items-start gap-3 rounded-md border border-border p-3 cursor-pointer has-[button[data-state=checked]]:border-primary"
++          >
++            <RadioGroupItem
++              id={`face-mode-${m}`}
++              value={m}
++              disabled={!ir}
++              className="mt-0.5"
++            />
++            <span className="grid gap-0.5">
++              <span className="text-sm font-medium">
++                {MODE_TEXT[m].title}
++                {m === "ir" && (
++                  <span className="ml-2 text-xs font-normal text-muted-foreground">
++                    recommended
++                  </span>
++                )}
++              </span>
++              <span className="text-xs font-normal text-muted-foreground">
++                {MODE_TEXT[m].text}
++              </span>
++            </span>
++          </Label>
++        ))}
++      </RadioGroup>
++      {!mode && (
++        <p className="text-xs text-destructive">
++          {ir
++            ? "Choose a mode: face unlock needs an IR camera."
++            : "No IR camera found."}
++        </p>
++      )}
++
++      <div className="grid grid-cols-2 gap-4">
++        <div className="grid min-w-0 gap-1">
++          <Label
++            htmlFor="face-ir-camera"
++            className="text-xs text-muted-foreground"
++          >
++            IR camera
++          </Label>
++          <CameraSelect
++            id="face-ir-camera"
++            value={ir}
++            onChange={chooseIr}
++            choices={choices}
++            placeholder="Select the IR camera"
++          />
++        </div>
++        <div className="grid min-w-0 gap-1">
++          <Label
++            htmlFor="face-colour-camera"
++            className="text-xs text-muted-foreground"
++          >
++            Colour camera
++          </Label>
++          <CameraSelect
++            id="face-colour-camera"
++            value={colour}
++            onChange={chooseColour}
++            choices={choices}
++            placeholder="Select the colour camera"
++            disabled={mode === "ir"}
++          />
++        </div>
++      </div>
++      {cameraError && <p className="text-xs text-destructive">{cameraError}</p>}
++
++      <div className="grid gap-2">
++        <div className="flex items-center justify-between">
++          <Label className="text-xs text-muted-foreground">
++            Minimum face size
++          </Label>
++          <span className="text-xs font-mono font-medium">
++            {minHeight > 0
++              ? `${Math.round(minHeight * 100)}% of the picture's height`
++              : "off"}
++          </span>
++        </div>
++        <Slider
++          value={[minHeight]}
++          min={0}
++          max={0.6}
++          step={0.01}
++          onValueChange={([v]) =>
++            setValue("methods.face.detection.min_face_height", v, OPTIONS)
++          }
++          className="cursor-pointer"
++        />
++        <p className="text-xs text-muted-foreground">
++          Only a face this big (and wholly in the picture) is compared: someone
++          in front of the screen, not across the room. Sitting at the laptop
++          your face fills about 30-45% in IR and 45-60% in colour; a face across
++          a room about 10%. Recommended: {RECOMMENDED_MIN_FACE_HEIGHT * 100}%.
++          {minHeight === 0 && " Off: face unlock refuses to run."}
++        </p>
++      </div>
++    </div>
++  );
++}
+diff --git a/app/src/app/configuration/-components/face/FaceCapture.tsx b/app/src/app/configuration/-components/face/FaceCapture.tsx
+deleted file mode 100644
+index acfa8c3..0000000
+--- a/app/src/app/configuration/-components/face/FaceCapture.tsx
++++ /dev/null
+@@ -1,147 +0,0 @@
+-import { convertFileSrc } from "@tauri-apps/api/core";
+-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+-import { Camera, Circle, Square, Trash2 } from "lucide-react";
+-import { useEffect, useRef } from "react";
+-import { useWatch } from "react-hook-form";
+-import { toast } from "sonner";
+-import { Button } from "@/components/ui/button";
+-import type { BiopassConfig, VideoDeviceInfo } from "@/types/config";
+-import { activeCameraProfile } from "./selectValue";
+-import { useFaceImages } from "./useFaceImages";
+-import { usePreviewSession } from "./usePreviewSession";
+-
+-interface Props {
+-  videoDevices: VideoDeviceInfo[];
+-}
+-
+-export function FaceCapture({ videoDevices }: Props) {
+-  const previewRef = useRef<HTMLImageElement>(null);
+-  const cameraProfiles = useWatch<
+-    BiopassConfig,
+-    "methods.face.camera_profiles"
+-  >({
+-    name: "methods.face.camera_profiles",
+-  });
+-  // Preview the camera auth would pick, so enrolment matches the sensor.
+-  const { camera } = activeCameraProfile(cameraProfiles ?? [], videoDevices);
+-  const {
+-    active: capturing,
+-    start: startCamera,
+-    stop: stopCamera,
+-  } = usePreviewSession(
+-    camera,
+-    (err) => {
+-      toast.error(`Failed to start camera: ${err}`);
+-      console.error(err);
+-    },
+-    // Drop the last frame so a failed start or camera switch doesn't show it.
+-    () => previewRef.current?.removeAttribute("src"),
+-  );
+-  const {
+-    faceImages,
+-    capture: capturePhoto,
+-    remove: deleteFace,
+-  } = useFaceImages();
+-
+-  useEffect(() => {
+-    if (!capturing) return;
+-
+-    let unlisten: UnlistenFn | undefined;
+-    let cancelled = false;
+-
+-    listen<string>("face-preview-frame", (event) => {
+-      if (previewRef.current) {
+-        previewRef.current.src = `data:image/jpeg;base64,${event.payload}`;
+-      }
+-    }).then((u) => {
+-      if (cancelled) {
+-        u();
+-      } else {
+-        unlisten = u;
+-      }
+-    });
+-
+-    return () => {
+-      cancelled = true;
+-      unlisten?.();
+-    };
+-  }, [capturing]);
+-
+-  return (
+-    <div className="p-4 rounded-lg bg-muted/50 border border-border/50">
+-      <h4 className="font-medium mb-3 flex items-center gap-2">
+-        <Camera className="w-4 h-4" />
+-        Face Capture
+-      </h4>
+-
+-      <div className="grid gap-4">
+-        <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
+-          <img
+-            ref={previewRef}
+-            alt="Camera preview"
+-            className={`w-full h-full object-cover ${capturing ? "" : "hidden"}`}
+-          />
+-          {!capturing && (
+-            <div className="absolute inset-0 flex items-center justify-center text-muted-foreground">
+-              <Camera className="w-12 h-12 opacity-50" />
+-            </div>
+-          )}
+-        </div>
+-
+-        <div className="flex gap-2">
+-          {!capturing ? (
+-            <Button type="button" onClick={startCamera} className="flex-1">
+-              <Camera className="w-4 h-4 mr-2" />
+-              Start Camera
+-            </Button>
+-          ) : (
+-            <>
+-              <Button type="button" onClick={capturePhoto} className="flex-1">
+-                <Circle className="w-4 h-4 mr-2" />
+-                Capture
+-              </Button>
+-              <Button type="button" variant="outline" onClick={stopCamera}>
+-                <Square className="w-4 h-4 mr-2" />
+-                Stop
+-              </Button>
+-            </>
+-          )}
+-        </div>
+-
+-        {capturing && (
+-          <p className="text-[10px] text-muted-foreground">
+-            Native preview via openpnp-capture (works cross-distro).
+-          </p>
+-        )}
+-
+-        {faceImages.length > 0 && (
+-          <div>
+-            <p className="text-sm text-muted-foreground mb-2">
+-              Saved Faces ({faceImages.length})
+-            </p>
+-            <div className="grid grid-cols-4 gap-2">
+-              {faceImages.map((path) => (
+-                <div key={path} className="relative group">
+-                  <div className="aspect-square bg-muted rounded-lg overflow-hidden">
+-                    <img
+-                      src={convertFileSrc(path)}
+-                      alt="Captured face"
+-                      className="w-full h-full object-cover"
+-                    />
+-                  </div>
+-                  <button
+-                    type="button"
+-                    onClick={() => deleteFace(path)}
+-                    className="absolute top-1 right-1 p-1 rounded bg-destructive/80 text-destructive-foreground cursor-pointer"
+-                  >
+-                    <Trash2 className="w-3 h-3 text-white" />
+-                  </button>
+-                </div>
+-              ))}
+-            </div>
+-          </div>
+-        )}
+-      </div>
+-    </div>
+-  );
+-}
+diff --git a/app/src/app/configuration/-components/face/FaceEnrolment.tsx b/app/src/app/configuration/-components/face/FaceEnrolment.tsx
+new file mode 100644
+index 0000000..1b43cbe
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/FaceEnrolment.tsx
+@@ -0,0 +1,199 @@
++import { listen, type UnlistenFn } from "@tauri-apps/api/event";
++import { Camera, Circle, Loader2, Repeat, Square } from "lucide-react";
++import { useEffect, useRef, useState } from "react";
++import { toast } from "sonner";
++import { cmd } from "@/commands";
++import { Button } from "@/components/ui/button";
++import { enrolmentCameras } from "./faceMode";
++import { usePreviewSession } from "./usePreviewSession";
++
++/** Pictures the guided enrolment takes, as `s15-face enrol` does. */
++export const GUIDED_COUNT = 5;
++
++interface Props {
++  face: Parameters<typeof enrolmentCameras>[0];
++  /** Why enrolment is not possible now (unsaved camera settings), or null. */
++  blocked: string | null;
++  /** After faces were added. */
++  onAdded: () => void;
++}
++
++const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
++
++/**
++ * Adds faces with the saved settings' cameras: the main camera's into
++ * faces/, and in both mode a pair per picture, the IR camera's into
++ * faces-ir/ (the preview switches to the IR camera and back: the cameras
++ * stream one at a time).
++ */
++export function FaceEnrolment({ face, blocked, onAdded }: Props) {
++  const previewRef = useRef<HTMLImageElement>(null);
++  const { main, pairIr } = enrolmentCameras(face);
++  const [busy, setBusy] = useState(false);
++  const [progress, setProgress] = useState<string | null>(null);
++  const cancelRef = useRef(false);
++  const {
++    active: capturing,
++    start,
++    stop,
++  } = usePreviewSession(
++    main,
++    (err) => toast.error(`Failed to start the camera: ${err}`),
++    () => previewRef.current?.removeAttribute("src"),
++  );
++
++  useEffect(() => {
++    if (!capturing) return;
++    let unlisten: UnlistenFn | undefined;
++    let cancelled = false;
++    listen<string>("face-preview-frame", (event) => {
++      if (previewRef.current) {
++        previewRef.current.src = `data:image/jpeg;base64,${event.payload}`;
++      }
++    }).then((u) => {
++      if (cancelled) u();
++      else unlisten = u;
++    });
++    return () => {
++      cancelled = true;
++      unlisten?.();
++    };
++  }, [capturing]);
++
++  // Leaving a blocked state (e.g. unsaved cameras) stops the preview.
++  useEffect(() => {
++    if (blocked) stop();
++  }, [blocked, stop]);
++
++  async function captureOnce(): Promise<boolean> {
++    try {
++      await cmd.face.captureInSession(pairIr);
++      return true;
++    } catch (err) {
++      setProgress(`${err}`);
++      return false;
++    }
++  }
++
++  async function single() {
++    setBusy(true);
++    setProgress(pairIr ? "Colour and IR picture..." : null);
++    if (await captureOnce()) {
++      toast.success(pairIr ? "Face pair saved" : "Face saved");
++      setProgress(null);
++      onAdded();
++    }
++    setBusy(false);
++  }
++
++  async function guided() {
++    setBusy(true);
++    cancelRef.current = false;
++    let saved = 0;
++    let tries = 0;
++    while (saved < GUIDED_COUNT && tries < GUIDED_COUNT * 3) {
++      if (cancelRef.current) break;
++      tries++;
++      setProgress(
++        `${saved}/${GUIDED_COUNT} saved. Look at the screen as you usually do; turn your head a little between pictures.`,
++      );
++      await sleep(pairIr ? 1000 : 2000);
++      if (cancelRef.current) break;
++      if (await captureOnce()) saved++;
++    }
++    setProgress(
++      `${saved} of ${GUIDED_COUNT} ${pairIr ? "face pairs" : "faces"} added.`,
++    );
++    if (saved > 0) onAdded();
++    setBusy(false);
++  }
++
++  const cameraText = pairIr
++    ? "the colour camera, each with an IR picture"
++    : face.camera === face.anti_spoofing.ir_camera
++      ? "the IR camera"
++      : "the colour camera";
++
++  return (
++    <div className="grid gap-3">
++      <div>
++        <h4 className="font-medium text-sm flex items-center gap-2">
++          <Camera className="w-4 h-4" />
++          Add faces
++        </h4>
++        <p className="text-xs text-muted-foreground">
++          {blocked ??
++            `With ${cameraText}. Sit as you usually do; add a few with and without glasses.`}
++        </p>
++      </div>
++
++      <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
++        <img
++          ref={previewRef}
++          alt="Camera preview"
++          className={`w-full h-full object-contain ${capturing ? "" : "hidden"}`}
++        />
++        {!capturing && (
++          <div className="absolute inset-0 flex items-center justify-center text-muted-foreground">
++            <Camera className="w-12 h-12 opacity-50" />
++          </div>
++        )}
++      </div>
++
++      <div className="flex gap-2">
++        {!capturing ? (
++          <Button
++            type="button"
++            onClick={start}
++            disabled={!!blocked || !main}
++            className="flex-1"
++          >
++            <Camera className="w-4 h-4 mr-2" />
++            Start camera
++          </Button>
++        ) : (
++          <>
++            <Button
++              type="button"
++              onClick={guided}
++              disabled={busy}
++              className="flex-1"
++            >
++              {busy ? (
++                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
++              ) : (
++                <Repeat className="w-4 h-4 mr-2" />
++              )}
++              Add {GUIDED_COUNT}
++            </Button>
++            <Button
++              type="button"
++              variant="outline"
++              onClick={single}
++              disabled={busy}
++            >
++              <Circle className="w-4 h-4 mr-2" />
++              Capture one
++            </Button>
++            <Button
++              type="button"
++              variant="outline"
++              onClick={() => {
++                cancelRef.current = true;
++                if (!busy) stop();
++              }}
++            >
++              <Square className="w-4 h-4 mr-2" />
++              {busy ? "Cancel" : "Stop"}
++            </Button>
++          </>
++        )}
++      </div>
++      {progress && (
++        <p className="text-xs text-muted-foreground" aria-live="polite">
++          {progress}
++        </p>
++      )}
++    </div>
++  );
++}
+diff --git a/app/src/app/configuration/-components/face/FaceModelsSection.tsx b/app/src/app/configuration/-components/face/FaceModelsSection.tsx
+index 2a06bee..769adfd 100644
+--- a/app/src/app/configuration/-components/face/FaceModelsSection.tsx
++++ b/app/src/app/configuration/-components/face/FaceModelsSection.tsx
+@@ -3,6 +3,7 @@ import type { BiopassConfig, Model } from "@/types/config";
+ import { ModelSelect } from "../methods/shared/ModelSelect";
+ import { Threshold } from "../methods/shared/Threshold";
+ import { AntiSpoofingSection } from "./AntiSpoofingSection";
++import { RECOMMENDED_THRESHOLD } from "./faceMode";
+ 
+ interface Props {
+   detectionModels: Model[];
+@@ -89,6 +90,19 @@ export function FaceModelsSection({
+           />
+         </div>
+       </div>
++      <p
++        className={`mt-2 text-xs ${
++          config.recognition.threshold < RECOMMENDED_THRESHOLD
++            ? "text-amber-600 dark:text-amber-400"
++            : "text-muted-foreground"
++        }`}
++      >
++        A face matches when it scores above the threshold against one enrolled
++        face (1 = the same picture).{" "}
++        {config.recognition.threshold < RECOMMENDED_THRESHOLD
++          ? `Below ${RECOMMENDED_THRESHOLD * 100}% a stranger matches far more often (about 4% of strangers over 5 scans at 50%, 0.3% at 60%).`
++          : `If your own face scores close to it, add more faces rather than lowering it: Test shows the scores.`}
++      </p>
+       <AntiSpoofingSection antiSpoofModels={antiSpoofModels} />
+     </div>
+   );
+diff --git a/app/src/app/configuration/-components/face/FaceSets.tsx b/app/src/app/configuration/-components/face/FaceSets.tsx
+new file mode 100644
+index 0000000..8fcc270
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/FaceSets.tsx
+@@ -0,0 +1,188 @@
++import { convertFileSrc } from "@tauri-apps/api/core";
++import { Trash2 } from "lucide-react";
++import { useState } from "react";
++import { toast } from "sonner";
++import { cmd } from "@/commands";
++import { Button } from "@/components/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog";
++import { cn } from "@/lib/utils";
++import type { FaceDir, FaceSet } from "@/types/config";
++import { type FaceMode, faceDirRole } from "./faceMode";
++
++interface Props {
++  sets: readonly FaceSet[];
++  /** The saved mode: the directories follow it. */
++  mode: FaceMode | null;
++  /** The last test scan's score per face, and its threshold. */
++  scores: ReadonlyMap<string, number>;
++  threshold: number | null;
++  onChanged: () => void;
++}
++
++/** File name of a face path. */
++export function faceName(path: string): string {
++  return path.slice(path.lastIndexOf("/") + 1);
++}
++
++/**
++ * The enrolled faces of every camera, labelled by camera and whether face
++ * unlock uses them now, each with its score in the last test scan.
++ */
++export function FaceSets({ sets, mode, scores, threshold, onChanged }: Props) {
++  const [confirmDir, setConfirmDir] = useState<FaceDir | null>(null);
++  const shown = sets.filter((s) => s.dir === "faces" || s.paths.length > 0);
++
++  async function remove(paths: readonly string[]) {
++    let failed = 0;
++    for (const path of paths) {
++      try {
++        await cmd.face.deleteImage(path);
++      } catch (err) {
++        failed++;
++        console.error("Failed to delete", path, err);
++      }
++    }
++    if (failed > 0) toast.error(`${failed} could not be deleted`);
++    else toast.success(paths.length === 1 ? "Face deleted" : "Faces deleted");
++    onChanged();
++  }
++
++  const confirmSet = sets.find((s) => s.dir === confirmDir);
++
++  return (
++    <div className="grid gap-4">
++      {shown.map((set) => {
++        const role = faceDirRole(set.dir, mode);
++        return (
++          <div key={set.dir} className="grid gap-2">
++            <div className="flex items-center justify-between gap-2">
++              <p className="text-sm">
++                <span className="font-medium">{role.camera}</span>{" "}
++                <span className="text-muted-foreground">
++                  ({set.paths.length}, {set.dir}/)
++                  {role.used ? "" : " · not used in this mode, kept"}
++                </span>
++              </p>
++              {set.paths.length > 0 && (
++                <Button
++                  type="button"
++                  variant="ghost"
++                  size="sm"
++                  onClick={() => setConfirmDir(set.dir)}
++                >
++                  <Trash2 />
++                  Delete all
++                </Button>
++              )}
++            </div>
++            {set.paths.length === 0 ? (
++              <p className="text-xs text-muted-foreground">None yet.</p>
++            ) : (
++              <div className="grid grid-cols-5 gap-2">
++                {set.paths.map((path) => (
++                  <FaceThumb
++                    key={path}
++                    path={path}
++                    score={scores.get(path)}
++                    threshold={threshold}
++                    onDelete={() => remove([path])}
++                  />
++                ))}
++              </div>
++            )}
++          </div>
++        );
++      })}
++
++      <Dialog
++        open={confirmDir !== null}
++        onOpenChange={(open) => {
++          if (!open) setConfirmDir(null);
++        }}
++      >
++        <DialogContent>
++          <DialogHeader>
++            <DialogTitle>
++              Delete all {confirmSet?.paths.length} faces in {confirmDir}/?
++            </DialogTitle>
++            <DialogDescription>
++              To enrol again: delete them, then add new ones with Add faces.
++            </DialogDescription>
++          </DialogHeader>
++          <DialogFooter>
++            <Button
++              type="button"
++              variant="outline"
++              onClick={() => setConfirmDir(null)}
++            >
++              Cancel
++            </Button>
++            <Button
++              type="button"
++              variant="destructive"
++              onClick={() => {
++                if (confirmSet) void remove(confirmSet.paths);
++                setConfirmDir(null);
++              }}
++            >
++              Delete all
++            </Button>
++          </DialogFooter>
++        </DialogContent>
++      </Dialog>
++    </div>
++  );
++}
++
++/** A face image with its last score (red below the threshold) and delete. */
++export function FaceThumb({
++  path,
++  score,
++  threshold,
++  onDelete,
++}: {
++  path: string;
++  score: number | undefined;
++  threshold: number | null;
++  onDelete: () => void;
++}) {
++  const low = score !== undefined && threshold !== null && score <= threshold;
++  return (
++    <div className="relative group">
++      <div className="aspect-square bg-muted rounded-lg overflow-hidden">
++        <img
++          src={convertFileSrc(path)}
++          alt={faceName(path)}
++          title={faceName(path)}
++          className="w-full h-full object-cover"
++        />
++      </div>
++      {score !== undefined && (
++        <span
++          className={cn(
++            "absolute bottom-1 left-1 rounded px-1 text-[10px] font-mono text-white",
++            low ? "bg-destructive/90" : "bg-emerald-600/90",
++          )}
++          title="Score in the last test scan"
++        >
++          {score.toFixed(2)}
++        </span>
++      )}
++      <button
++        type="button"
++        onClick={onDelete}
++        aria-label={`Delete ${faceName(path)}`}
++        className="absolute top-1 right-1 p-1 rounded bg-destructive/80 cursor-pointer"
++      >
++        <Trash2 className="w-3 h-3 text-white" />
++      </button>
++    </div>
++  );
++}
+diff --git a/app/src/app/configuration/-components/face/FaceSetting.tsx b/app/src/app/configuration/-components/face/FaceSetting.tsx
+index c302b72..99211e1 100644
+--- a/app/src/app/configuration/-components/face/FaceSetting.tsx
++++ b/app/src/app/configuration/-components/face/FaceSetting.tsx
+@@ -1,15 +1,42 @@
+-import { useMemo } from "react";
++import { TriangleAlert } from "lucide-react";
++import { useMemo, useState } from "react";
++import { useWatch } from "react-hook-form";
+ import { CONFIG_LIMITS } from "@/bindings";
++import type { BiopassConfig, ScanResult } from "@/types/config";
+ import { NumberField } from "../NumberField";
+-import { CameraProfilesSection } from "./CameraProfilesSection";
+-import { FaceCapture } from "./FaceCapture";
++import { CamerasSection } from "./CamerasSection";
++import { FaceEnrolment } from "./FaceEnrolment";
+ import { FaceModelsSection } from "./FaceModelsSection";
++import { FaceSets } from "./FaceSets";
++import { enrolledPerCamera, faceModeOf, missingFaces } from "./faceMode";
++import { useSavedSettings } from "./savedSettings";
++import { TestScan } from "./TestScan";
++import { useCameras } from "./useCameras";
++import { useFaceSets } from "./useFaceSets";
+ import { useModels } from "./useModels";
+-import { useVideoDevices } from "./useVideoDevices";
++
++type FaceConfig = BiopassConfig["methods"]["face"];
++
++/** Whether the form's cameras differ from the saved ones. */
++function camerasChanged(a: FaceConfig, b: FaceConfig): boolean {
++  return (
++    (a.camera || null) !== (b.camera || null) ||
++    (a.anti_spoofing.ir_camera || null) !==
++      (b.anti_spoofing.ir_camera || null) ||
++    a.anti_spoofing.ir_recognition !== b.anti_spoofing.ir_recognition
++  );
++}
+ 
+ export function FaceSetting() {
+   const models = useModels();
+-  const videoDevices = useVideoDevices();
++  const { cameras, choices, error } = useCameras();
++  const saved = useSavedSettings();
++  const { sets, reload } = useFaceSets(saved.version);
++  const [scan, setScan] = useState<ScanResult | null>(null);
++  const face = useWatch<BiopassConfig, "methods.face">({
++    name: "methods.face",
++  });
++  const config = useWatch<BiopassConfig>();
+ 
+   // Memoized so useModelFileStatus (in AntiSpoofingSection and ModelSelect)
+   // rechecks files only when the model list changes, not on every render.
+@@ -22,8 +49,65 @@ export function FaceSetting() {
+     [models],
+   );
+ 
++  const savedFace = saved.config.methods.face;
++  const savedMode = faceModeOf(savedFace);
++  const enrolBlocked = !savedMode
++    ? "Choose the cameras above and save first."
++    : camerasChanged(face, savedFace)
++      ? "Save the camera settings first: faces go to the saved settings' cameras."
++      : null;
++  const missing = missingFaces(
++    faceModeOf(face),
++    enrolledPerCamera(sets, savedMode),
++  );
++  const unsaved = JSON.stringify(config) !== JSON.stringify(saved.config);
++
++  const scores = useMemo(
++    () => new Map((scan?.scores ?? []).map((s) => [s.path, s.score])),
++    [scan],
++  );
++
+   return (
+     <div className="grid gap-4">
++      <CamerasSection
++        cameras={cameras}
++        choices={choices}
++        camerasError={error}
++      />
++
++      <div className="grid gap-4 p-4 rounded-lg bg-muted/50 border border-border/50">
++        <div>
++          <h4 className="font-medium text-sm">Enrolled faces</h4>
++          <p className="text-xs text-muted-foreground">
++            Faces match only the camera that took them.
++          </p>
++        </div>
++        {missing.length > 0 && (
++          <p className="flex gap-2 text-xs text-amber-600 dark:text-amber-400">
++            <TriangleAlert className="w-4 h-4 shrink-0" />
++            No faces yet for the {missing.join(" and the ")}: face unlock does
++            not try until you add some.
++          </p>
++        )}
++        <FaceSets
++          sets={sets}
++          mode={savedMode}
++          scores={scores}
++          threshold={scan?.threshold ?? null}
++          onChanged={() => {
++            void reload();
++          }}
++        />
++        <FaceEnrolment
++          face={savedFace}
++          blocked={enrolBlocked}
++          onAdded={() => {
++            void reload();
++          }}
++        />
++        <TestScan unsaved={unsaved} result={scan} onResult={setScan} />
++      </div>
++
+       <div className="grid grid-cols-2 gap-6 p-4 rounded-lg bg-muted/50 border border-border/50">
+         <NumberField
+           name="methods.face.retries"
+@@ -41,10 +125,6 @@ export function FaceSetting() {
+         />
+       </div>
+ 
+-      <CameraProfilesSection videoDevices={videoDevices} />
+-
+-      <FaceCapture videoDevices={videoDevices} />
+-
+       <FaceModelsSection
+         detectionModels={modelsByTask.detection}
+         recognitionModels={modelsByTask.recognition}
+diff --git a/app/src/app/configuration/-components/face/TestScan.tsx b/app/src/app/configuration/-components/face/TestScan.tsx
+new file mode 100644
+index 0000000..44b9503
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/TestScan.tsx
+@@ -0,0 +1,96 @@
++import { Loader2, ScanFace } from "lucide-react";
++import { useState } from "react";
++import { toast } from "sonner";
++import { cmd } from "@/commands";
++import { Button } from "@/components/ui/button";
++import { cn } from "@/lib/utils";
++import type { ScanOutcome, ScanResult } from "@/types/config";
++
++const OUTCOME_TEXT: Record<ScanOutcome, string> = {
++  match: "Recognised: face unlock would unlock.",
++  no_match:
++    "Not recognised: a face was seen but did not match (or anti-spoofing flagged it). On the lock screen this counts as a false face.",
++  no_face: "No face seen in time (does not count on the lock screen).",
++  not_tried:
++    "Face not tried: no settings saved, no faces enrolled for a camera, or no camera.",
++  failed: "The scan failed.",
++};
++
++interface Props {
++  /** Why the scan may differ from the form (unsaved changes), or null. */
++  unsaved: boolean;
++  result: ScanResult | null;
++  onResult: (result: ScanResult) => void;
++}
++
++/** One face scan with the saved settings, as login runs it, step by step. */
++export function TestScan({ unsaved, result, onResult }: Props) {
++  const [busy, setBusy] = useState(false);
++
++  async function run() {
++    setBusy(true);
++    try {
++      onResult(await cmd.face.testScan());
++    } catch (err) {
++      toast.error(`Face scan failed: ${err}`);
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <div className="grid gap-3">
++      <div className="flex items-center justify-between gap-4">
++        <div>
++          <h4 className="font-medium text-sm flex items-center gap-2">
++            <ScanFace className="w-4 h-4" />
++            Test face unlock
++          </h4>
++          <p className="text-xs text-muted-foreground">
++            One scan with the saved settings, as the lock screen runs it: the
++            face's size, each enrolled face's score. It counts nowhere.
++            {unsaved && " Save first: unsaved changes are not used."}
++          </p>
++        </div>
++        <Button type="button" onClick={run} disabled={busy}>
++          {busy ? (
++            <Loader2 className="w-4 h-4 mr-2 animate-spin" />
++          ) : (
++            <ScanFace className="w-4 h-4 mr-2" />
++          )}
++          {busy ? "Look at the screen..." : "Test"}
++        </Button>
++      </div>
++
++      {result && (
++        <div className="grid gap-2 rounded-md border border-border p-3">
++          <p
++            className={cn(
++              "text-sm font-medium",
++              result.outcome === "match"
++                ? "text-emerald-600 dark:text-emerald-400"
++                : "text-destructive",
++            )}
++          >
++            {OUTCOME_TEXT[result.outcome]}{" "}
++            <span className="font-normal text-muted-foreground">
++              ({(result.duration_ms / 1000).toFixed(1)} s)
++            </span>
++          </p>
++          {result.threshold !== null && result.scores.length > 0 && (
++            <p className="text-xs text-muted-foreground">
++              Each compared face shows its best score above (it matches above{" "}
++              {result.threshold.toFixed(2)}; red: not above). Faces that stay
++              red when you test are worth deleting and adding again.
++            </p>
++          )}
++          {result.steps.length > 0 && (
++            <pre className="max-h-48 overflow-auto rounded bg-muted p-2 text-[11px] leading-relaxed whitespace-pre-wrap">
++              {result.steps.join("\n")}
++            </pre>
++          )}
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/app/src/app/configuration/-components/face/VideoDeviceSelect.tsx b/app/src/app/configuration/-components/face/VideoDeviceSelect.tsx
+deleted file mode 100644
+index e21e365..0000000
+--- a/app/src/app/configuration/-components/face/VideoDeviceSelect.tsx
++++ /dev/null
+@@ -1,103 +0,0 @@
+-import {
+-  Select,
+-  SelectContent,
+-  SelectItem,
+-  SelectTrigger,
+-  SelectValue,
+-} from "@/components/ui/select";
+-import type { VideoDeviceInfo } from "@/types/config";
+-import { DISABLED_OPTION, devicePathFor, selectValueFor } from "./selectValue";
+-
+-const UNAVAILABLE_DEVICE_OPTION = "__unavailable_device__";
+-
+-interface Props {
+-  id?: string;
+-  /** Saved path; null = the "off" option, or unset without one. */
+-  value: string | null | undefined;
+-  onChange: (value: string | null) => void;
+-  videoDevices: VideoDeviceInfo[];
+-  /** Label of the option that saves null; omit to offer devices only. */
+-  offLabel?: string;
+-  unavailableLabel: string;
+-  placeholder?: string;
+-  disabled?: boolean;
+-  /** With a null value: nothing chosen yet, so show the placeholder. */
+-  unset?: boolean;
+-}
+-
+-/** A camera picker that shows device info and saves its stable path. */
+-export function VideoDeviceSelect({
+-  id,
+-  value,
+-  onChange,
+-  videoDevices,
+-  offLabel,
+-  unavailableLabel,
+-  placeholder,
+-  disabled,
+-  unset,
+-}: Props) {
+-  // Radix shows the placeholder for "".
+-  const selectValue =
+-    (unset || offLabel === undefined) && !value
+-      ? ""
+-      : selectValueFor(
+-          devicePathFor(value || null, videoDevices),
+-          videoDevices.map((device) => device.path),
+-          UNAVAILABLE_DEVICE_OPTION,
+-        );
+-  const selected = videoDevices.find((device) => device.path === selectValue);
+-
+-  return (
+-    <Select
+-      value={selectValue}
+-      disabled={disabled}
+-      onValueChange={(next) => onChange(next === DISABLED_OPTION ? null : next)}
+-    >
+-      <SelectTrigger id={id} className="h-10 w-full min-w-0">
+-        {/* The name only; the list shows details to tell devices apart. */}
+-        <SelectValue
+-          className="min-w-0 flex-1 overflow-hidden text-left"
+-          placeholder={placeholder ?? offLabel}
+-        >
+-          {selected && <span className="truncate">{selected.label}</span>}
+-        </SelectValue>
+-      </SelectTrigger>
+-      <SelectContent>
+-        {offLabel !== undefined && (
+-          <SelectItem value={DISABLED_OPTION}>{offLabel}</SelectItem>
+-        )}
+-        {selectValue === UNAVAILABLE_DEVICE_OPTION && (
+-          <SelectItem value={UNAVAILABLE_DEVICE_OPTION} disabled>
+-            {unavailableLabel}
+-          </SelectItem>
+-        )}
+-        {videoDevices.length > 0 ? (
+-          videoDevices.map((device) => (
+-            <SelectItem key={device.path} value={device.path}>
+-              <DeviceLabel device={device} />
+-            </SelectItem>
+-          ))
+-        ) : (
+-          <SelectItem value="__no_devices__" disabled>
+-            No video devices found
+-          </SelectItem>
+-        )}
+-      </SelectContent>
+-    </Select>
+-  );
+-}
+-
+-/** The device's label, with its details muted below. */
+-function DeviceLabel({ device }: { device: VideoDeviceInfo }) {
+-  return (
+-    <span className="flex min-w-0 flex-col">
+-      <span className="truncate">{device.label}</span>
+-      {device.details && (
+-        <span className="truncate text-xs text-muted-foreground">
+-          {device.details}
+-        </span>
+-      )}
+-    </span>
+-  );
+-}
+diff --git a/app/src/app/configuration/-components/face/faceMode.test.ts b/app/src/app/configuration/-components/face/faceMode.test.ts
+new file mode 100644
+index 0000000..5965358
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/faceMode.test.ts
+@@ -0,0 +1,240 @@
++import { describe, expect, test } from "bun:test";
++import type { BiopassConfig, CameraInfo, FaceSet } from "@/types/config";
++import {
++  colourCameraOf,
++  defaultCameras,
++  enrolledPerCamera,
++  enrolmentCameras,
++  faceDirRole,
++  faceModeOf,
++  mainIsIr,
++  missingFaces,
++  RECOMMENDED_MIN_FACE_HEIGHT,
++  RECOMMENDED_THRESHOLD,
++  withFaceMode,
++  withoutCameraProfiles,
++} from "./faceMode";
++
++const IR = "/base/soc@0/cci@ac15000/i2c-bus@0/camera@24";
++const RGB = "/base/soc@0/cci@ac16000/i2c-bus@1/camera@36";
++
++function config(): BiopassConfig {
++  return {
++    schema_version: 2,
++    strategy: {
++      debug: false,
++      execution_mode: "parallel",
++      order: ["face", "fingerprint"],
++      ignore_services: ["polkit-1", "pkexec"],
++    },
++    methods: {
++      face: {
++        enable: true,
++        retries: 5,
++        retry_delay: 200,
++        camera: null,
++        camera_profiles: [],
++        detection: {
++          model_id: "yolov8n-face",
++          threshold: 0.5,
++          min_face_height: 0,
++        },
++        recognition: { model_id: "edgeface-s-gamma-05", threshold: 0.5 },
++        anti_spoofing: {
++          enable: false,
++          model: { model_id: "mobilenetv3-antispoof", threshold: 0.8 },
++          ir_camera: null,
++          ir_warmup_delay_ms: 300,
++          ir_presence_timeout_ms: 1500,
++          ir_recognition: false,
++        },
++      },
++      fingerprint: { enable: false, retries: 1, timeout: 5000 },
++    },
++    appearance: "system",
++  };
++}
++
++const face = () => config().methods.face;
++
++describe("faceModeOf", () => {
++  test("no camera or no IR camera: no mode", () => {
++    expect(faceModeOf(face())).toBeNull();
++    expect(faceModeOf({ ...face(), camera: RGB })).toBeNull();
++  });
++
++  test("the IR camera as the main camera is ir", () => {
++    const f = withFaceMode(face(), "ir", { ir: IR, colour: RGB });
++    expect(f.camera).toBe(IR);
++    expect(faceModeOf(f)).toBe("ir");
++    expect(mainIsIr(f)).toBe(true);
++  });
++
++  test("the colour camera recognises in rgb and both", () => {
++    const rgb = withFaceMode(face(), "rgb", { ir: IR, colour: RGB });
++    const both = withFaceMode(face(), "both", { ir: IR, colour: RGB });
++    expect(faceModeOf(rgb)).toBe("rgb");
++    expect(faceModeOf(both)).toBe("both");
++    expect(rgb.anti_spoofing.ir_recognition).toBe(false);
++    expect(both.anti_spoofing.ir_recognition).toBe(true);
++    expect(mainIsIr(both)).toBe(false);
++  });
++
++  test("camera profiles: no mode (face unlock refuses them)", () => {
++    const f = withFaceMode(face(), "ir", { ir: IR, colour: RGB });
++    expect(
++      faceModeOf({
++        ...f,
++        camera_profiles: [
++          { camera: IR, ir_camera: IR, allow_without_ir: false },
++        ],
++      }),
++    ).toBeNull();
++  });
++});
++
++describe("withFaceMode", () => {
++  test("writes the recommended minimum face height and threshold", () => {
++    const f = withFaceMode(face(), "ir", { ir: IR, colour: RGB });
++    expect(f.detection.min_face_height).toBe(RECOMMENDED_MIN_FACE_HEIGHT);
++    expect(f.recognition.threshold).toBe(RECOMMENDED_THRESHOLD);
++    expect(f.camera_profiles).toEqual([]);
++  });
++
++  test("keeps stricter values the user chose", () => {
++    const strict = face();
++    strict.detection.min_face_height = 0.3;
++    strict.recognition.threshold = 0.7;
++    const f = withFaceMode(strict, "both", { ir: IR, colour: RGB });
++    expect(f.detection.min_face_height).toBe(0.3);
++    expect(f.recognition.threshold).toBe(0.7);
++  });
++
++  test("anti-spoofing goes off in ir and stays as it was otherwise", () => {
++    const on = face();
++    on.anti_spoofing.enable = true;
++    expect(
++      withFaceMode(on, "ir", { ir: IR, colour: RGB }).anti_spoofing.enable,
++    ).toBe(false);
++    expect(
++      withFaceMode(on, "rgb", { ir: IR, colour: RGB }).anti_spoofing.enable,
++    ).toBe(true);
++  });
++
++  test("other settings are kept", () => {
++    const f = face();
++    f.retries = 3;
++    f.anti_spoofing.ir_presence_timeout_ms = 900;
++    const out = withFaceMode(f, "rgb", { ir: IR, colour: RGB });
++    expect(out.retries).toBe(3);
++    expect(out.anti_spoofing.ir_presence_timeout_ms).toBe(900);
++    expect(out.detection.model_id).toBe("yolov8n-face");
++  });
++});
++
++describe("withoutCameraProfiles", () => {
++  test("the first profile's cameras become the camera settings", () => {
++    const c = config();
++    c.methods.face.camera_profiles = [
++      { camera: IR, ir_camera: IR, allow_without_ir: false },
++      { camera: RGB, ir_camera: null, allow_without_ir: true },
++    ];
++    const { config: out, hadProfiles } = withoutCameraProfiles(c);
++    expect(hadProfiles).toBe(true);
++    expect(out.methods.face.camera_profiles).toEqual([]);
++    expect(out.methods.face.camera).toBe(IR);
++    expect(out.methods.face.anti_spoofing.ir_camera).toBe(IR);
++    expect(faceModeOf(out.methods.face)).toBe("ir");
++  });
++
++  test("a profile without an IR camera keeps the fallback one", () => {
++    const c = config();
++    c.methods.face.anti_spoofing.ir_camera = IR;
++    c.methods.face.camera_profiles = [
++      { camera: RGB, ir_camera: null, allow_without_ir: false },
++    ];
++    const out = withoutCameraProfiles(c).config.methods.face;
++    expect(out.camera).toBe(RGB);
++    expect(out.anti_spoofing.ir_camera).toBe(IR);
++  });
++
++  test("no profiles: unchanged", () => {
++    const c = config();
++    expect(withoutCameraProfiles(c)).toEqual({ config: c, hadProfiles: false });
++  });
++});
++
++function cam(id: string, mono: boolean): CameraInfo {
++  return { id, model: id, mono, video_paths: [] };
++}
++
++describe("defaultCameras", () => {
++  test("the first mono camera is the IR camera", () => {
++    expect(defaultCameras([cam(RGB, false), cam(IR, true)])).toEqual({
++      ir: IR,
++      colour: RGB,
++    });
++    expect(defaultCameras([])).toEqual({ ir: null, colour: null });
++  });
++});
++
++describe("cameras per mode", () => {
++  const both = withFaceMode(face(), "both", { ir: IR, colour: RGB });
++  const ir = withFaceMode(face(), "ir", { ir: IR, colour: RGB });
++  const rgb = withFaceMode(face(), "rgb", { ir: IR, colour: RGB });
++
++  test("enrolment pairs the IR camera only in both", () => {
++    expect(enrolmentCameras(both)).toEqual({ main: RGB, pairIr: IR });
++    expect(enrolmentCameras(ir)).toEqual({ main: IR, pairIr: null });
++    expect(enrolmentCameras(rgb)).toEqual({ main: RGB, pairIr: null });
++  });
++
++  test("the colour camera of a mode", () => {
++    expect(colourCameraOf(both)).toBe(RGB);
++    expect(colourCameraOf(ir)).toBeNull();
++  });
++});
++
++describe("face directories", () => {
++  test("faces/ is the main camera's", () => {
++    expect(faceDirRole("faces", "ir")).toEqual({
++      camera: "IR camera",
++      used: true,
++    });
++    expect(faceDirRole("faces", "both")).toEqual({
++      camera: "Colour camera",
++      used: true,
++    });
++    expect(faceDirRole("faces", null).used).toBe(false);
++  });
++
++  test("faces-ir/ counts only in both, faces-rgb/ never", () => {
++    expect(faceDirRole("faces-ir", "both").used).toBe(true);
++    expect(faceDirRole("faces-ir", "rgb").used).toBe(false);
++    expect(faceDirRole("faces-rgb", "ir")).toEqual({
++      camera: "Colour camera",
++      used: false,
++    });
++  });
++
++  const sets: FaceSet[] = [
++    { dir: "faces", paths: ["a", "b"] },
++    { dir: "faces-ir", paths: ["c"] },
++    { dir: "faces-rgb", paths: [] },
++  ];
++
++  test("faces per camera follow the saved mode", () => {
++    expect(enrolledPerCamera(sets, "both")).toEqual({ ir: 1, colour: 2 });
++    expect(enrolledPerCamera(sets, "ir")).toEqual({ ir: 2, colour: 0 });
++  });
++
++  test("missing faces per mode", () => {
++    expect(missingFaces("ir", { ir: 0, colour: 3 })).toEqual(["IR camera"]);
++    expect(missingFaces("both", { ir: 0, colour: 0 })).toEqual([
++      "IR camera",
++      "Colour camera",
++    ]);
++    expect(missingFaces("rgb", { ir: 0, colour: 1 })).toEqual([]);
++    expect(missingFaces(null, { ir: 0, colour: 0 })).toEqual([]);
++  });
++});
+diff --git a/app/src/app/configuration/-components/face/faceMode.ts b/app/src/app/configuration/-components/face/faceMode.ts
+new file mode 100644
+index 0000000..77b83f7
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/faceMode.ts
+@@ -0,0 +1,199 @@
++import type {
++  BiopassConfig,
++  CameraInfo,
++  FaceDir,
++  FaceSet,
++} from "@/types/config";
++
++type FaceConfig = BiopassConfig["methods"]["face"];
++
++/**
++ * Which camera recognises:
++ * - ir: the IR camera (`camera` = `anti_spoofing.ir_camera`); works in the
++ *   dark. The AI anti-spoofing models are trained on colour pictures, so
++ *   they stay off.
++ * - rgb: the colour camera; the IR camera only checks that it sees a face.
++ * - both: the colour and the IR camera each recognise, against their own
++ *   faces (`anti_spoofing.ir_recognition`).
++ */
++export type FaceMode = "ir" | "rgb" | "both";
++
++export const FACE_MODES: readonly FaceMode[] = ["ir", "both", "rgb"];
++
++/**
++ * Written where a mode is chosen and the settings have none, or a looser
++ * one: a face must fill a fifth of the picture's height (in front of the
++ * screen, not across the room), and a match must score above 0.6.
++ */
++export const RECOMMENDED_MIN_FACE_HEIGHT = 0.2;
++export const RECOMMENDED_THRESHOLD = 0.6;
++
++/** The mode `face` is in, or null when it names no IR camera or no camera. */
++export function faceModeOf(face: FaceConfig): FaceMode | null {
++  const camera = face.camera || null;
++  const ir = face.anti_spoofing.ir_camera || null;
++  if (!camera || !ir || face.camera_profiles.length > 0) return null;
++  if (camera === ir) return "ir";
++  return face.anti_spoofing.ir_recognition ? "both" : "rgb";
++}
++
++/** Whether `face`'s main camera is its IR camera: faces/ holds IR faces. */
++export function mainIsIr(face: FaceConfig): boolean {
++  return faceModeOf(face) === "ir";
++}
++
++/**
++ * `face` set to `mode` with these cameras: `camera`, `anti_spoofing.ir_camera`
++ * and `ir_recognition`; no camera profiles; anti-spoofing off in ir; the
++ * recommended minimum face height and threshold where the settings have none
++ * or a looser one.
++ */
++export function withFaceMode(
++  face: FaceConfig,
++  mode: FaceMode,
++  cameras: { ir: string; colour: string | null },
++): FaceConfig {
++  const camera = mode === "ir" ? cameras.ir : cameras.colour;
++  const minHeight = face.detection.min_face_height;
++  return {
++    ...face,
++    camera,
++    camera_profiles: [],
++    detection: {
++      ...face.detection,
++      min_face_height:
++        minHeight > 0 && minHeight <= 1
++          ? minHeight
++          : RECOMMENDED_MIN_FACE_HEIGHT,
++    },
++    recognition: {
++      ...face.recognition,
++      threshold: Math.max(face.recognition.threshold, RECOMMENDED_THRESHOLD),
++    },
++    anti_spoofing: {
++      ...face.anti_spoofing,
++      ir_camera: cameras.ir,
++      ir_recognition: mode === "both",
++      enable: mode === "ir" ? false : face.anti_spoofing.enable,
++    },
++  };
++}
++
++/**
++ * `config` without camera profiles: the first profile's cameras go into
++ * `camera` and `anti_spoofing.ir_camera` (an older save of this app turned
++ * them into a profile; face unlock here refuses profiles). `hadProfiles`
++ * says whether anything changed.
++ */
++export function withoutCameraProfiles(config: BiopassConfig): {
++  config: BiopassConfig;
++  hadProfiles: boolean;
++} {
++  const face = config.methods.face;
++  const first = face.camera_profiles[0];
++  if (!first) return { config, hadProfiles: false };
++  return {
++    hadProfiles: true,
++    config: {
++      ...config,
++      methods: {
++        ...config.methods,
++        face: {
++          ...face,
++          camera: first.camera || face.camera,
++          camera_profiles: [],
++          anti_spoofing: {
++            ...face.anti_spoofing,
++            ir_camera: first.ir_camera || face.anti_spoofing.ir_camera,
++          },
++        },
++      },
++    },
++  };
++}
++
++/** The first IR (mono) and the first colour camera libcamera lists. */
++export function defaultCameras(cameras: readonly CameraInfo[]): {
++  ir: string | null;
++  colour: string | null;
++} {
++  return {
++    ir: cameras.find((c) => c.mono)?.id ?? null,
++    colour: cameras.find((c) => !c.mono)?.id ?? null,
++  };
++}
++
++/** The colour camera of `face`, if its mode has one. */
++export function colourCameraOf(face: FaceConfig): string | null {
++  const mode = faceModeOf(face);
++  return mode === "rgb" || mode === "both" ? face.camera : null;
++}
++
++/**
++ * The cameras enrolment takes pictures with: `camera` into faces/, and in
++ * both mode the IR camera too, into faces-ir/ (a pair per picture).
++ */
++export function enrolmentCameras(face: FaceConfig): {
++  main: string | null;
++  pairIr: string | null;
++} {
++  return {
++    main: face.camera || null,
++    pairIr: faceModeOf(face) === "both" ? face.anti_spoofing.ir_camera : null,
++  };
++}
++
++export interface FaceDirRole {
++  camera: "IR camera" | "Colour camera";
++  /** Whether face unlock matches these in this mode. */
++  used: boolean;
++}
++
++/**
++ * Whose faces each face directory holds in `mode` (the saved settings: the
++ * directories follow them), and whether face unlock uses them. Without a
++ * mode, faces/ is the colour camera's (the app's default camera).
++ */
++export function faceDirRole(dir: FaceDir, mode: FaceMode | null): FaceDirRole {
++  switch (dir) {
++    case "faces":
++      return mode === "ir"
++        ? { camera: "IR camera", used: true }
++        : { camera: "Colour camera", used: mode !== null };
++    case "faces-ir":
++      return { camera: "IR camera", used: mode === "both" };
++    case "faces-rgb":
++      return { camera: "Colour camera", used: false };
++  }
++}
++
++/**
++ * How many faces each camera has, with the directories as `saved` (the
++ * mode on disk) left them. Saving another mode moves the directories but
++ * keeps each camera's faces, so the counts hold for any mode.
++ */
++export function enrolledPerCamera(
++  sets: readonly FaceSet[],
++  saved: FaceMode | null,
++): { ir: number; colour: number } {
++  const count = (dir: FaceDir) =>
++    sets.find((s) => s.dir === dir)?.paths.length ?? 0;
++  return saved === "ir"
++    ? { ir: count("faces"), colour: count("faces-rgb") }
++    : { ir: count("faces-ir"), colour: count("faces") };
++}
++
++/** What face unlock is missing in `mode` with these enrolled faces. */
++export function missingFaces(
++  mode: FaceMode | null,
++  enrolled: { ir: number; colour: number },
++): ("IR camera" | "Colour camera")[] {
++  const missing: ("IR camera" | "Colour camera")[] = [];
++  if ((mode === "ir" || mode === "both") && enrolled.ir === 0) {
++    missing.push("IR camera");
++  }
++  if ((mode === "rgb" || mode === "both") && enrolled.colour === 0) {
++    missing.push("Colour camera");
++  }
++  return missing;
++}
+diff --git a/app/src/app/configuration/-components/face/savedSettings.tsx b/app/src/app/configuration/-components/face/savedSettings.tsx
+new file mode 100644
+index 0000000..a6dfae6
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/savedSettings.tsx
+@@ -0,0 +1,23 @@
++import { createContext, useContext } from "react";
++import type { BiopassConfig } from "@/types/config";
++
++export interface SavedSettings {
++  /**
++   * config.yaml as last loaded or saved (camera profiles of an older save
++   * read as the camera settings): the helper and the face directories follow
++   * it, so enrolment and the test scan use it, not the form.
++   */
++  config: BiopassConfig;
++  /** Bumped on every save: a save may move the enrolled faces. */
++  version: number;
++  /** The file had camera profiles, which the next save replaces. */
++  hadProfiles: boolean;
++}
++
++export const SavedSettingsContext = createContext<SavedSettings | null>(null);
++
++export function useSavedSettings(): SavedSettings {
++  const saved = useContext(SavedSettingsContext);
++  if (!saved) throw new Error("useSavedSettings outside SavedSettingsContext");
++  return saved;
++}
+diff --git a/app/src/app/configuration/-components/face/selectValue.test.ts b/app/src/app/configuration/-components/face/selectValue.test.ts
+index 523c34d..fda3a47 100644
+--- a/app/src/app/configuration/-components/face/selectValue.test.ts
++++ b/app/src/app/configuration/-components/face/selectValue.test.ts
+@@ -235,6 +235,21 @@ describe("withStablePaths", () => {
+     ]);
+   });
+ 
++  test("the camera fields are pinned too; libcamera ids are kept", () => {
++    const face = withStablePaths(
++      config([], "/dev/video2", "/dev/video0"),
++      docked,
++    ).methods.face;
++    expect(face.camera).toBe(DOCK);
++    expect(face.anti_spoofing.ir_camera).toBe(LID);
++    const ids = withStablePaths(
++      config([], "/base/cam@24", "/base/cam@36"),
++      docked,
++    ).methods.face;
++    expect(ids.camera).toBe("/base/cam@36");
++    expect(ids.anti_spoofing.ir_camera).toBe("/base/cam@24");
++  });
++
+   test("a node without a stable path is kept", () => {
+     const bare = [device("/dev/video0", "/dev/video0")];
+     expect(pinned([profile("/dev/video0", null)])(bare)).toEqual([
+diff --git a/app/src/app/configuration/-components/face/selectValue.ts b/app/src/app/configuration/-components/face/selectValue.ts
+index 946ffa2..0f05c8e 100644
+--- a/app/src/app/configuration/-components/face/selectValue.ts
++++ b/app/src/app/configuration/-components/face/selectValue.ts
+@@ -120,9 +120,10 @@ export function activeCameraProfile(
+ const RAW_NODE = /^\/dev\/video\d+$/;
+ 
+ /**
+- * `config` with each profile camera saved as a raw /dev/videoN (from before
+- * stable IDs) pinned to the stable path of the device at that number now:
+- * the device the pickers show, and the one auth opens today.
++ * `config` with each camera (and profile camera) saved as a raw /dev/videoN
++ * (from before stable IDs) pinned to the stable path of the device at that
++ * number now: the device the pickers show, and the one auth opens today.
++ * libcamera ids stay as they are.
+  */
+ export function withStablePaths(
+   config: BiopassConfig,
+@@ -139,6 +140,11 @@ export function withStablePaths(
+       ...config.methods,
+       face: {
+         ...face,
++        camera: stable(face.camera),
++        anti_spoofing: {
++          ...face.anti_spoofing,
++          ir_camera: stable(face.anti_spoofing.ir_camera),
++        },
+         camera_profiles: face.camera_profiles.map((p) => ({
+           ...p,
+           camera: stable(p.camera),
+diff --git a/app/src/app/configuration/-components/face/useCameras.ts b/app/src/app/configuration/-components/face/useCameras.ts
+new file mode 100644
+index 0000000..b77e137
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/useCameras.ts
+@@ -0,0 +1,80 @@
++import { useEffect, useState } from "react";
++import { cmd } from "@/commands";
++import type { CameraInfo, VideoDeviceInfo } from "@/types/config";
++
++export interface CameraChoice {
++  /** What config.yaml saves: a libcamera id or a video device path. */
++  value: string;
++  label: string;
++  /** IR, colour or a video device, and the id. */
++  details: string;
++  mono: boolean;
++}
++
++/**
++ * The cameras to choose from: libcamera's (by id; cameras behind one CSI-2
++ * receiver share their video nodes, so only the id tells them apart), then
++ * the video devices that belong to none of them (e.g. a USB camera libcamera
++ * does not drive). Listed once on mount.
++ */
++export function cameraChoices(
++  cameras: readonly CameraInfo[],
++  devices: readonly VideoDeviceInfo[],
++): CameraChoice[] {
++  const owned = new Set(cameras.flatMap((c) => c.video_paths));
++  return [
++    ...cameras.map((c) => ({
++      value: c.id,
++      label: c.model,
++      details: `${c.mono ? "IR (monochrome)" : "Colour"} · ${c.id}`,
++      mono: c.mono,
++    })),
++    ...devices
++      .filter((d) => !d.aliases.some((a) => owned.has(a)))
++      .map((d) => ({
++        value: d.path,
++        label: d.label,
++        details: d.details || d.path,
++        mono: false,
++      })),
++  ];
++}
++
++export function useCameras(): {
++  cameras: CameraInfo[];
++  choices: CameraChoice[];
++  loaded: boolean;
++  error: string | null;
++} {
++  const [state, setState] = useState<{
++    cameras: CameraInfo[];
++    devices: VideoDeviceInfo[];
++    loaded: boolean;
++    error: string | null;
++  }>({ cameras: [], devices: [], loaded: false, error: null });
++
++  useEffect(() => {
++    let cancelled = false;
++    Promise.allSettled([cmd.face.listCameras(), cmd.face.listVideoDevices()])
++      .then(([cameras, devices]) => {
++        if (cancelled) return;
++        setState({
++          cameras: cameras.status === "fulfilled" ? cameras.value : [],
++          devices: devices.status === "fulfilled" ? devices.value : [],
++          loaded: true,
++          error: cameras.status === "rejected" ? String(cameras.reason) : null,
++        });
++      })
++      .catch(() => {});
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  return {
++    cameras: state.cameras,
++    choices: cameraChoices(state.cameras, state.devices),
++    loaded: state.loaded,
++    error: state.error,
++  };
++}
+diff --git a/app/src/app/configuration/-components/face/useFaceImages.ts b/app/src/app/configuration/-components/face/useFaceImages.ts
+deleted file mode 100644
+index 2c37508..0000000
+--- a/app/src/app/configuration/-components/face/useFaceImages.ts
++++ /dev/null
+@@ -1,48 +0,0 @@
+-import { useCallback, useEffect, useState } from "react";
+-import { toast } from "sonner";
+-import { cmd } from "@/commands";
+-
+-/**
+- * The saved face images, loaded on mount. `capture` saves a frame from the
+- * running preview session; both actions reload the list and toast the result.
+- */
+-export function useFaceImages() {
+-  const [faceImages, setFaceImages] = useState<string[]>([]);
+-
+-  // Stable identity: the effect below depends on it, and a new function per
+-  // render would reload (and re-render) forever.
+-  const loadFaceImages = useCallback(async () => {
+-    try {
+-      const images = await cmd.face.listImages();
+-      setFaceImages(images);
+-    } catch (err) {
+-      console.error("Failed to load face images:", err);
+-    }
+-  }, []);
+-
+-  useEffect(() => {
+-    loadFaceImages();
+-  }, [loadFaceImages]);
+-
+-  async function capture() {
+-    try {
+-      await cmd.face.captureInSession();
+-      toast.success("Face image saved!");
+-      await loadFaceImages();
+-    } catch (err) {
+-      toast.error(`${err}`);
+-    }
+-  }
+-
+-  async function remove(path: string) {
+-    try {
+-      await cmd.face.deleteImage(path);
+-      toast.success("Face image deleted");
+-      await loadFaceImages();
+-    } catch (err) {
+-      toast.error(`Failed to delete: ${err}`);
+-    }
+-  }
+-
+-  return { faceImages, capture, remove };
+-}
+diff --git a/app/src/app/configuration/-components/face/useFaceSets.ts b/app/src/app/configuration/-components/face/useFaceSets.ts
+new file mode 100644
+index 0000000..a417304
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/useFaceSets.ts
+@@ -0,0 +1,23 @@
++import { useCallback, useEffect, useState } from "react";
++import { cmd } from "@/commands";
++import type { FaceSet } from "@/types/config";
++
++/** The enrolled faces of every face directory, reloaded on `reload()`. */
++export function useFaceSets(version: number) {
++  const [sets, setSets] = useState<FaceSet[]>([]);
++
++  const reload = useCallback(async () => {
++    try {
++      setSets(await cmd.face.listSets());
++    } catch (err) {
++      console.error("Failed to list the enrolled faces:", err);
++    }
++  }, []);
++
++  // `version` changes on every save, which may move the faces.
++  useEffect(() => {
++    void reload();
++  }, [reload, version]);
++
++  return { sets, reload };
++}
+diff --git a/app/src/app/configuration/-components/face/useVideoDevices.ts b/app/src/app/configuration/-components/face/useVideoDevices.ts
+deleted file mode 100644
+index 02c5ebc..0000000
+--- a/app/src/app/configuration/-components/face/useVideoDevices.ts
++++ /dev/null
+@@ -1,22 +0,0 @@
+-import { useEffect, useState } from "react";
+-import { cmd } from "@/commands";
+-import type { VideoDeviceInfo } from "@/types/config";
+-
+-/** The system's video devices, listed once on mount. Empty on failure. */
+-export function useVideoDevices(): VideoDeviceInfo[] {
+-  const [videoDevices, setVideoDevices] = useState<VideoDeviceInfo[]>([]);
+-
+-  useEffect(() => {
+-    const fetchDevices = async () => {
+-      try {
+-        setVideoDevices(await cmd.face.listVideoDevices());
+-      } catch (err) {
+-        console.error("Failed to fetch devices:", err);
+-      }
+-    };
+-
+-    fetchDevices();
+-  }, []);
+-
+-  return videoDevices;
+-}
+diff --git a/app/src/app/configuration/-components/validation.ts b/app/src/app/configuration/-components/validation.ts
+index 127317b..9bf2d0b 100644
+--- a/app/src/app/configuration/-components/validation.ts
++++ b/app/src/app/configuration/-components/validation.ts
+@@ -4,7 +4,12 @@ import { CONFIG_LIMITS } from "@/bindings";
+ import { cmd } from "@/commands";
+ import { referencedModelIds } from "@/lib/models";
+ import type { BiopassConfig } from "@/types/config";
+-import { hasIrChoice } from "./face/selectValue";
++import {
++  enrolledPerCamera,
++  type FaceMode,
++  faceModeOf,
++  missingFaces,
++} from "./face/faceMode";
+ 
+ // Ranges come from CONFIG_LIMITS in app/src-tauri/src/config.rs, which the
+ // config_golden ctest checks against auth/core/auth_config.h. The helper
+@@ -90,31 +95,16 @@ export const biopassConfigSchema = z.object({
+           ir_recognition: z.boolean(),
+         }),
+       })
+-      // The camera UI edits profiles only (see migrateCameraProfiles).
++      // The camera UI sets a mode (camera, IR camera), never profiles.
+       .superRefine((face, ctx) => {
+         if (!face.enable) return;
+-        if (face.camera_profiles.length === 0) {
++        if (faceModeOf(face) === null) {
+           ctx.addIssue({
+             code: "custom",
+-            message: "Add at least one camera profile",
+-            path: ["camera_profiles"],
++            message: "Choose the cameras (a mode with an IR camera)",
++            path: ["camera"],
+           });
+         }
+-        face.camera_profiles.forEach((profile, index) => {
+-          if (!profile.camera) {
+-            ctx.addIssue({
+-              code: "custom",
+-              message: "Choose a camera",
+-              path: ["camera_profiles", index, "camera"],
+-            });
+-          }
+-          if (hasIrChoice(profile)) return;
+-          ctx.addIssue({
+-            code: "custom",
+-            message: "Choose an IR camera, or None",
+-            path: ["camera_profiles", index, "ir_camera"],
+-          });
+-        });
+       }),
+     fingerprint: z.object({
+       enable: z.boolean(),
+@@ -127,7 +117,10 @@ export const biopassConfigSchema = z.object({
+ 
+ // Model checks need the live SQLite registry, so they run as a separate
+ // async pass instead of in the zod schema's synchronous superRefine.
+-export async function validateConfig(config: BiopassConfig): Promise<boolean> {
++export async function validateConfig(
++  config: BiopassConfig,
++  savedMode: FaceMode | null,
++): Promise<boolean> {
+   const models = await cmd.models.list();
+   const modelsById = new Map(models.map((m) => [m.id, m]));
+ 
+@@ -155,13 +148,17 @@ export async function validateConfig(config: BiopassConfig): Promise<boolean> {
+       return false;
+     }
+ 
++    // Not a blocker: faces are added with the saved cameras, so a new mode
++    // is saved first. Face unlock does not try a camera without faces.
+     try {
+-      const samples = await cmd.face.listImages();
+-      if (samples.length === 0) {
+-        toast.error(
+-          "At least one face sample must be captured before enabling Face method",
++      const missing = missingFaces(
++        faceModeOf(config.methods.face),
++        enrolledPerCamera(await cmd.face.listSets(), savedMode),
++      );
++      if (missing.length > 0) {
++        toast.warning(
++          `No faces yet for the ${missing.join(" and the ")}: add them under Enrolled faces.`,
+         );
+-        return false;
+       }
+     } catch (err) {
+       console.error("Failed to check face samples:", err);
+diff --git a/app/src/app/configuration/page.tsx b/app/src/app/configuration/page.tsx
+index 09a986e..bda7f44 100644
+--- a/app/src/app/configuration/page.tsx
++++ b/app/src/app/configuration/page.tsx
+@@ -8,11 +8,13 @@ import { toast } from "sonner";
+ import { cmd } from "@/commands";
+ import { Button } from "@/components/ui/button";
+ import { withCurrentAppearance } from "@/hooks/useThemeSync";
+-import type { BiopassConfig } from "@/types/config";
++import type { BiopassConfig, FacesMoved } from "@/types/config";
++import { faceModeOf, withoutCameraProfiles } from "./-components/face/faceMode";
+ import {
+-  migrateCameraProfiles,
+-  withStablePaths,
+-} from "./-components/face/selectValue";
++  type SavedSettings,
++  SavedSettingsContext,
++} from "./-components/face/savedSettings";
++import { withStablePaths } from "./-components/face/selectValue";
+ import { KeyringCard } from "./-components/KeyringCard";
+ import { MethodConfig } from "./-components/MethodConfig";
+ import { StrategyConfig } from "./-components/StrategyConfig";
+@@ -73,14 +75,29 @@ function ConfigurationRouteComponent() {
+   return <ConfigurationForm initialConfig={initialConfig} />;
+ }
+ 
++/** A toast's text for the faces a save moved. */
++export function facesMovedText(moved: FacesMoved): string {
++  const [main, aside, asideDir] = moved.main_is_ir
++    ? ["IR", "colour", "faces-rgb/"]
++    : ["colour", "IR", "faces-ir/"];
++  return `Faces moved with the cameras: ${moved.set_aside} ${aside} faces kept aside in ${asideDir}, ${moved.restored} ${main} faces back in use.`;
++}
++
+ function ConfigurationForm({
+   initialConfig,
+ }: {
+   initialConfig: BiopassConfig;
+ }) {
++  // Camera profiles (an older save of this app) read as the camera settings;
++  // the next save replaces them.
++  const [saved, setSaved] = useState<SavedSettings>(() => {
++    const { config, hadProfiles } = withoutCameraProfiles(
++      structuredClone(initialConfig),
++    );
++    return { config, version: 0, hadProfiles };
++  });
+   const form = useForm<BiopassConfig>({
+-    // Legacy camera fields move into profiles; auth picks the same cameras.
+-    defaultValues: migrateCameraProfiles(structuredClone(initialConfig)),
++    defaultValues: saved.config,
+     resolver: zodResolver(biopassConfigSchema),
+   });
+   const { isSubmitting, isDirty } = form.formState;
+@@ -101,12 +118,23 @@ function ConfigurationForm({
+ 
+     try {
+       // Inside the try: validateConfig calls commands that can reject.
+-      const isValid = await validateConfig(configToSave);
++      const isValid = await validateConfig(
++        configToSave,
++        faceModeOf(saved.config.methods.face),
++      );
+       if (!isValid) return;
+ 
+-      await cmd.config.save(configToSave);
++      const outcome = await cmd.config.save(configToSave);
+       form.reset(configToSave);
++      setSaved((prev) => ({
++        config: configToSave,
++        version: prev.version + 1,
++        hadProfiles: false,
++      }));
+       toast.success("Settings saved successfully!");
++      if (outcome.faces_moved) {
++        toast.info(facesMovedText(outcome.faces_moved));
++      }
+     } catch (err) {
+       console.error("Failed to save config:", err);
+       toast.error(`Failed to save config: ${err}`);
+@@ -143,49 +171,51 @@ function ConfigurationForm({
+   }
+ 
+   return (
+-    <FormProvider {...form}>
+-      <form
+-        onSubmit={submit}
+-        className="flex flex-col gap-6 w-full max-w-4xl mx-auto p-6"
+-      >
+-        <div className="flex justify-between items-center">
+-          <div>
+-            <h1 className="text-3xl font-bold bg-linear-to-r from-primary to-purple-500 bg-clip-text text-transparent">
+-              Biopass Configuration
+-            </h1>
+-            <p className="text-sm text-muted-foreground mt-1">
+-              Manage your authentication methods and execution strategies
+-            </p>
+-          </div>
+-          <div className="flex gap-2">
+-            <Button
+-              type="button"
+-              variant="outline"
+-              onClick={handleReset}
+-              disabled={!isDirty || isSubmitting}
+-              className="flex items-center gap-2 cursor-pointer"
+-            >
+-              <RotateCcw className="w-4 h-4" />
+-              Reset
+-            </Button>
+-            <Button
+-              type="submit"
+-              disabled={isSubmitting}
+-              className="flex items-center gap-2 cursor-pointer"
+-            >
+-              <Save className="w-4 h-4" />
+-              {isSubmitting ? "Saving..." : "Save"}
+-            </Button>
++    <SavedSettingsContext.Provider value={saved}>
++      <FormProvider {...form}>
++        <form
++          onSubmit={submit}
++          className="flex flex-col gap-6 w-full max-w-4xl mx-auto p-6"
++        >
++          <div className="flex justify-between items-center">
++            <div>
++              <h1 className="text-3xl font-bold bg-linear-to-r from-primary to-purple-500 bg-clip-text text-transparent">
++                Biopass Configuration
++              </h1>
++              <p className="text-sm text-muted-foreground mt-1">
++                Manage your authentication methods and execution strategies
++              </p>
++            </div>
++            <div className="flex gap-2">
++              <Button
++                type="button"
++                variant="outline"
++                onClick={handleReset}
++                disabled={!isDirty || isSubmitting}
++                className="flex items-center gap-2 cursor-pointer"
++              >
++                <RotateCcw className="w-4 h-4" />
++                Reset
++              </Button>
++              <Button
++                type="submit"
++                disabled={isSubmitting}
++                className="flex items-center gap-2 cursor-pointer"
++              >
++                <Save className="w-4 h-4" />
++                {isSubmitting ? "Saving..." : "Save"}
++              </Button>
++            </div>
+           </div>
+-        </div>
+ 
+-        <div className="grid gap-6">
+-          <StrategyConfig />
+-          <MethodConfig />
+-          <KeyringCard />
+-        </div>
+-      </form>
+-    </FormProvider>
++          <div className="grid gap-6">
++            <StrategyConfig />
++            <MethodConfig />
++            <KeyringCard />
++          </div>
++        </form>
++      </FormProvider>
++    </SavedSettingsContext.Provider>
+   );
+ }
+ 
+diff --git a/app/src/bindings.ts b/app/src/bindings.ts
+index 0e776ee..b0d3660 100644
+--- a/app/src/bindings.ts
++++ b/app/src/bindings.ts
+@@ -10,17 +10,31 @@ export const commands = {
+ 	/**
+ 	 *  Writes `config` into config.yaml, keeping every value of the file that
+ 	 *  `config` has no field for (settings of a newer helper, of other tools,
+-	 *  or added by hand), see merged_yaml.
++	 *  or added by hand), see merged_yaml. When the main camera changes between
++	 *  the IR camera and another one, the enrolled faces move with it (faces/
++	 *  always holds the main camera's).
+ 	 */
+-	saveConfig: (config: BiopassConfig_Deserialize) => __TAURI_INVOKE<null>("save_config", { config }),
++	saveConfig: (config: BiopassConfig_Deserialize) => __TAURI_INVOKE<SaveOutcome_Serialize>("save_config", { config }),
+ 	setAppearance: (appearance: string) => __TAURI_INVOKE<null>("set_appearance", { appearance }),
+ 	getCurrentUsername: () => __TAURI_INVOKE<string>("get_current_username"),
+ 	startFacePreview: (camera: string | null) => __TAURI_INVOKE<null>("start_face_preview", { camera }),
+ 	stopFacePreview: () => __TAURI_INVOKE<null>("stop_face_preview"),
+-	captureFaceInSession: () => __TAURI_INVOKE<string>("capture_face_in_session"),
++	captureFaceInSession: (irCamera: string | null) => __TAURI_INVOKE<string[]>("capture_face_in_session", { irCamera }),
+ 	listFaces: () => __TAURI_INVOKE<string[]>("list_faces"),
++	/**
++	 *  Every face directory with its images (empty when it is missing), in
++	 *  FaceDir::ALL's order.
++	 */
++	listFaceSets: () => __TAURI_INVOKE<FaceSet[]>("list_face_sets"),
+ 	listVideoDevices: () => __TAURI_INVOKE<VideoDeviceInfo[]>("list_video_devices"),
++	listCameras: () => __TAURI_INVOKE<CameraInfo[]>("list_cameras"),
++	/**  Deletes a face image of any face directory (see FaceDir). */
+ 	deleteFace: (path: string) => __TAURI_INVOKE<null>("delete_face", { path }),
++	/**
++	 *  One scan with the saved settings (the camera preview stops first: the
++	 *  helper needs the camera). Counts nowhere: no PAM, no lockout.
++	 */
++	testFaceScan: () => __TAURI_INVOKE<ScanResult_Serialize>("test_face_scan"),
+ 	enrollFingerprint: (username: string, fingerName: string) => __TAURI_INVOKE<null>("enroll_fingerprint", { username, fingerName }),
+ 	removeFingerprint: (username: string, fingerName: string) => __TAURI_INVOKE<null>("remove_fingerprint", { username, fingerName }),
+ 	listEnrolledFingerprints: (username: string) => __TAURI_INVOKE<string[]>("list_enrolled_fingerprints", { username }),
+@@ -104,6 +118,17 @@ export type BiopassConfig_Serialize = {
+ 	appearance: string,
+ };
+ 
++export type CameraInfo = {
++	/**  What config.yaml saves, e.g. "/base/soc@0/cci@ac15000/i2c-bus@0/camera@24". */
++	id: string,
++	/**  The sensor's model, e.g. "hm1092"; the id when libcamera has none. */
++	model: string,
++	/**  A sensor without colour filters: an IR camera. */
++	mono: boolean,
++	/**  The /dev/video nodes it streams through (several cameras may share them). */
++	video_paths: string[],
++};
++
+ /**
+  *  A colour + IR camera pair. `None` camera = auto-select. `None` IR = the
+  *  fallback IR camera (`anti_spoofing.ir_camera`, else the first profile IR),
+@@ -185,6 +210,24 @@ export type DownloadProgress_Serialize = {
+  */
+ export type ExecutionMode = "sequential" | "parallel";
+ 
++/**
++ *  A directory of enrolled faces in the data dir. Faces match only the
++ *  camera that took them, so each camera keeps its own:
++ */
++export type FaceDir = 
++/**  faces/: the main camera's (`camera`), which the helper matches. */
++"faces" | 
++/**
++ *  faces-ir/: the IR camera's while another camera is the main one; the
++ *  helper matches them with `anti_spoofing.ir_recognition`.
++ */
++"faces-ir" | 
++/**
++ *  faces-rgb/: the colour camera's, kept aside while the IR camera is the
++ *  main one; the helper never reads them.
++ */
++"faces-rgb";
++
+ export type FaceMethodConfig = FaceMethodConfig_Serialize | FaceMethodConfig_Deserialize;
+ 
+ export type FaceMethodConfig_Deserialize = {
+@@ -217,6 +260,34 @@ export type FaceMethodConfig_Serialize = {
+ 	anti_spoofing: AntiSpoofingConfig_Serialize,
+ };
+ 
++export type FaceScore = {
++	/**  The enrolled face image (in faces/ or faces-ir/). */
++	path: string,
++	score: number,
++};
++
++/**  The face images in one face directory. */
++export type FaceSet = {
++	dir: FaceDir,
++	paths: string[],
++};
++
++/**  What move_faces_for_main_camera moved. */
++export type FacesMoved = {
++	/**  faces/ now holds the IR camera's faces (else the colour camera's). */
++	main_is_ir: boolean,
++	/**
++	 *  Moved out of faces/: into faces-rgb/ when the IR camera became the
++	 *  main camera, else into faces-ir/.
++	 */
++	set_aside: number,
++	/**
++	 *  Moved into faces/: from faces-ir/ when the IR camera became the main
++	 *  camera, else from faces-rgb/.
++	 */
++	restored: number,
++};
++
+ export type FingerprintMethodConfig = FingerprintMethodConfig_Serialize | FingerprintMethodConfig_Deserialize;
+ 
+ export type FingerprintMethodConfig_Deserialize = {
+@@ -322,6 +393,71 @@ export type RecognitionConfig_Serialize = {
+ 	threshold: number,
+ };
+ 
++/**  What save_config did besides writing config.yaml. */
++export type SaveOutcome = SaveOutcome_Serialize | SaveOutcome_Deserialize;
++
++/**  What save_config did besides writing config.yaml. */
++export type SaveOutcome_Deserialize = {
++	/**
++	 *  The enrolled faces moved because the main camera changed between the
++	 *  IR camera and another one (see face::move_faces_for_main_camera).
++	 */
++	faces_moved?: FacesMoved | null,
++};
++
++/**  What save_config did besides writing config.yaml. */
++export type SaveOutcome_Serialize = {
++	/**
++	 *  The enrolled faces moved because the main camera changed between the
++	 *  IR camera and another one (see face::move_faces_for_main_camera).
++	 */
++	faces_moved: FacesMoved | null,
++};
++
++export type ScanOutcome = 
++/**  Recognised: login would succeed (exit 0). */
++"match" | 
++/**  A face was compared and did not match, or anti-spoofing flagged it (1). */
++"no_match" | 
++/**  Nothing to try: no settings, no enrolled faces or no camera (2). */
++"not_tried" | 
++/**  No face was seen in time (3). */
++"no_face" | 
++/**  Killed, timed out or an unknown exit code. */
++"failed";
++
++export type ScanResult = ScanResult_Serialize | ScanResult_Deserialize;
++
++export type ScanResult_Deserialize = {
++	outcome: ScanOutcome,
++	/**  The steps of the scan, one per line: time, then what happened. */
++	steps: string[],
++	/**
++	 *  How well each enrolled face compared (cosine similarity, 1 = the
++	 *  same), its best over the scan's attempts, in the order first compared.
++	 *  A face compared after a match is not listed: matching stops there.
++	 */
++	scores: FaceScore[],
++	/**  The recognition threshold the scan used: a face matches above it. */
++	threshold?: number | null,
++	duration_ms: number,
++};
++
++export type ScanResult_Serialize = {
++	outcome: ScanOutcome,
++	/**  The steps of the scan, one per line: time, then what happened. */
++	steps: string[],
++	/**
++	 *  How well each enrolled face compared (cosine similarity, 1 = the
++	 *  same), its best over the scan's attempts, in the order first compared.
++	 *  A face compared after a match is not listed: matching stops there.
++	 */
++	scores: FaceScore[],
++	/**  The recognition threshold the scan used: a face matches above it. */
++	threshold: number | null,
++	duration_ms: number,
++};
++
+ export type StrategyConfig = StrategyConfig_Serialize | StrategyConfig_Deserialize;
+ 
+ export type StrategyConfig_Deserialize = {
+diff --git a/app/src/commands/config.ts b/app/src/commands/config.ts
+index b265a48..42e5d1c 100644
+--- a/app/src/commands/config.ts
++++ b/app/src/commands/config.ts
+@@ -5,8 +5,10 @@ function load(): Promise<BiopassConfig> {
+   return commands.loadConfig();
+ }
+ 
+-async function save(config: BiopassConfig): Promise<void> {
+-  await commands.saveConfig(config);
++// Keeps the values config.yaml has that the form lacks; moves the enrolled
++// faces when the main camera changes between the IR and the colour camera.
++function save(config: BiopassConfig) {
++  return commands.saveConfig(config);
+ }
+ 
+ // Changes only `appearance` in config.yaml; every other value is kept.
+diff --git a/app/src/commands/face.ts b/app/src/commands/face.ts
+index 4c7236e..59a3b2e 100644
+--- a/app/src/commands/face.ts
++++ b/app/src/commands/face.ts
+@@ -4,6 +4,11 @@ function listImages() {
+   return commands.listFaces();
+ }
+ 
++/** Every face directory (faces/, faces-ir/, faces-rgb/) with its images. */
++function listSets() {
++  return commands.listFaceSets();
++}
++
+ async function startPreview(camera?: string | null): Promise<void> {
+   await commands.startFacePreview(camera ?? null);
+ }
+@@ -12,8 +17,13 @@ async function stopPreview(): Promise<void> {
+   await commands.stopFacePreview();
+ }
+ 
+-function captureInSession() {
+-  return commands.captureFaceInSession();
++/**
++ * Saves a face from the running preview into faces/; with `irCamera` (both
++ * cameras recognise) the same moment's face from the IR camera into
++ * faces-ir/ too. Returns the saved paths.
++ */
++function captureInSession(irCamera?: string | null) {
++  return commands.captureFaceInSession(irCamera ?? null);
+ }
+ 
+ async function deleteImage(path: string): Promise<void> {
+@@ -23,11 +33,25 @@ async function deleteImage(path: string): Promise<void> {
+ function listVideoDevices() {
+   return commands.listVideoDevices();
+ }
++
++/** The cameras libcamera finds, by id (biopass-helper list-cameras). */
++function listCameras() {
++  return commands.listCameras();
++}
++
++/** One face scan with the saved settings, with its steps and scores. */
++function testScan() {
++  return commands.testFaceScan();
++}
++
+ export const face = {
+   listImages,
++  listSets,
+   startPreview,
+   stopPreview,
+   captureInSession,
+   deleteImage,
+   listVideoDevices,
++  listCameras,
++  testScan,
+ };
+diff --git a/app/src/types/config.ts b/app/src/types/config.ts
+index c86a52d..9ad8b53 100644
+--- a/app/src/types/config.ts
++++ b/app/src/types/config.ts
+@@ -5,17 +5,25 @@ import type {
+   BiopassConfig_Serialize,
+   DownloadProgress_Serialize,
+   Model_Serialize,
++  ScanResult_Serialize,
+ } from "@/bindings";
+ 
+ export type {
++  CameraInfo,
+   ExecutionMode,
++  FaceDir,
++  FaceScore,
++  FaceSet,
++  FacesMoved,
+   ModelTask,
++  ScanOutcome,
+   VideoDeviceInfo,
+ } from "@/bindings";
+ 
+ export type BiopassConfig = BiopassConfig_Serialize;
+ export type Model = Model_Serialize;
+ export type ModelDownloadProgress = DownloadProgress_Serialize;
++export type ScanResult = ScanResult_Serialize;
+ 
+ // A `strategy.order` entry the helper knows (MethodKind in
+ // auth/core/auth_config.h). `order` stays string[]: the app keeps whatever
+-- 
+2.43.0
+

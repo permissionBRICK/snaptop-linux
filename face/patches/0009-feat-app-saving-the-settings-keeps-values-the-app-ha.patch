@@ -1,0 +1,400 @@
+From 190a362e65caf15aa54d61ee8052bcd5cf2c8eb8 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:14:43 +0000
+Subject: [PATCH] feat(app): saving the settings keeps values the app has no
+ field for
+
+save_config wrote the form's config alone, so every key of config.yaml
+the app does not know was dropped on save: settings of a newer helper,
+of other tools, or added by hand. It now merges the form's values into
+the file as it is at save time: each value the form has replaces the
+file's, recursively through mappings, every other key stays. Lists are
+the form's, whole. A file of an older schema (or none) is replaced as
+before; one that does not parse, is not a mapping or is newer is an
+error and never overwritten. The f32 thresholds keep their written form
+(through text, not to_value, which widened 0.2 to 0.20000000298).
+
+The app also knows the two face settings the helper gained:
+detection.min_face_height (a face in front of the camera only) and
+anti_spoofing.ir_recognition (the IR camera recognises too), with their
+helper defaults (0, false) in defaults.yaml.
+Tests: config (merge, older/newer/bad files, new fields), the golden
+defaults.yaml and bindings.ts.
+---
+ app/src-tauri/src/config.rs                   | 179 +++++++++++++++++-
+ .../configuration/-components/validation.ts   |   5 +
+ app/src/bindings.ts                           |  29 +++
+ app/src/lib/models.test.ts                    |   2 +
+ auth/test/config/defaults.yaml                |   2 +
+ 5 files changed, 214 insertions(+), 3 deletions(-)
+
+diff --git a/app/src-tauri/src/config.rs b/app/src-tauri/src/config.rs
+index fe385c4..a6a5e15 100644
+--- a/app/src-tauri/src/config.rs
++++ b/app/src-tauri/src/config.rs
+@@ -90,6 +90,11 @@ pub struct DetectionConfig {
+     pub model_id: String,
+     #[specta(type = specta_typescript::Number)]
+     pub threshold: f32,
++    /// The face box's minimum height as a fraction of the picture's height,
++    /// with the whole box inside the picture (auth's face_framing.h): only a
++    /// face in front of the camera is matched. 0 = no check.
++    #[specta(type = specta_typescript::Number)]
++    pub min_face_height: f32,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Type)]
+@@ -116,6 +121,10 @@ pub struct AntiSpoofingConfig {
+     pub ir_camera: Option<String>,
+     pub ir_warmup_delay_ms: i32,
+     pub ir_presence_timeout_ms: i32,
++    /// The IR camera recognises too, against its own faces (faces-ir/),
++    /// instead of only checking that it sees a face. Needs an IR camera other
++    /// than the main camera.
++    pub ir_recognition: bool,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Type)]
+@@ -153,6 +162,7 @@ fn get_default_config() -> BiopassConfig {
+                 detection: DetectionConfig {
+                     model_id: "yolov8n-face".to_string(),
+                     threshold: 0.5,
++                    min_face_height: 0.0,
+                 },
+                 recognition: RecognitionConfig {
+                     model_id: "edgeface-s-gamma-05".to_string(),
+@@ -169,6 +179,7 @@ fn get_default_config() -> BiopassConfig {
+                     ir_camera: None,
+                     ir_warmup_delay_ms: DEFAULT_IR_WARMUP_DELAY_MS,
+                     ir_presence_timeout_ms: DEFAULT_IR_PRESENCE_TIMEOUT_MS,
++                    ir_recognition: false,
+                 },
+             },
+             fingerprint: FingerprintMethodConfig {
+@@ -183,7 +194,7 @@ fn get_default_config() -> BiopassConfig {
+ 
+ // Missing fields take these defaults (#[serde(default)] on each struct), so a
+ // config that lacks a field keeps the rest of the user's values. Unknown
+-// fields are ignored on load and dropped by save_config.
++// fields are ignored on load and kept by save_config (see merged_yaml).
+ impl Default for BiopassConfig {
+     fn default() -> Self {
+         get_default_config()
+@@ -345,14 +356,81 @@ fn read_config_file(path: &Path) -> Result<BiopassConfig, String> {
+     parse_config(&content).map_err(|e| format!("{}: {}", path.display(), e))
+ }
+ 
++/// Writes `config` into config.yaml, keeping every value of the file that
++/// `config` has no field for (settings of a newer helper, of other tools,
++/// or added by hand), see merged_yaml.
+ #[tauri::command]
+ #[specta::specta]
+ pub fn save_config(app: AppHandle, config: BiopassConfig) -> Result<(), String> {
+-    let yaml_content =
+-        yaml_serde::to_string(&config).map_err(|e| format!("Failed to serialize config: {}", e))?;
++    let config_path = get_config_path(&app)?;
++    let old = read_optional(&config_path)?;
++    let yaml_content = merged_yaml(old.as_deref(), &config)
++        .map_err(|e| format!("{}: {}", config_path.display(), e))?;
+     write_config_file(&app, &yaml_content)
+ }
+ 
++/// The file's text, None when there is none.
++fn read_optional(path: &Path) -> Result<Option<String>, String> {
++    match fs::read_to_string(path) {
++        Ok(text) => Ok(Some(text)),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
++        Err(e) => Err(format!("Failed to read {}: {}", path.display(), e)),
++    }
++}
++
++/// `config` as YAML, merged into `content` (the current config.yaml, None:
++/// none yet): each value `config` has replaces the file's, recursively
++/// through mappings, and every key it lacks stays as it is. Lists are
++/// replaced whole. A file of an older schema (or none) is replaced, as load
++/// showed defaults for it; one that does not parse, is not a mapping or is
++/// newer is an error, never overwritten.
++fn merged_yaml(content: Option<&str>, config: &BiopassConfig) -> Result<String, String> {
++    // Through text, not to_value: that widens the f32 thresholds to f64
++    // (0.2 -> 0.20000000298023224); the text has them as written.
++    let new: yaml_serde::Value = yaml_serde::to_string(config)
++        .and_then(|text| yaml_serde::from_str(&text))
++        .map_err(|e| format!("Failed to serialize config: {}", e))?;
++    let mut merged = match content {
++        None => yaml_serde::Value::Null,
++        Some(text) => yaml_serde::from_str::<yaml_serde::Value>(text)
++            .map_err(|e| format!("config.yaml is not valid YAML: {}", e))?,
++    };
++    if !merged.is_null() {
++        if !merged.is_mapping() {
++            return Err("config.yaml is not a YAML mapping".to_string());
++        }
++        let version = merged.get("schema_version").and_then(|v| v.as_u64());
++        match version {
++            Some(v) if v > u64::from(CURRENT_SCHEMA_VERSION) => {
++                return Err(format!(
++                    "config.yaml has schema_version {}, newer than this app's {}; update Biopass",
++                    v, CURRENT_SCHEMA_VERSION
++                ));
++            }
++            Some(v) if v == u64::from(CURRENT_SCHEMA_VERSION) => {}
++            _ => merged = yaml_serde::Value::Null,
++        }
++    }
++    merge_value(&mut merged, new);
++    yaml_serde::to_string(&merged).map_err(|e| format!("Failed to serialize config: {}", e))
++}
++
++fn merge_value(into: &mut yaml_serde::Value, from: yaml_serde::Value) {
++    match (into, from) {
++        (yaml_serde::Value::Mapping(into), yaml_serde::Value::Mapping(from)) => {
++            for (key, value) in from {
++                match into.get_mut(&key) {
++                    Some(slot) => merge_value(slot, value),
++                    None => {
++                        into.insert(key, value);
++                    }
++                }
++            }
++        }
++        (into, from) => *into = from,
++    }
++}
++
+ /// Returns `content` (None: no config yet) with only `appearance` changed.
+ /// Works on the raw YAML so the user's other values, including fields this
+ /// app doesn't know, are kept. Errors instead of replacing a config it can't
+@@ -804,6 +882,101 @@ mod tests {
+         assert!(err.contains(&path.display().to_string()), "{err}");
+     }
+ 
++    fn yaml(text: &str) -> yaml_serde::Value {
++        yaml_serde::from_str(text).unwrap()
++    }
++
++    /// What the helper reads and other tools (s15-face) write, but this app
++    /// has no field for, survives a save; the app's own fields take the form's
++    /// values.
++    #[test]
++    fn save_keeps_values_the_app_does_not_know() {
++        let on_disk = format!(
++            "schema_version: {CURRENT_SCHEMA_VERSION}\n\
++             added_later: 1\n\
++             methods:\n  face:\n    retries: 2\n    future_option: [a, b]\n\
++             \x20   detection:\n      model_id: yolov8n-face\n      max_faces: 3\n\
++             strategy:\n  debug: true\n"
++        );
++        let mut config = parse_config(&on_disk).unwrap();
++        config.methods.face.retries = 7;
++        config.strategy.debug = false;
++        let saved = yaml(&merged_yaml(Some(&on_disk), &config).unwrap());
++
++        assert_eq!(saved["added_later"], yaml("1"));
++        assert_eq!(saved["methods"]["face"]["future_option"], yaml("[a, b]"));
++        assert_eq!(
++            saved["methods"]["face"]["detection"]["max_faces"],
++            yaml("3")
++        );
++        assert_eq!(saved["methods"]["face"]["retries"], yaml("7"));
++        assert_eq!(saved["strategy"]["debug"], yaml("false"));
++        // Read back, it is the form's config.
++        let text = yaml_serde::to_string(&saved).unwrap();
++        assert_eq!(parse_config(&text).unwrap(), config);
++    }
++
++    #[test]
++    fn save_writes_the_face_unlock_fields() {
++        let mut config = get_default_config();
++        config.methods.face.camera = Some("/base/cam@36".to_string());
++        config.methods.face.anti_spoofing.ir_camera = Some("/base/cam@24".to_string());
++        config.methods.face.anti_spoofing.ir_recognition = true;
++        config.methods.face.detection.min_face_height = 0.2;
++        let saved = yaml(&merged_yaml(None, &config).unwrap());
++        let face = &saved["methods"]["face"];
++        assert_eq!(face["detection"]["min_face_height"], yaml("0.2"));
++        assert_eq!(face["anti_spoofing"]["ir_recognition"], yaml("true"));
++        assert_eq!(face["camera_profiles"], yaml("[]"));
++        assert_eq!(
++            parse_config(&yaml_serde::to_string(&saved).unwrap()).unwrap(),
++            config
++        );
++    }
++
++    /// Lists are the form's, whole: camera profiles the form cleared are gone.
++    #[test]
++    fn save_replaces_lists() {
++        let on_disk = format!(
++            "schema_version: {CURRENT_SCHEMA_VERSION}\nmethods:\n  face:\n    camera_profiles:\n    - camera: /dev/video0\n      extra: 1\n"
++        );
++        let saved = yaml(&merged_yaml(Some(&on_disk), &get_default_config()).unwrap());
++        assert_eq!(saved["methods"]["face"]["camera_profiles"], yaml("[]"));
++    }
++
++    #[test]
++    fn save_replaces_an_older_schema_and_refuses_bad_files() {
++        let config = custom_config();
++        let fresh = yaml(&merged_yaml(None, &config).unwrap());
++        // Older or missing schema_version: the old settings are not carried
++        // over (load showed defaults for them), as before.
++        let older = "schema_version: 1\nmodels: []\n";
++        assert_eq!(yaml(&merged_yaml(Some(older), &config).unwrap()), fresh);
++        assert_eq!(
++            yaml(&merged_yaml(Some("appearance: dark\n"), &config).unwrap()),
++            fresh
++        );
++        assert_eq!(yaml(&merged_yaml(Some(""), &config).unwrap()), fresh);
++        // Never overwritten: newer, unparseable, not a mapping.
++        let newer = format!("schema_version: {}\n", CURRENT_SCHEMA_VERSION + 1);
++        assert!(merged_yaml(Some(&newer), &config).is_err());
++        assert!(merged_yaml(Some("not: [valid"), &config).is_err());
++        assert!(merged_yaml(Some("- a list"), &config).is_err());
++    }
++
++    #[test]
++    fn new_face_unlock_fields_default_off() {
++        let face = get_default_config().methods.face;
++        assert_eq!(face.detection.min_face_height, 0.0);
++        assert!(!face.anti_spoofing.ir_recognition);
++        let yaml = format!(
++            "schema_version: {CURRENT_SCHEMA_VERSION}\nmethods:\n  face:\n    detection:\n      min_face_height: 0.25\n    anti_spoofing:\n      ir_recognition: true\n"
++        );
++        let face = parse_config(&yaml).unwrap().methods.face;
++        assert_eq!(face.detection.min_face_height, 0.25);
++        assert!(face.anti_spoofing.ir_recognition);
++    }
++
+     #[test]
+     fn set_appearance_changes_only_appearance() {
+         let yaml = yaml_serde::to_string(&custom_config()).unwrap() + "added_later: 1\n";
+diff --git a/app/src/app/configuration/-components/validation.ts b/app/src/app/configuration/-components/validation.ts
+index edbe9c3..127317b 100644
+--- a/app/src/app/configuration/-components/validation.ts
++++ b/app/src/app/configuration/-components/validation.ts
+@@ -61,6 +61,10 @@ export const biopassConfigSchema = z.object({
+         detection: z.object({
+           model_id: z.string(),
+           threshold: thresholdSchema,
++          min_face_height: z
++            .number("Minimum face size must be a number")
++            .min(0, "Minimum face size must be at least 0%")
++            .max(1, "Minimum face size must be at most 100%"),
+         }),
+         recognition: z.object({
+           model_id: z.string(),
+@@ -83,6 +87,7 @@ export const biopassConfigSchema = z.object({
+             limits.ir_presence_timeout_ms,
+             " ms",
+           ),
++          ir_recognition: z.boolean(),
+         }),
+       })
+       // The camera UI edits profiles only (see migrateCameraProfiles).
+diff --git a/app/src/bindings.ts b/app/src/bindings.ts
+index 7c7f9a6..0e776ee 100644
+--- a/app/src/bindings.ts
++++ b/app/src/bindings.ts
+@@ -7,6 +7,11 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
+ /** Commands */
+ export const commands = {
+ 	loadConfig: () => __TAURI_INVOKE<BiopassConfig_Serialize>("load_config"),
++	/**
++	 *  Writes `config` into config.yaml, keeping every value of the file that
++	 *  `config` has no field for (settings of a newer helper, of other tools,
++	 *  or added by hand), see merged_yaml.
++	 */
+ 	saveConfig: (config: BiopassConfig_Deserialize) => __TAURI_INVOKE<null>("save_config", { config }),
+ 	setAppearance: (appearance: string) => __TAURI_INVOKE<null>("set_appearance", { appearance }),
+ 	getCurrentUsername: () => __TAURI_INVOKE<string>("get_current_username"),
+@@ -49,6 +54,12 @@ export type AntiSpoofingConfig_Deserialize = {
+ 	ir_camera?: string | null,
+ 	ir_warmup_delay_ms?: number,
+ 	ir_presence_timeout_ms?: number,
++	/**
++	 *  The IR camera recognises too, against its own faces (faces-ir/),
++	 *  instead of only checking that it sees a face. Needs an IR camera other
++	 *  than the main camera.
++	 */
++	ir_recognition?: boolean,
+ };
+ 
+ export type AntiSpoofingConfig_Serialize = {
+@@ -57,6 +68,12 @@ export type AntiSpoofingConfig_Serialize = {
+ 	ir_camera: string | null,
+ 	ir_warmup_delay_ms: number,
+ 	ir_presence_timeout_ms: number,
++	/**
++	 *  The IR camera recognises too, against its own faces (faces-ir/),
++	 *  instead of only checking that it sees a face. Needs an IR camera other
++	 *  than the main camera.
++	 */
++	ir_recognition: boolean,
+ };
+ 
+ export type AntiSpoofingModelConfig = AntiSpoofingModelConfig_Serialize | AntiSpoofingModelConfig_Deserialize;
+@@ -123,11 +140,23 @@ export type DetectionConfig = DetectionConfig_Serialize | DetectionConfig_Deseri
+ export type DetectionConfig_Deserialize = {
+ 	model_id?: string,
+ 	threshold?: number,
++	/**
++	 *  The face box's minimum height as a fraction of the picture's height,
++	 *  with the whole box inside the picture (auth's face_framing.h): only a
++	 *  face in front of the camera is matched. 0 = no check.
++	 */
++	min_face_height?: number,
+ };
+ 
+ export type DetectionConfig_Serialize = {
+ 	model_id: string,
+ 	threshold: number,
++	/**
++	 *  The face box's minimum height as a fraction of the picture's height,
++	 *  with the whole box inside the picture (auth's face_framing.h): only a
++	 *  face in front of the camera is matched. 0 = no check.
++	 */
++	min_face_height: number,
+ };
+ 
+ /**  Payload of the "model-download-progress" event. */
+diff --git a/app/src/lib/models.test.ts b/app/src/lib/models.test.ts
+index 7dbf09c..b525309 100644
+--- a/app/src/lib/models.test.ts
++++ b/app/src/lib/models.test.ts
+@@ -25,6 +25,7 @@ function makeConfig(
+         detection: {
+           model_id: ids.detection ?? "yolov8n-face",
+           threshold: 0.5,
++          min_face_height: 0,
+         },
+         recognition: {
+           model_id: ids.recognition ?? "edgeface-s-gamma-05",
+@@ -39,6 +40,7 @@ function makeConfig(
+           ir_camera: null,
+           ir_warmup_delay_ms: 300,
+           ir_presence_timeout_ms: 1500,
++          ir_recognition: false,
+         },
+       },
+       fingerprint: { enable: false, retries: 1, timeout: 5000 },
+diff --git a/auth/test/config/defaults.yaml b/auth/test/config/defaults.yaml
+index 762a598..522d969 100644
+--- a/auth/test/config/defaults.yaml
++++ b/auth/test/config/defaults.yaml
+@@ -19,6 +19,7 @@ methods:
+     detection:
+       model_id: yolov8n-face
+       threshold: 0.5
++      min_face_height: 0.0
+     recognition:
+       model_id: edgeface-s-gamma-05
+       threshold: 0.5
+@@ -30,6 +31,7 @@ methods:
+       ir_camera: null
+       ir_warmup_delay_ms: 300
+       ir_presence_timeout_ms: 1500
++      ir_recognition: false
+   fingerprint:
+     enable: false
+     retries: 1
+-- 
+2.43.0
+
