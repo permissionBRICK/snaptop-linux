@@ -201,8 +201,8 @@ camera() {
   pgrep -u "$u" -x biopass >/dev/null && die "close the Biopass app first (it would write its own settings back)"
   local run=()
   [ "$(id -u)" = 0 ] && [ "$u" != root ] && run=(runuser -u "$u" --)
-  "${run[@]}" python3 -I - "$home/$CONF" "$home/$DATA" "$mode" "$ir" "$rgb" "$MIN_FACE" "$MIN_THRESHOLD" <<'EOF' ||
-    die "configuration not changed"
+  "${run[@]}" python3 -I - "$home/$CONF" "$home/$DATA" "$mode" "$ir" "$rgb" "$MIN_FACE" "$MIN_THRESHOLD" \
+    <<'EOF' || die "configuration not changed"
 import os, sys, yaml
 path, data, mode, ir, rgb, min_face, min_threshold = sys.argv[1:]
 # The app writes config.yaml only when its settings are saved. Without one: Biopass 1.5.1's defaults
