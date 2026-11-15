@@ -61,6 +61,49 @@ done
 exit 0
 EOS
 chmod 0755 "$R/usr/lib/systemd/system-shutdown/s15-next-boot-same-os"
+# 3. Two minutes into every boot (s15-next-boot.timer) BootNext already points back to this entry, so a crash, a hang
+#    or a forced power-off also comes back to SteamOS; only "Reboot to Windows" (which overwrites it) or the
+#    firmware's boot menu (ESC at power-on) starts Windows. Not right at boot: a SteamOS that fails within its first
+#    two minutes (a broken update, a kernel test) still falls back to Windows instead of starting itself again and
+#    again. EFI variables appear about 30 s into the boot (qseecom); wait for them.
+cat > "$R/usr/local/sbin/s15-next-boot" <<'EOS'
+#!/bin/sh
+# BootNext = the entry this boot came from, unless something already chose one (docs/steamos.md)
+mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+cur=
+for i in $(seq 1 90); do
+  cur=$(efibootmgr 2>/dev/null | sed -n 's/^BootCurrent: //p')
+  [ -n "$cur" ] && break; sleep 1
+done
+[ -n "$cur" ] || { echo "no EFI variables: BootNext not set"; exit 1; }
+if next=$(efibootmgr 2>/dev/null | sed -n 's/^BootNext: //p') && [ -n "$next" ]; then
+  echo "BootNext already $next"; exit 0
+fi
+for i in 1 2 3; do
+  efibootmgr -q -n "$cur" 2>/dev/null
+  efibootmgr 2>/dev/null | grep -q "^BootNext: $cur" && { echo "BootNext = $cur (this boot's entry)"; exit 0; }
+  sleep 1
+done
+echo "BootNext could not be set"; exit 1
+EOS
+chmod 0755 "$R/usr/local/sbin/s15-next-boot"
+cat > "$R/etc/systemd/system/s15-next-boot.service" <<'EOS'
+[Unit]
+Description=Next start comes back to SteamOS, also after a crash (UEFI BootNext, docs/steamos.md)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s15-next-boot
+EOS
+cat > "$R/etc/systemd/system/s15-next-boot.timer" <<'EOS'
+[Unit]
+Description=Next start comes back to SteamOS, two minutes into the boot (docs/steamos.md)
+[Timer]
+OnBootSec=2min
+[Install]
+WantedBy=timers.target
+EOS
+install -d "$R/etc/systemd/system/timers.target.wants"
+ln -sf ../s15-next-boot.timer "$R/etc/systemd/system/timers.target.wants/s15-next-boot.timer"
 cat > "$R/etc/systemd/system/s15-reboot-to-windows.service" <<'EOS'
 [Unit]
 Description=Reboot into Windows once (UEFI BootNext)

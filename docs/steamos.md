@@ -291,9 +291,12 @@ default and BitLocker is not involved.
   without a password, a "Reboot to Windows" desktop icon and a "Reboot to Windows" entry in the Game Mode library.
 - **SteamOS comes back after every clean shutdown:** restart, power-off (menu, power key, the power-off at 5 %
   battery) and halt from SteamOS all set BootNext to the entry it booted from, unless one was already chosen
-  ("Reboot to Windows"); systemd-shutdown hook `s15-next-boot-same-os`. Only a crash, a hang or a forced power-off
-  leaves it unset, and the firmware default, Windows, starts as the fallback. Windows restarts stay in Windows
-  because it is first in BootOrder.
+  ("Reboot to Windows"); systemd-shutdown hook `s15-next-boot-same-os`. **Also after a crash:** two minutes into
+  every boot, `s15-next-boot.timer` already sets BootNext to the entry it booted from, so a crash, a hang or a
+  forced power-off comes back to SteamOS too. Only a SteamOS that fails within its first two minutes (a broken
+  update, a kernel test) falls back to the firmware default, Windows, instead of starting itself again and again.
+  To start Windows after a forced power-off anyway: ESC at power-on, then the boot menu. Windows restarts stay in
+  Windows because it is first in BootOrder.
 - **Windows → SteamOS:** run `windows\Install-RebootShortcut.ps1` once elevated. It creates a scheduled task
   (current user, highest privileges, on demand) that runs `Reboot-ToSteamOS.ps1` (`bcdedit /set {fwbootmgr}
   bootsequence <SteamOS entry>`, then restart), and a desktop shortcut that starts the task, so there is no UAC
