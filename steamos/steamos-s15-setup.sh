@@ -72,7 +72,9 @@ printf '[device]\nwifi.backend=iwd\n' > "$R/etc/NetworkManager/conf.d/99-valve-w
 install -D -m0755 "$HERE/s15-wifi-powersave" "$R/usr/local/sbin/s15-wifi-powersave"
 install -D -m0755 "$HERE/90-s15-wifi-powersave" "$R/etc/NetworkManager/dispatcher.d/90-s15-wifi-powersave"
 install -D -m0755 "$HERE/s15-wifi-watchdog" "$R/usr/local/sbin/s15-wifi-watchdog"
-printf '[Unit]\nDescription=Wi-Fi watchdog\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/s15-wifi-watchdog\n' \
+# LogLevelMax: no "Starting/Deactivated/Finished" journal lines every minute (they kept btrfs committing at idle);
+# the watchdogs log their actions to their own files, warnings and errors still reach the journal
+printf '[Unit]\nDescription=Wi-Fi watchdog\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/s15-wifi-watchdog\nLogLevelMax=notice\n' \
   > "$R/etc/systemd/system/s15-wifi-watchdog.service"
 printf '[Unit]\nDescription=Wi-Fi watchdog every minute\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=60s\n[Install]\nWantedBy=timers.target\n' \
   > "$R/etc/systemd/system/s15-wifi-watchdog.timer"
@@ -239,7 +241,7 @@ install -D -m0755 "$HERE/s15-sync-state" "$R/usr/lib/systemd/system-sleep/s15-sy
 install -D -m0755 "$HERE/s15-wifi-resume" "$R/usr/lib/systemd/system-sleep/s15-wifi-resume"
 install -D -m0755 "$HERE/s15-input-wait" "$R/usr/local/bin/s15-input-wait"          # used by s15-ec-darkwake
 install -D -m0755 "$HERE/s15-lid-watchdog" "$R/usr/local/sbin/s15-lid-watchdog"
-printf '[Unit]\nDescription=Suspend when awake with the lid closed\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/s15-lid-watchdog\n' \
+printf '[Unit]\nDescription=Suspend when awake with the lid closed\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/s15-lid-watchdog\nLogLevelMax=notice\n' \
   > "$R/etc/systemd/system/s15-lid-watchdog.service"
 printf '[Unit]\nDescription=Lid watchdog every minute\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=60s\n[Install]\nWantedBy=timers.target\n' \
   > "$R/etc/systemd/system/s15-lid-watchdog.timer"

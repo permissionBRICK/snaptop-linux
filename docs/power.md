@@ -1,195 +1,105 @@
-# Power: measuring idle draw and sleep drain
+# Power
 
-Tools in `power/` (install on the laptop as root):
+## Current figures
 
-| Tool | Purpose |
+SteamOS 0.5.7 (build 20261103.6153824), kernel 7.3.0-s15+ with patches `0001`-`0035` ([kernel.md](kernel.md)),
+battery 56.5 Wh full (70.0 Wh design). On battery, Wi-Fi connected, nothing on USB, keyboard light off, Desktop Mode
+idle on the plain desktop, no Steam client; `s15-powerlog`, 3.5-4.5 min per step, the first 40 s dropped.
+
+| State | Power | Runtime from full | Measured |
+|---|---|---|---|
+| Screen on, 25 % brightness, 60 Hz | 3.98 W (3.94-4.06 over 6 runs) | 14 h | 2026-11-15 |
+| Screen on, 25 %, 120 Hz (the rate on AC) | 4.30 W | 13 h | 2026-11-15 |
+| Screen on, 1 % / 5 %, 60 Hz | 3.71 / 3.75 W | 15 h | 2026-11-15 |
+| Screen on, windows open, 25 %, 60 Hz | 5.1 W | 11 h | 2026-11-05 |
+| Screen off (DPMS), idle | 1.34 W | 42 h | 2026-11-15 |
+| Standby (`deep`, CX collapse) | 0.15-0.19 W | 12-16 days | nights 2026-11-08 to 11-14, `/var/log/s15-sleep.log` |
+| Hibernated | 0 W (off) | | back in 17.5 s from the power button |
+
+From the evening of 2026-11-14 to a reboot on 11-15 the sleep log showed no CX collapse (`cxsd 0%`) and 0.22 W over
+the night: a prototype driver of the wake-timer tests (`rtc-qcom-tad`, loaded by hand, not part of the install) was
+loaded during those sleeps. Without it CX collapse is back (99 % and 98 % of the first sleeps after the reboot).
+
+Where it goes (2026-11-15 unless noted):
+
+| Part | Cost |
 |---|---|
-| `s15-powerlog.py` → `/usr/local/bin/s15-powerlog` | CSV every N s: battery power, energy, brightness, screen DPMS, CPU load and clocks, GPU clock, share of time the SoC-wide power domain spent idle, Wi-Fi state, USB device count. Run detached: `systemd-run --unit=s15-powerlog --collect -p Nice=10 /usr/local/bin/s15-powerlog --interval 5 --duration 14400` |
-| `s15-powerreport.py` | Averages per (screen, brightness, USB devices) segment of a CSV, with the runtime that would give on a full battery. |
-| `s15-sleep-hook` → `/usr/lib/systemd/system-sleep/` | Logs battery energy before/after every suspend to `/var/log/s15-sleep.log`, with average drain in mW, SoC idle entries during the sleep and the wake IRQ. |
+| Screen on at all, 1 % brightness | +2.4 W over screen off: panel electronics, the eDP link (HBR3, 4 lanes) and the display engine reading the frame from memory 60 times a second (1.4-1.6 GB/s requested; the frame is 10-bit and UBWC-compressed). Only Panel Self Refresh would remove it ([below](#tried-parked-or-not-adopted)). KWin does not repaint at idle (1 frame and 2 vblank events in 20 s). |
+| Brightness 1 % → 25 % | +0.27 W (1 % → 100 %: about +1 W, 2026-11-01) |
+| 120 Hz instead of 60 Hz | +0.35 W at 25 % |
+| Keyboard light, level 1, white | +1.9 W with the screen on, +0.8 W with it off (2026-11-05); `s15-kbd-idle` turns it off after 30 s without input on battery ([steamos.md](steamos.md#keyboard-colour)) |
+| Screen content (OLED): windows open instead of the plain desktop | about +1 W (2026-11-05) |
+| Steam client in the background | no difference in a 3.5 min step, but about 180 CPU wakeups/s and 7 % of one core, and bursts to 7-9 W (CPU at 3.4 GHz, GPU at 1.25 GHz) from a client running since login; it no longer starts with the desktop ([steamos.md](steamos.md#desktop-mode)) |
 
-Notes:
-- `qcom-battmgr-ac/online` stays 0 when charging over USB-C PD; use the battery `status` (Discharging) to tell
-  battery operation apart.
-- Measure on battery with nothing on USB (a USB Ethernet adapter alone draws a measurable amount) and with
-  Wi-Fi connected, as in normal use.
-- The SoC-wide idle state (`domain_ss3` on `power-domain-system`, PSCI 0x0200c354) and GPIO wakeups through the
-  PDC are in mainline 7.3. Check `/sys/kernel/debug/pm_genpd/power-domain-system/idle_states`. For reference:
-  in February 2026, upstream developers measured about 2.5 W screen-off idle on Linux without those patches,
-  against about 0.5 W on Windows.
+Wakeups at screen-on idle without Steam (per second): the EC temperature feed 15 (patch `0009` can slow it, no
+measurable gain), rcu_sched 11, PowerDevil's `display_recheck` thread 8.5 (libddcutil looking for external
+monitors; `POWERDEVIL_NO_DDCUTIL=1` would stop it, and external monitors' brightness control with it), dbus-broker
+4, KWin 3. CPU load 0.1-0.2 %, the SoC-wide idle state 71-76 % of the time (34 % with the Steam client).
 
-## Results (2026-11-01, kernel 7.3.0-s15+, SteamOS Desktop Mode idle, on battery, Wi-Fi connected, no USB devices)
+Windows on this laptop for comparison: about 0.5 W screen-off idle, about 0.23 W in Modern Standby
+([x1e-sleep](https://github.com/justririll/x1e-sleep) measurements on the same model).
 
-Measured with `s15-powerlog` (5 s samples, 4 min per step, first 30 s of each step dropped). Battery 56.4 Wh.
+## What is in place
 
-| State | Power | Runtime on a full battery |
-|---|---|---|
-| 100% brightness, 120 Hz | 6.9 W | 8.1 h |
-| 35%, 120 Hz | 6.4 W | 8.9 h |
-| 10%, 120 Hz | 6.0 W | 9.3 h |
-| 1%, 120 Hz | 5.9 W | 9.5 h |
-| 35%, 60 Hz | 5.7 W | 9.9 h |
-| screen off (DPMS) | 4.05 W | 13.9 h |
+Awake:
+- CPU idle works: clocks at the minimum at idle (710 MHz on two clusters, 998 MHz on one), the SoC-wide power domain
+  (`domain_ss3` on `power-domain-system`) idle most of the time, fans at 0 RPM. A CPU clock cap changes nothing at
+  idle.
+- USB runtime PM (`s15-usb-pm`, udev rule `91-s15-usb-pm.rules`): the USB-A controllers suspend after 5 s without
+  activity and wake on a plug-in (kernel patch `0021`, the sleep clock kept on as on Windows); the USB-C controllers
+  suspend only while their port has no Type-C partner. About -0.1 W with the screen on, -0.06 to -0.3 W off.
+- NVMe: APST on, the drive idles in PS4 (4 mW) with L1.2. USB4 and PCIe tunnel power domains are off.
+- Wi-Fi power save on; `s15-wifi-powersave` turns it off only for networks that drop the connection with it
+  ([known issues](known-issues.md)).
+- Keyboard light off after 30 s without input on battery (`s15-kbd-idle`).
+- Our services wait for events (input, logind, UPower) rather than polling; the two exceptions, the lid and Wi-Fi
+  watchdog timers, run once a minute without journal lines (`LogLevelMax=notice`), so they do not keep btrfs
+  committing. The Steam client does not start with the desktop.
 
-CPU load 0.1 %, clocks at the minimum (710 MHz on two clusters, 998 MHz on one), GPU at 300 MHz, the SoC-wide
-power domain idle about 82 % of the time, fans at 0 RPM, Wi-Fi power save on. So the CPU side works; the
-~4 W floor with the screen off comes from outside the cores. Panel brightness costs about 1 W from 1 % to 100 %,
-and 120 Hz about 0.7 W more than 60 Hz.
-
-Screen-off idle A/B (2026-11-01, 75-150 s per step):
-
-| Change | Power |
-|---|---|
-| keyboard backlight level 1 → off | 4.08 → 3.25 W (**-0.8 W**) |
-| PCIe ASPM `default` → `powersupersave` | no change |
-| USB runtime PM on all four dwc3 controllers *and* their `xhci-hcd.N.auto` children | 3.42 → 3.10 W (-0.3 W); no shutdown here, unlike the upstream report. A runtime-suspended controller did not wake when a device was plugged in; since kernel patch `0021` (sleep clock kept on, as on Windows) it does, and `s15-usb-pm` uses runtime PM while awake (2026-11-14, see below). |
-
-Checked and fine: NVMe APST is on and the drive idles in PS4 (4 mW) with L1.2; USB4 and PCIe tunnel power
-domains are off; fans stop at idle. Still powered without a user: `gcc_ufs_phy_gdsc`/`gcc_ufs_mem_phy_gdsc` (no
-UFS on this laptop) and `gcc_usb30_tert_gdsc`, kept on by `pd_ignore_unused`.
-
-Open leads for the floor:
-- USB runtime PM while awake: done (2026-11-14). With the screen off and the rest idle, the four controllers on
-  `auto` drew 1.40-1.41 W against 1.46 W with them on (two rounds of 75 s each), so about -0.06 W at today's much
-  lower idle floor. Plug-in wakeup works on both USB-A ports (kernel patch `0021`, [kernel.md](kernel.md)); USB-C
-  controllers suspend only while their port has no Type-C partner (`s15-usb-pm`, udev rule `91-s15-usb-pm.rules`).
-- Wi-Fi and NVMe have runtime PM off (NVMe relies on APST, `default_ps_max_latency_us` = 100000); check which
-  APST state the drive reaches.
-- Keyboard backlight was at level 1 during the test.
-- Windows reaches about 0.5 W screen-off idle on this platform.
-
-## Idle on SteamOS 0.5.7 (2026-11-05)
-
-On battery, nothing on USB, Wi-Fi connected, Desktop Mode untouched, 25 % brightness, 60 Hz; `s15-powerlog` every
-5 s, 5 min per phase (first 45 s dropped), screen kept on by `kde-inhibit`:
-
-| Phase | Power |
-|---|---|
-| baseline (Steam client running, keyboard light off) | 5.16 W |
-| keyboard light at level 1 (white) | 7.09 W (**+1.9 W**) |
-| CPU clocks capped at 1.92 GHz | 5.13 W (no change: the cores idle at 710-998 MHz anyway) |
-| baseline again | 5.11 W |
-
-Screen off (a second run, 4 min each): 1.43 W with the Steam client running, 1.37 W after closing it (-0.06 W).
-
-- 5.1 W is about 11 h on the 56 Wh the battery holds now. The 6.3 W measured in use earlier that day (Plasma estimated
-  9 h) had the keyboard light on: it costs almost 2 W with the screen on, more than the 0.8 W of the screen-off test
-  above. `s15-kbd-idle` turns it off after 30 s without input on battery ([steamos.md](steamos.md#keyboard-colour)),
-  as ASUS's software does on Windows. White lights all three LED colours; a single colour should cost less.
-- A CPU cap does not help at idle; it could only matter under load.
-- Screen content matters on the OLED panel: the plain desktop (Meta+D) drew 4.1 W against 5.1 W with the windows open
-  in the first run (same brightness, no Steam client).
-- USB runtime PM while awake (plain desktop, 4 min each): 4.09 W always on, 3.99 W with the four controllers and
-  their xHCI hosts on `auto` (all suspended after their 5 s autosuspend delay; the memory bus average vote fell from
-  4.85 to 1.61 GB/s, 3.2 GB/s of it the controllers' own), 4.10 W on again. So about -0.1 W with the screen on
-  (-0.3 W screen off, above), then still blocked by the missing wakeup on plug-in (fixed since, see "Open leads" above).
-- Panel Self Refresh: the panel supports PSR1 (DPCD `0x070` = `01`, eDP controller `aea0000`) and msm has it behind
-  `msm.psr_enabled=1` (`/etc/modprobe.d`: msm is blacklisted in the initramfs and loads from the system on a TPM
-  boot). Tried 2026-11-05: the login screen flashed on and off, the desktop showed once or twice and then stayed
-  black; the kernel logged "driver disabled vblank in self-refresh" with a warning trace as soon as
-  `self_refresh_active=1`. On a second boot the screen showed a frame on every change and went black when idle.
-  While black, the panel (Samsung ATNA56AC03, DT-compatible with the ATNA33XC20 of the sc7280 Chromebooks msm's PSR
-  was written for) reported PSR status `0x2008` = 0 (inactive) and no error (`0x2006`/`0x2007` = 0), with
-  `DP_PSR_EN_CFG` (`0x170`) = 1, `SET_POWER` D0 and the backlight unchanged; the driver logged no PSR timeout. So
-  the source turns the link off but the panel never enters PSR: the PSR-enter VSC SDP does not reach it or is not
-  accepted, probably a difference of the X1E DP controller. Parked; a first test would keep the main link on during
-  PSR (`0x170` bit 1) to see whether the panel enters PSR at all. Also note: the panel asks for link training on
-  PSR exit (`0x071` bit 0 = 0), which msm does not do.
-
-## Battery charge limit
-
-Plasma's power settings ("Charge limit") write `charge_control_start_threshold` and `charge_control_end_threshold`
-of `qcom-battmgr-bat`; the driver accepts a start of 50-95 % and a stop of 55-100 %, and the start has to be at
-least 1 % below the stop. Plasma lets both be equal (e.g. 80/80), but the firmware rejects a gap of 0 and the driver
-still reports success, so the start silently stays at its old value; 79/80 works. The battery is managed by the
-ADSP firmware, which forgets a limit set from Linux at every boot: `qcom_battmgr` only reads a persistent limit from
-PMIC nvmem cells (`charge_limit_*`), which this laptop's DT does not have, so after a restart the thresholds read 0
-(no limit). `s15-charge-limit.service` keeps it: a udev rule starts it when the battery appears (about 20 s into the
-boot, once the ADSP runs) and it sets the saved limit; when it stops at shutdown it saves the current one to
-`/var/lib/s15-charge-limit`. A stop threshold of 100 % (no limit) removes the saved limit. A limit changed shortly
-before a hard reset is lost (it is saved at shutdown only).
-
-With the limit reached on AC the battery reports "Not charging"; Plasma's battery applet would then move into the
-tray's hidden items, so the desktop setup sets it to "Always shown" ([steamos.md](steamos.md#desktop-mode)).
-
-## Standby policy
-
-Standby is meant to be plain suspend-to-RAM, not Modern Standby: nothing runs, nothing radio-related stays on, and
-only the user or the battery wakes the machine.
+Standby is plain suspend-to-RAM, not Modern Standby: nothing runs, nothing radio-related stays on, and only the user
+or the battery wakes the machine.
 
 | Piece | What it does |
 |---|---|
-| ath12k (driver) | shuts the Wi-Fi half of the WCN7850 down on suspend and reloads its firmware on resume |
-| `s15-sleep-radios` (sleep hook) | Bluetooth off during suspend (`/etc/s15-sleep-keep-bt` keeps it on) |
+| Sleep mode `deep` | PSCI SYSTEM_SUSPEND: the firmware puts the SoC into CX collapse (`cxsd`/`ddr` in `/sys/kernel/debug/qcom_stats/` for the whole sleep) |
+| Kernel | LPASS macro clocks released in runtime suspend, syscon XO vote, PCIe Gen1 bandwidth vote, SoundWire IRQ sync, SS1 idle state and DRIPS for system sleep only ([kernel.md](kernel.md)); boot parameters `fw_devlink.sync_state=timeout`, `nvme.quirks=…simple_suspend`, `pcie_port_pm=force`; panel 3.3 V not always-on (DT) |
+| `qcom_adsp_pwr_lmts`, `aoss_cxsd_only` (modules) | the ADSP's Modern Standby message; CX collapse only, no AOSS deep sleep (AOSD), which reset the machine about every hour |
+| ath12k | shuts the Wi-Fi half of the WCN7850 down on suspend and reloads its firmware on resume |
+| `s15-sleep-radios` (sleep hook) | Bluetooth off during suspend (`/etc/s15-sleep-keep-bt` keeps it on; it makes no measurable difference) |
 | `92-s15-wakeup.rules` | no wakeup from battery/charger reports, Wi-Fi (MHI, its PCIe root port) or the compute DSP |
-| `s15-ec-darkwake` (sleep hook) | a wake without a wakeup IRQ (the battery management at every 1 % step on battery, every 3-4 h) goes back to sleep after 2 s; with the lid open only if no key or button is pressed within 3 s (`s15-input-wait`) and the lid was not opened; at or below 5 % battery it powers off instead (hibernates with [hibernate after hours](#hibernate-after-hours)); a failed suspend is not retried |
+| `s15-ec-darkwake` (sleep hook) | a wake without a wakeup IRQ (the battery management at every 1 % step on battery, every 3-4 h; about every 60 s on AC) goes back to sleep after 2 s; with the lid open only if no key or button is pressed within 3 s (`s15-input-wait`) and the lid was not opened; at or below 5 % battery it powers off, or hibernates with [hibernate after hours](#hibernate-after-hours); a failed suspend is not retried |
 | `s15-lid-watchdog` (timer) | awake with the lid closed and no external display for two minutes: suspend, whatever an application requested (`/run/s15-keepawake` disables it) |
 | `s15-lid-wake` (sleep hook) | no lid wakeup when suspended with the lid open (the EC pulses the lid GPIO) |
 
 Still able to wake the machine: lid, keyboard, touchpad, power key, USB devices, the EC, the ADSP (battery
-management) and the thermal sensors. The RTC cannot (the ADSP owns its alarm, see
-[hibernate after hours](#hibernate-after-hours)), so there are no timed wakes and no suspend-then-hibernate.
-Hibernation is experimental and off by default ([below](#hibernation)).
-Note: the sleep mode `deep` is PSCI SYSTEM_SUSPEND, not s2idle: any interrupt that wakes the SoC resumes the whole
-system, also one from a source without wakeup flag (the ADSP's glink messages), which is what a dark wake is.
-
-## Standby: CX collapse (2026-11-01)
-
-The SoC counters in `/sys/kernel/debug/qcom_stats/` (`cxsd` = CX collapse, `aosd` = AOSS deep sleep, `ddr`,
-`apss`) were 0 at idle and in standby: the main rail never collapsed, standby drew 1.5-1.8 W. The fixes, mostly
-from [justririll/x1e-sleep](https://github.com/justririll/x1e-sleep) (made for this laptop), in the order applied:
-
-| Step | Standby (≈5 min samples) |
-|---|---|
-| start (EC standby message only) | 1.78 W |
-| `fw_devlink.sync_state=timeout`, no `*_ignore_unused` | 1.57 W |
-| panel 3.3 V not always-on (DT), `nvme.quirks=...simple_suspend`, `pcie_port_pm=force`, lid-wake hook | 0.88 W (s2idle) |
-| kernel: LPASS macro clocks released in runtime suspend (rx/tx from x1e-sleep, wsa/va ours), syscon XO vote, PCIe Gen1 bandwidth vote, SoundWire IRQ sync, SS1 idle state + DRIPS system-sleep-only; modules `qcom_adsp_pwr_lmts` (ADSP Modern Standby message) and `aoss_cxsd_only` | 0.67 W (s2idle, `apss` 0) |
-| same, sleep mode `deep` | `cxsd`/`ddr` for 325 of 327 s; drain below the gauge's resolution in 5 min |
-
-x1e-sleep measured about 0.17 W overnight in this CX-collapse-only mode on the same laptop (Windows Modern
-Standby there: about 0.23 W). AOSD (XO shutdown) is disabled by `aoss_cxsd_only` because it caused hard resets
-about every 61 minutes in their tests.
-
-Long test (2026-11-01, lid closed 2 h 41 min, battery at 23 %, `deep`): **0.15 W** on average (0.14 W for the
-first 65 min, 0.16 W for the remaining 96 min; the gauge resolves 10 mWh). That is about 6.5 % of the 56.4 Wh
-battery per day, roughly two weeks from full. One dark wake after 65 min (no wake IRQ recorded); `s15-ec-darkwake`
-put the machine back to sleep after 4 s. `cxsd`/`ddr` residency covered the whole sleep.
-
-Second long test (2026-11-01/02 night, battery 87 %, `sync_state()` forced right before suspend instead of at boot,
-systemd-boot, Bluetooth off during sleep, wakeup disabled for Wi-Fi/MHI, its PCIe root port and the CDSP): **0.21 W**
-for 80 min and **0.20 W** for 87 min, `cxsd`/`ddr` for the whole sleep. About 50 mW more than the first test,
-cause not known yet (the DTB the kernel gets is identical with systemd-boot and GRUB). A/B night with Bluetooth left
-on during sleep (battery 84 %): 0.21 W for 100 min, 0.20 W for 15 min, so Bluetooth makes no difference; it stays
-off during sleep. Next A/B: the wakeup changes (MHI, PCIe root port, CDSP), and runs at a similar charge level.
-AOSD (XO shutdown) test (2026-11-02, `aoss_cxsd_only` unloaded): the SoC does reach it (`cxsd`/`aosd`/`ddr` 78 % of
-a 15 s sleep, i.e. the whole sleep after the entry delay), but the next long sleep ended in a hard reset; the laptop
-was found off and the firmware had started Windows. Same as x1e-sleep's hourly AOSD resets (they measured 0.25 W in
-AOSD, 0.17 W CXSD-only), so `aoss_cxsd_only` stays. The drain in AOSD could not be measured.
-Caveat: these figures come from the battery gauge (`energy_now` in 10 mWh steps, model-based, possibly corrected after
-a long rest), not from a power meter; compare only long runs at similar charge levels. A false "input activity" after the hourly EC
-wake kept the laptop awake for 14 min in this test (fixed: the input baseline is now taken 2 s after the wake).
+management) and the thermal sensors. Not the RTC ([below](#no-wake-timer)): no timed wakes. `deep` resumes the whole
+system on any interrupt that wakes the SoC, also one from a source without wakeup flag (the ADSP's glink messages):
+that is what a dark wake is.
 
 ## Hibernation
 
-Experimental (2026-11-14), not part of the install and not offered by default: the goal is Windows' "hibernate after
-some hours of standby". The mechanics work end to end and the restored system works except for audio (see below).
+Optional, off by default. `sudo /opt/snaptop-linux/steamos/hibernate.sh enable` (`status`, `disable`, `after
+SECONDS`):
+- a 16 GiB swap file in its own subvolume of the partition's top level, `.s15-swap` (outside the OS versions that
+  updates swap; NOCOW, so not inheriting the top level's `compression=zstd`), switched on at boot by
+  `s15-hibernate-swap.service` with a priority below zram;
+- `resume=<root device> resume_offset=<page>` in every boot entry of this install (`s15-os-update` copies them into
+  the entries it writes), a new initramfs and a TPM re-seal;
+- Valve's `hibernate-prepare.service` masked: its swap helper finds the file offset with `filefrag`, which is wrong on
+  btrfs, so the kernel would write the image over other data;
+- `HIBERNATE_AFTER=18000` (5 h) in `/etc/s15-hibernate.conf` ([below](#hibernate-after-hours)).
 
-Enable with `sudo /opt/snaptop-linux/steamos/hibernate.sh enable` (`status`, `disable` to undo). It
-- creates a 16 GiB swap file in its own subvolume of the partition's top level, `.s15-swap` (outside the OS
-  versions that updates swap; the top level carries `compression=zstd`, which the subvolume must not inherit, or the
-  file cannot be made NOCOW), switched on at boot by `s15-hibernate-swap.service` with a priority below zram;
-- writes `resume=<root device> resume_offset=<page>` into every boot entry of this install (`s15-os-update` copies
-  them into the entries it writes), rebuilds the initramfs and re-seals the TPM unlock;
-- masks Valve's `hibernate-prepare.service`: its swap helper finds the file offset with `filefrag`, which is wrong
-  on btrfs, so the kernel would write the image over other data.
+What works (kernel patches `0016`-`0020`, `0022`-`0024`, `0026`-`0035`): with a real power-off the session is back
+17.5 s after pressing the power button, as fast as a cold boot but with all apps open. GPU, EC, Wi-Fi, Bluetooth,
+keyboard, touchpad, battery, all USB controllers, both DSPs, audio and both cameras work after the restore, also for
+several hibernations in a row in one session.
 
 Around a hibernation (sleep hook `s15-hibernate`, initcpio hook `s15-hibernate`):
 - the image size limit is set to the memory in use, so the page cache is dropped instead of saved (about 4.5 GB);
-- the location systemd-sleep configured is checked against `/etc/s15-hibernate.conf`; on a mismatch the swap file
-  is switched off and the hibernation fails instead of writing elsewhere;
-- BootNext is set to the running entry and systemd-boot's one-shot entry to the running kernel: the firmware starts
-  Windows first, and BootNext survives a full power-off (tested 2026-11-14);
+- the location systemd-sleep configured is checked against `/etc/s15-hibernate.conf`; on a mismatch the swap file is
+  switched off and the hibernation fails instead of writing elsewhere;
+- BootNext is set to the running entry and systemd-boot's one-shot entry to the running kernel: the firmware would
+  start Windows first, and BootNext survives a full power-off;
 - the CDSP and ADSP are stopped (CDSP first: the other DSP's state notifications to it time out after 5 s each).
   Their driver has no hibernation callbacks, and the boot that restores the image starts its own ADSP in the
   initramfs; `s15-hibernate-initrd` stops it again right before the hand-over (after loading msm, which quiesces the
@@ -197,87 +107,121 @@ Around a hibernation (sleep hook `s15-hibernate`, initcpio hook `s15-hibernate`)
   removes the sound card, which waits until PipeWire closed it, so user sessions are not frozen during the hooks
   (`SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=false` on `systemd-hibernate.service`; otherwise the stop waits forever and
   the kernel aborts the hibernation after systemd's 90 s hook timeout);
-- Bluetooth is unbound from its driver and bound again after the resume: the controller loses power and firmware,
-  the driver has no restore, and unbinding it only after the resume hung in `hci_unregister_dev()`;
+- Bluetooth is unbound from its driver before and bound again after the resume: the controller loses power and
+  firmware, the driver has no restore, and unbinding it only after the resume hung in `hci_unregister_dev()`;
 - `s15-ec-darkwake` and `s15-sleep-radios` treat a resume from hibernation as a real wake.
 
-State (2026-11-14, kernel patches `0016`-`0035`, [kernel.md](kernel.md)): with a real power-off
-(`HibernateMode=shutdown`, the default) the session is back 17.5 s after pressing the power button, the same as a cold
-boot but with all apps open; a self-resuming test (`HibernateMode=reboot`) takes about 70 s from the hibernate
-command, for saving, firmware and loading. After the restore the GPU, EC, Wi-Fi, Bluetooth (unbound before and bound
-again after, on top of patch `0018`), keyboard, touchpad, battery, all USB controllers, both DSPs and audio (speakers
-tested) work, also for three hibernations in a row in one session. The audio card is back about 2 s after the ADSP;
-the cameras work after the restore once patch `0035` reprograms their clocks (before it, only cameras unused before
-the hibernation worked). Not yet: long-term use and suspend-then-hibernate.
+The kernel that loads the image has to set up the USB PHYs itself: the eUSB2 PHY and PTN3222 repeater drivers are
+in `drivers/phy/`, not `drivers/phy/qualcomm/`, so the initcpio hook `s15` adds them by name. Without them that
+kernel's `clk_disable_unused` gated the QMP PHY clocks, and every SuperSpeed xHCI restore spun for 21 s with
+interrupts off, starving RPMh, I2C and Wi-Fi (freezes, hard lockups). Releasing the PHYs before the snapshot instead
+(driver patches, or unbinding the USB controllers) made the machine reset silently in the late/noirq freeze phase.
 
-USB: the kernel that loads the image has to set up the USB PHYs itself. The eUSB2 PHY and PTN3222 repeater drivers
-are in `drivers/phy/`, not `drivers/phy/qualcomm/`, so the initcpio hook `s15` adds them by name; without them no
-USB controller bound before the hand-over, that kernel's `clk_disable_unused` gated the QMP PHY clocks, and the
-restored kernel, which still counted the PHYs as set up, had no PIPE clock: every SuperSpeed xHCI restore spun for
-21 s with interrupts off (`Clearing Run/Stop bit failed`), which starved RPMh, the I2C controllers and Wi-Fi on that
-CPU (freezes, hard lockups). Two other approaches made the machine reset silently in the late/noirq freeze phase
-before the image was written: unbinding the USB controllers before hibernating, and PHY driver patches that
-release the PHYs before the snapshot. `echo platform > /sys/power/pm_test` reproduces such resets without writing an
-image (the `devices` level stops before the late/noirq phase).
-Test aids: `/run/s15-hibernate-entry` (one-shot entry for the resume, e.g. one without `quiet`),
-`s15.hibernate_report=1` on that entry (the boot kernel writes its log to `S15BOOT/s15-hibernate-resume.log` before
-the image load), `echo platform > /sys/power/pm_test` (see above). `clk_ignore_unused` on the resume entry crashed the
+Test aids: `echo platform > /sys/power/pm_test` runs a hibernation up to the late/noirq phase without writing an
+image (`devices` stops before it); `/run/s15-hibernate-entry` sets the one-shot entry for the resume (e.g. one
+without `quiet`); `s15.hibernate_report=1` on that entry makes the boot kernel write its log to
+`S15BOOT/s15-hibernate-resume.log` before loading the image. `clk_ignore_unused` on the resume entry crashes the
 restore.
 
 ### Hibernate after hours
 
-Windows on this laptop hibernates after some hours of standby. `hibernate.sh enable` sets `HIBERNATE_AFTER=18000`
-(5 h) in `/etc/s15-hibernate.conf`; `hibernate.sh after SECONDS` changes it, 0 turns it off. `s15-ec-darkwake`
-then hibernates instead of suspending again at a dark wake on battery once the standby has lasted that long, and at
-low battery. The standby starts at the first suspend after a real wake (`/run/s15-standby.since`); a wake with a
-wakeup IRQ, a key press or the opened lid after a dark wake, and a resume from hibernation end it.
+As Windows does on this laptop: `s15-ec-darkwake` hibernates instead of suspending again at a dark wake on battery
+once the standby has lasted `HIBERNATE_AFTER` seconds (`hibernate.sh after SECONDS`, 0 = off), and at low battery.
+The standby starts at the first suspend after a real wake (`/run/s15-standby.since`); a wake with a wakeup IRQ, a
+key press or the opened lid after a dark wake, and a resume from hibernation end it.
 
-There is no timer that wakes the machine at the right time, so the check runs at the next dark wake: on battery the
-machine wakes at every 1 % step of the gauge (battery management, no wakeup IRQ; 10 500-13 800 s apart at
-0.15-0.19 W, always a multiple of 300 s plus a few seconds), so a 5 h setting hibernates after 5-9 h. On AC there are
-no such wakes and no hibernation; unplugging the charger wakes the machine (check that in the test).
+Without a wake timer the check runs at the next dark wake. On battery those come at every 1 % step of the gauge,
+10 500-13 800 s apart in standby, so a 5 h setting hibernates after 5-9 h (night of 2026-11-14/15: after 6.5 h). On
+AC there is no hibernation; unplugging the charger wakes the machine, and the next dark wake on battery counts.
 
-Why there is no wake timer (2026-11-14):
+### No wake timer
+
 - The PMIC RTC alarm (PMK8550 `0x6200`) belongs to the ADSP: the SPMI arbiter gives it the write and interrupt
-  permission, so `rtc-pm8xxx` runs with `qcom,no-alarm` (upstream commit 015b70bd6c75). Dropping the property gives
-  `-EPERM` on the alarm interrupt (reported on another X1 laptop); it cannot work and would fight the firmware.
-- Windows does not use it either: ASUS's PMIC Apps driver ships with `RtcAlarm\RtcAlarmSupport = 0`. Its wake
-  timer is the ACPI Time and Alarm Device `\_SB.PRTC` (ACPI000E, `_GCP` 0x1F7: AC and DC timers, also from S4/S5),
-  which the PMIC Apps driver passes to the ADSP over pmic_glink: owner 0x8010, opcodes 0x60-0x65 for
-  `_GWS`/`_CWS`/`_STP`/`_STV`/`_TIP`/`_TIV`, u32 timer id (0 AC, 1 DC) and value (seconds), u32 result. The ADSP's
-  battery manager (`BattMngrTech_TAD`) programs the alarm.
-- Linux can send the same requests (prototype driver `rtc-qcom-tad`, not part of the build), and the ADSP accepts
-  them (result 0, timers read back). But ASUS's ADSP firmware (ADSP.HT.5.9-00806, January 2025) does not wake Linux
-  when the timer expires (tested 2026-11-15: 30 s and 120 s alarms in standby, the machine woke only at the next
-  charger update ~61 s later; awake, no message arrives on expiry). Qualcomm added an "alarm expired" glink message
-  to the ADSP firmware only in 2026 (linux-firmware, `qcom/x1e80100/adsp.mbn`, for their reference boards; retail
-  laptops need the vendor-signed firmware), with a driver `rtc-qcom-glink` under review. If an `rtc*/wakealarm`
-  exists, `s15-ec-darkwake` sets it to the end of the standby period at every suspend.
-- No alternative: the Hamoa EC protocol has no timer command; the RPMh/PDC wake timer is not used on X1E
-  (`CONTROL_TCS` 0) and PSCI SYSTEM_SUSPEND leaves the system sleep to the firmware; the APSS watchdog would reset
-  the machine if its bark could not wake it.
+  permission, so `rtc-pm8xxx` runs with `qcom,no-alarm` (upstream commit 015b70bd6c75); without the property the
+  alarm interrupt fails with `-EPERM`.
+- Windows uses the ACPI Time and Alarm Device `\_SB.PRTC` instead, which ASUS's PMIC Apps driver passes to the ADSP
+  over pmic_glink (owner 0x8010, opcodes 0x60-0x65 for `_GWS`/`_CWS`/`_STP`/`_STV`/`_TIP`/`_TIV`); its own RTC
+  alarm support is off (`RtcAlarm\RtcAlarmSupport = 0`).
+- Linux can send the same requests (prototype driver `rtc-qcom-tad`, not part of the build) and the ADSP accepts them,
+  but ASUS's ADSP firmware (ADSP.HT.5.9-00806, January 2025) does not wake Linux when the timer expires (tested
+  2026-11-15). Qualcomm added an "alarm expired" glink message to the ADSP firmware only in 2026, for their reference
+  boards (`rtc-qcom-glink` under review); retail laptops need vendor-signed firmware. If an `rtc*/wakealarm` ever
+  works, `s15-ec-darkwake` already sets it to the end of the standby period at every suspend.
+- No alternative: the EC protocol has no timer command, the RPMh/PDC wake timer is not used on X1E, and PSCI
+  SYSTEM_SUSPEND leaves the system sleep to the firmware.
 
-## Idle on the new kernel (2026-11-01, keyboard backlight off, Wi-Fi on)
+## Battery charge limit
 
-| State | Morning (old setup) | New kernel + boot parameters |
-|---|---|---|
-| screen on, 35 %, 120 Hz | 6.36 W | 4.54 W |
-| screen on, 10 %, 60 Hz | ~5.7 W | 3.84 W |
-| screen off | 2.77 W | 1.50 W |
-| screen off, Bluetooth off | 2.72 W | 1.49 W |
-| screen off, Wi-Fi + Bluetooth off | 2.47 W | 1.31 W |
+Plasma's power settings ("Charge limit") write `charge_control_start_threshold` and `charge_control_end_threshold`
+of `qcom-battmgr-bat`; the driver accepts a start of 50-95 % and a stop of 55-100 %, and the start has to be at
+least 1 % below the stop. Plasma lets both be equal (e.g. 80/80), but the firmware rejects a gap of 0 and the driver
+still reports success, so the start silently stays at its old value; 79/80 works. The ADSP firmware forgets a limit
+set from Linux at every boot (`qcom_battmgr` reads a persistent one only from PMIC nvmem cells this laptop's DT does
+not have), so `s15-charge-limit.service` keeps it: a udev rule starts it when the battery appears (about 20 s into
+the boot) and it sets the saved limit; at shutdown it saves the current one to `/var/lib/s15-charge-limit`. A stop
+threshold of 100 % removes the saved limit; a limit changed shortly before a hard reset is lost.
 
-These were measured with Wi-Fi power save on. It is off now (some access points dropped the connection with power
-save on, see [known issues](known-issues.md)); its cost at screen-on idle is still to be measured.
+With the limit reached on AC the battery reports "Not charging"; Plasma's battery applet would then move into the
+tray's hidden items, so the desktop setup sets it to "Always shown" ([steamos.md](steamos.md#desktop-mode)).
 
-Tried without a measurable effect on screen-off idle:
-- EC SoC-Tj report every 2 s instead of 125 ms (`qcom_hamoa_ec.tj_period_ms`, patch 0009): the EC accepts it, I2C
-  interrupts drop from 14/s to 1/s, power unchanged (1.52 W both).
-- HDMI hot-plug via GPIO: the HDMI DP controller (DP2, `ae9a000`) uses its internal HPD block, so msm keeps it
-  runtime-active and the display subsystem (`mdss_gdsc`, `mmcx`) never powers down. Muxing gpio126 as a GPIO and
-  adding `hpd-gpios = <&tlmm 126 GPIO_ACTIVE_HIGH>` to the hdmi-connector lets DP2 and MDSS suspend, but
-  screen-off idle stayed at ~1.53 W. Not adopted (HDMI hot-plug would be untested).
+## Measuring
 
-Windows uses the deepest platform state (DRIPS) only in Modern Standby, never at runtime idle (x1e-sleep WPR
-trace); the equivalent here is suspend, which now reaches CX collapse.
+Tools in `power/` (install on the laptop as root):
 
+| Tool | Purpose |
+|---|---|
+| `s15-powerlog.py` → `/usr/local/bin/s15-powerlog` | CSV every N s: battery power, energy, brightness, screen DPMS, CPU load and clocks, GPU clock, share of time the SoC-wide power domain spent idle, Wi-Fi state, USB device count. Run detached: `systemd-run --unit=s15-powerlog --collect -p Nice=10 /usr/local/bin/s15-powerlog --interval 5 --duration 14400` |
+| `s15-powerreport.py` | Averages per (screen, brightness, USB devices) segment of a CSV, with the runtime that would give on a full battery. |
+| `s15-sleep-hook` → `/usr/lib/systemd/system-sleep/` | Logs battery energy before/after every suspend to `/var/log/s15-sleep.log`, with average drain, CX collapse/AOSD/DDR residency (`qcom_stats`) during the sleep and the wake IRQ. |
+
+- Measure on battery: `qcom-battmgr-ac/online` stays 0 when charging over USB-C PD, so check that the battery
+  `status` is Discharging. Nothing on USB (a USB Ethernet adapter alone draws a measurable amount), Wi-Fi connected.
+- Drop the first 30-45 s after each change; 4-5 min per step is enough at idle.
+- The figures come from the battery gauge (`energy_now` in 10 mWh steps, model-based, sometimes corrected after a long
+  rest), not from a power meter. For standby compare only sleeps of hours at similar charge levels; short sleeps
+  and the first sleep after charging show nonsense (negative or several watts).
+
+## Milestones
+
+| Date | Change | Screen-off idle | Standby |
+|---|---|---|---|
+| 2026-11-01 morning | first install (kernel 7.3 with the SoC-wide idle state and PDC wakeups) | 2.77 W | 1.78 W, no CX collapse |
+| 2026-11-01 | `fw_devlink.sync_state=timeout`, panel rail, NVMe and PCIe port PM, LPASS/XO/PCIe votes, `deep` with CX collapse only | 1.50 W | 0.15-0.21 W |
+| 2026-11-05 | SteamOS 0.5.7, keyboard light off on idle | 1.37-1.43 W | |
+| 2026-11-14 | USB runtime PM with plug-in wakeup (`0021`) | 1.40 W (1.46 W without) | 0.15-0.19 W |
+| 2026-11-14/15 | hibernation, hibernate after 5 h | | CX collapse again after a test driver was gone (see the top) |
+| 2026-11-15 | measured again (screen on 25 %: 3.98 W) | 1.34 W | |
+
+## Tried, parked or not adopted
+
+- AOSS deep sleep (AOSD, XO shutdown): the SoC reaches it, but the next long sleep ended in a hard reset and the
+  firmware started Windows; x1e-sleep saw the same hourly resets (0.25 W in AOSD against 0.17 W CX-only there).
+  `aoss_cxsd_only` stays.
+- PCIe ASPM `powersupersave`: no change.
+- EC SoC-Tj report every 2 s instead of 125 ms (`qcom_hamoa_ec.tj_period_ms`, patch `0009`): I2C interrupts 14/s →
+  1/s, power unchanged.
+- HDMI hot-plug through gpio126 (`hpd-gpios`) lets the HDMI DP controller and MDSS runtime-suspend, but screen-off
+  idle stayed at ~1.53 W; not adopted (HDMI hot-plug would be untested).
+- Panel Self Refresh (`msm.psr_enabled=1`): the screen goes black. The panel (Samsung ATNA56AC03) offers PSR1 only,
+  needs link training on PSR exit (DPCD `0x071` = `0x3a`), and has no Panel Replay or ALPM. The eDP controller is
+  newer (v1.4.1, `0x10040001`) than the sc7280 msm's PSR code was written for, and two things on the source side are
+  wrong at reset (2026-11-15): `PSR_CONFIG` (link + 0x100) and `PSR_CMD` (link + 0x110) hold garbage (`0x67438600`)
+  that msm's single-bit updates keep, and the PSR VSC SDP header (link + 0x170/0x174) defaults to the 3D-stereo
+  revision 1 instead of revision 2 with 8 data bytes (`0x16070000`/`0x5d08ce02`). With exact values written there the
+  source side works: PSR entry raises its update and capture interrupts and drops the link, PSR exit raises its exit
+  interrupt and the picture comes back without link training. But the panel never enters PSR: its PSR status
+  (`0x2008`) and "last received PSR SDP" (`0x200A`) stay 0 for sink settings `0x170` = 1, 3, 9 and `0x0B`, at 60 and
+  120 Hz, and the screen is black meanwhile (checked through the camera in a mirror). A PSR SDP built by hand in the
+  generic packet slot (GENERIC0) changed nothing, and a colour-format (VSC) SDP sent the same way blanked the panel
+  although it supports it (`0x2210` = `0x08`): most likely this controller does not put SDPs on the link the way
+  msm programs them. ASUS's Windows driver does PSR (it counts fast, full and no link training on exit and has
+  `EDPPsrTrainingPattern`, `EDPPsrTrainingDuration`, `EDPMaxPsrVersion` settings); its register sequence could not be
+  read from the binary. Parked.
+- Display engine clock at 325 MHz instead of 575 MHz (the wide plane split across both mixers; the multimedia rail one
+  level lower, no underruns in 40 min at 60 and 120 Hz): +0.01 / -0.04 W, within the noise. With the link at HBR2
+  as well (the rail two levels lower) about -0.05 W, but HBR2 x4 carries 17.19 Gbit/s against the 17.13 the 10-bit
+  stream needs, and the panel offers nothing between HBR2 and HBR3; not adopted (kernel branch `s15-display-idle`).
+- Still powered without a user: `gcc_ufs_phy_gdsc`/`gcc_ufs_mem_phy_gdsc` (no UFS on this laptop) and
+  `gcc_usb30_tert_gdsc`, kept on by `pd_ignore_unused`.
+- Windows uses the deepest platform state (DRIPS) only in Modern Standby, never at runtime idle; the equivalent here
+  is suspend.
