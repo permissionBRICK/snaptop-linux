@@ -131,12 +131,16 @@ Needs the login password ([above](#setting-it-up)). In Konsole (Desktop Mode):
 sudo /opt/snaptop-linux/steamos/install-face.sh install    # about 15 minutes the first time (it builds)
 ```
 
-1. Start **Biopass** from the application menu once: it writes its settings and downloads its models. Close it.
-2. Choose the cameras (recommended: the IR camera, below), then open Biopass again and add your face under Face
-   (enrol a few times: straight, slightly turned, with and without glasses):
+1. Start **Biopass** from the application menu once: it downloads its models (Models page). Close it.
+2. Choose the cameras (recommended: the IR camera, below) and add your face, as yourself, not with sudo (5 pictures
+   two seconds apart: look at the screen, turn your head a little between them, with and without glasses):
    ```sh
    sudo s15-face camera ir
+   s15-face enrol
    ```
+   The app lists the faces under Saved Faces, but its own "add face" cannot pick the IR camera: it lists only
+   `/dev/video` nodes, which both cameras share, and would take the colour camera. Saving the app's settings page
+   turns the camera settings into a camera profile; face unlock then refuses until `sudo s15-face camera ir` again.
 3. Log out or restart once: the first login after a boot always takes the password or the PIN.
 
 `sudo s15-face snapshot ir` saves one frame as Biopass sees it (`/tmp/s15-face-ir.png`); `sudo s15-face status`

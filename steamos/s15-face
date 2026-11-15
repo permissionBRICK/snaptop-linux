@@ -15,9 +15,14 @@
 #
 #   s15-face status [user]
 #   s15-face reset [user]               (root) clear the count of failed scans
-#   s15-face camera ir|rgb [user]       set the cameras in the user's Biopass configuration (Biopass app closed):
+#   s15-face camera ir|rgb [user]       set the cameras in the user's Biopass configuration (Biopass app closed;
+#                                       without one yet, Biopass's defaults are written first):
 #                                       ir: the IR camera recognises and checks presence, in the dark too (default);
 #                                       rgb: the colour camera recognises, the IR camera checks presence
+#   s15-face enrol [count]              (as yourself) add your face [count] times (default 5) with the camera set
+#                                       above, through Biopass's helper; the app lists them under Saved Faces. The
+#                                       app's own "add face" cannot pick the IR camera (it lists only /dev/video
+#                                       nodes, which both cameras share)
 #   s15-face snapshot ir|rgb [file]     one frame as Biopass sees it (default /tmp/s15-face-<camera>.png)
 #   s15-face cameras                    the cameras as Biopass's libcamera lists them
 set -u
@@ -26,6 +31,9 @@ STATE=/run/s15-face
 MAX_FAILS=5
 TOOL=/usr/lib/s15-face/camera_capture_test
 CONF=.config/com.ticklab.biopass/config.yaml
+DB=.config/com.ticklab.biopass/biopass.db
+FACES=.local/share/com.ticklab.biopass/faces
+HELPER=/usr/bin/biopass-helper
 log() { logger -t s15-face -p auth.notice -- "$*" 2>/dev/null || true; }
 die() { echo "s15-face: $*" >&2; exit 1; }
 valid_user() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
@@ -152,17 +160,42 @@ camera() {
   ir=$(camera_id ir); rgb=$(camera_id rgb)
   [ -n "$ir" ] && [ -n "$rgb" ] || die "IR or colour camera not found ($(cameras | grep -c ' id: ') cameras listed)"
   home=$(getent passwd "$u" | cut -d: -f6)
-  [ -f "$home/$CONF" ] || die "no Biopass configuration for $u yet: start the Biopass app once, then run this again"
   pgrep -u "$u" -x biopass >/dev/null && die "close the Biopass app first (it would write its own settings back)"
   local run=()
   [ "$(id -u)" = 0 ] && [ "$u" != root ] && run=(runuser -u "$u" --)
   "${run[@]}" python3 -I - "$home/$CONF" "$mode" "$ir" "$rgb" <<'EOF' || die "configuration not changed"
 import os, sys, yaml
 path, mode, ir, rgb = sys.argv[1:]
-c = yaml.safe_load(open(path)) or {}
+# The app writes config.yaml only when its settings are saved. Without one: Biopass 1.5.1's defaults
+# (auth/test/config/defaults.yaml), which the helper reads as its own.
+DEFAULTS = {
+    "schema_version": 2,
+    "strategy": {"debug": False, "execution_mode": "parallel", "order": ["face", "fingerprint"],
+                 "ignore_services": ["polkit-1", "pkexec"]},
+    "methods": {
+        "face": {
+            "enable": True, "retries": 5, "retry_delay": 200, "camera": None, "camera_profiles": [],
+            "detection": {"model_id": "yolov8n-face", "threshold": 0.5},
+            "recognition": {"model_id": "edgeface-s-gamma-05", "threshold": 0.5},
+            "anti_spoofing": {"enable": False, "model": {"model_id": "mobilenetv3-antispoof", "threshold": 0.8},
+                              "ir_camera": None, "ir_warmup_delay_ms": 300, "ir_presence_timeout_ms": 1500},
+        },
+        "fingerprint": {"enable": False, "retries": 1, "timeout": 5000},
+    },
+    "appearance": "system",
+}
+try:
+    c = yaml.safe_load(open(path)) or {}
+except FileNotFoundError:
+    c = DEFAULTS
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+if "schema_version" not in c:   # only "appearance" (the app's theme picker): the helper would ignore the file
+    c = {**DEFAULTS, **c}
 face = c.setdefault("methods", {}).setdefault("face", {})
 if face.get("camera_profiles"):
-    sys.exit("s15-face: the configuration has camera profiles, which override these settings; remove them in the app")
+    # saving the app's settings page turns these settings into a profile, which would override them
+    print("s15-face: camera profiles from the app removed (these settings replace them)")
+    face["camera_profiles"] = []
 anti = face.setdefault("anti_spoofing", {})
 anti["ir_camera"] = ir
 if mode == "ir":
@@ -172,12 +205,88 @@ if mode == "ir":
 else:
     face["camera"] = rgb
 tmp = path + ".s15-face"
-with open(tmp, "w") as f:
+with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
     yaml.safe_dump(c, f, sort_keys=False)
 os.replace(tmp, path)
 print(f"camera: {face['camera']}\nIR camera: {ir}")
 EOF
-  echo "Enrol your face again in the Biopass app: faces from the other camera do not match."
+  echo "Now add your face as $u: s15-face enrol (faces from the other camera do not match)."
+}
+
+# Biopass's helper as the app runs it for "add face" (preview-session: READY, then CAPTURE <file> -> OK | NO_FACE |
+# ERR), with the camera from the user's settings, so a libcamera id (the IR camera) works too.
+enrol() {
+  local count=${1:-5} home
+  [[ $count =~ ^[1-9][0-9]?$ ]] || die "usage: s15-face enrol [count]"
+  [ "$(id -u)" != 0 ] || die "run as yourself, not as root"
+  [ -x "$HELPER" ] || die "face unlock is not installed (steamos/install-face.sh install)"
+  home=$(getent passwd "$(id -un)" | cut -d: -f6)
+  [ -f "$home/$CONF" ] || die "no camera set yet: sudo s15-face camera ir"
+  python3 -I - "$home/$CONF" "$home/$DB" "$home/$FACES" "$HELPER" "$count" <<'EOF'
+import os, select, sqlite3, subprocess, sys, time, yaml
+conf, db, faces, helper, count = sys.argv[1:]
+face = ((yaml.safe_load(open(conf)) or {}).get("methods") or {}).get("face") or {}
+cam = face.get("camera")
+if not cam or face.get("camera_profiles"):
+    sys.exit("s15-face: no camera set (or camera profiles from the app): sudo s15-face camera ir")
+mid = (face.get("detection") or {}).get("model_id", "yolov8n-face")
+try:
+    row = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select path from models where id = ?", (mid,)).fetchone()
+except sqlite3.Error:
+    row = None
+if not row or not os.path.isfile(row[0]):
+    sys.exit(f"s15-face: detection model {mid} not downloaded yet: open the Biopass app once (Models)")
+os.makedirs(faces, mode=0o700, exist_ok=True)
+p = subprocess.Popen([helper, "preview-session", "--model", row[0], "--camera", cam],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+buf = b""
+def reply(done, timeout):   # the next line done() accepts; the helper also prints log lines
+    global buf
+    end = time.monotonic() + timeout
+    while True:
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.decode(errors="replace").strip()
+            if done(line):
+                return line
+        left = end - time.monotonic()
+        if left <= 0 or not select.select([p.stdout], [], [], left)[0]:
+            sys.exit("s15-face: the helper did not answer in time")
+        chunk = os.read(p.stdout.fileno(), 65536)
+        if not chunk:
+            sys.exit("s15-face: the helper ended (camera in use? close the Biopass app)")
+        buf += chunk
+try:
+    print("Opening the camera...")
+    r = reply(lambda l: l == "READY" or l.startswith("ERR"), 20)
+    if r != "READY":
+        sys.exit(f"s15-face: {r}")
+    n = int(count)
+    print(f"Look at the screen as you normally do. {n} pictures, one every 2 seconds; between them turn your head")
+    print("a little (left, right, up, down), with and without glasses if you wear them.")
+    saved = tries = 0
+    while saved < n and tries < n * 3:
+        tries += 1
+        time.sleep(2)
+        path = os.path.join(faces, f"face_{int(time.time() * 1000)}.jpg")
+        p.stdin.write(f"CAPTURE {path}\n".encode())
+        p.stdin.flush()
+        r = reply(lambda l: l in ("OK", "NO_FACE") or l.startswith("ERR"), 15)
+        if r == "OK":
+            saved += 1
+            print(f"  {saved}/{n} saved")
+        elif r == "NO_FACE":
+            print("  no face seen, again")
+        else:
+            print(f"  {r}")
+    print(f"{saved} faces added ({len(os.listdir(faces))} in total). Lock the screen (Meta+L) and press Enter to try.")
+finally:
+    try:
+        p.stdin.write(b"QUIT\n"); p.stdin.flush()
+        p.wait(2)
+    except Exception:
+        p.kill()
+EOF
 }
 
 snapshot() {
@@ -202,7 +311,8 @@ case "${1:-}" in
   status) status "${2:-}" ;;
   reset) reset "${2:-}" ;;
   camera) camera "${2:-}" "${3:-}" ;;
+  enrol|enroll) enrol "${2:-}" ;;
   snapshot) snapshot "${2:-}" "${3:-}" ;;
   cameras) cameras ;;
-  *) sed -n '2,24p' "$0"; exit 2 ;;
+  *) sed -n '2,27p' "$0"; exit 2 ;;
 esac
