@@ -1,7 +1,9 @@
 #!/bin/bash
 # Face unlock with Biopass (docs/login.md#face-unlock): Biopass's arm64 release for the app, with its auth part
 # (helper, PAM module, libraries, libcamera) built on the laptop with our patches for the IR camera (face/build.sh),
-# and the PAM lines through login-lock.sh. Run as root in the installed SteamOS, from a checkout of this repository:
+# s15-face and s15-face-run (gate and runs), s15-face-wake.service (starts face on the lock screen by itself), and
+# the PAM lines through login-lock.sh. The lockout numbers (root's /etc/s15-face.conf, s15-face lockout) stay
+# across SteamOS updates. Run as root in the installed SteamOS, from a checkout of this repository:
 #   sudo steamos/install-face.sh install [--rebuild]  install or update (idempotent). Face unlock works once the
 #                                                     login password is on (login-lock.sh enable), from the next login
 #   sudo steamos/install-face.sh status
@@ -23,6 +25,9 @@ case $model in *"Vivobook S 15"*|*S5507Q*) ;; *) die "not the Vivobook S15 (mode
 . "$REPO/face/sources.sh"
 STATE=/var/lib/s15-face          # build id (= installed), file list, admin flag, cache; root only
 CACHE=$STATE/cache
+WAKE=/etc/systemd/system/s15-face-wake.service
+WAKE_LINK=/etc/systemd/system/multi-user.target.wants/s15-face-wake.service
+KEEP=/etc/atomic-update.conf.d/s15-face.conf   # s15-os-update carries these /etc files into a new version
 DEPS="webkit2gtk-4.1"            # the app; the rest Biopass needs is in the image (not fprintd: no fingerprints)
 ID=$(face_build_id)
 
@@ -105,8 +110,15 @@ put() {
     REBUILD=1 put "$R"; return
   fi
   install -D -m0755 "$HERE/s15-face" "$R/usr/local/sbin/s15-face"
+  install -D -m0755 "$HERE/s15-face-run" "$R/usr/local/sbin/s15-face-run"
+  install -D -m0644 "$HERE/s15-face-wake.service" "$R$WAKE"
+  install -d "$R${WAKE_LINK%/*}"
+  ln -sfn "$WAKE" "$R$WAKE_LINK"
+  install -d "$R${KEEP%/*}"
+  printf '%s\n' '# snaptop-linux face unlock (steamos/install-face.sh): the lockout numbers (s15-face lockout)' \
+    /etc/s15-face.conf > "$R$KEEP"
   install -d -m0700 "$R$STATE"
-  { cat "$s/files"; echo /usr/local/sbin/s15-face; } > "$R$STATE/files"
+  { cat "$s/files"; echo /usr/local/sbin/s15-face; echo /usr/local/sbin/s15-face-run; } > "$R$STATE/files"
   echo "$ID" > "$R$STATE/build"
   rm -rf "$s"
 }
@@ -146,6 +158,9 @@ install_() {
   echo "  $(wc -l < "$STATE/files") files (list: $STATE/files)"
   echo "== PAM (login-lock.sh)"
   bash "$HERE/login-lock.sh" face-pam
+  systemctl daemon-reload
+  systemctl restart s15-face-wake.service
+  echo "  s15-face-wake: $(systemctl is-active s15-face-wake.service) (starts face unlock on the lock screen)"
   polkit_check
   cat <<EOF
 
@@ -175,8 +190,11 @@ apply_root() {
 uninstall() {
   rm -f "$STATE/build" "$STATE/admin"
   bash "$HERE/login-lock.sh" face-pam
+  systemctl disable --now s15-face-wake.service 2>/dev/null || true
+  rm -f "$WAKE_LINK" "$WAKE" "$KEEP" /etc/s15-face.conf
+  systemctl daemon-reload
   remove_files ""
-  rm -f /usr/local/sbin/s15-face
+  rm -f /usr/local/sbin/s15-face /usr/local/sbin/s15-face-run
   rm -rf "$STATE"
   polkit_check
   echo "Biopass removed; PAM files as before. Kept: webkit2gtk-4.1 (pacman -Rs webkit2gtk-4.1 removes it), and"
@@ -189,6 +207,8 @@ status() {
     local missing=0
     while read -r f; do [ -e "$f" ] || { echo "  missing $f"; missing=1; }; done < "$STATE/files"
     [ $missing = 0 ] && echo "  all $(wc -l < "$STATE/files") files present"
+    echo "  s15-face-wake: $(systemctl is-active s15-face-wake.service 2>/dev/null)"
+    echo "  lockout (s15-face lockout): $(/usr/local/sbin/s15-face lockout | tr '\n' ' ')"
   else
     echo "not installed"
   fi

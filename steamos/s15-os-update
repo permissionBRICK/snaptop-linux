@@ -631,11 +631,11 @@ def verify_version(root, kv):
         need(has("/etc/pam.d/sddm-autologin", "s15-login-gate check"), "login gate (login-lock.sh)")
     if face_on():
         need(all(os.path.exists(root + f) for f in ("/usr/bin/biopass", "/usr/bin/biopass-helper",
-                                                    "/usr/lib/security/libbiopass_pam.so", "/usr/local/sbin/s15-face")),
+                                                    "/usr/local/sbin/s15-face", "/usr/local/sbin/s15-face-run")),
              "face unlock (install-face.sh)")
         if login_lock_on():
-            need(has("/etc/pam.d/sddm", "libbiopass_pam.so") and has("/etc/pam.d/kde-fingerprint", "libbiopass_pam.so"),
-                 "face unlock PAM lines (login-lock.sh)")
+            need(has("/etc/pam.d/sddm", "s15-face pam-scan") and has("/etc/pam.d/kde-fingerprint", "s15-face pam-watch")
+                 and has("/etc/pam.d/kde", "s15-face pam-rescan"), "face unlock PAM lines (login-lock.sh)")
     need(any(TOP in l and "subvolid=5" in l for l in open(f"{root}/etc/fstab")), "/home from the top level (fstab)")
     need(has("/usr/bin/steamos-polkit-helpers/steamos-update", "s15-os-update"), "Steam's update hook")
     need(not os.path.islink(f"{root}/etc/systemd/system/home.mount"), "home.mount not masked")

@@ -1,0 +1,20 @@
+[Unit]
+Description=Face unlock starts by itself on the lock screen (docs/login.md#face-unlock)
+After=systemd-logind.service dbus.service
+
+[Service]
+# s15-face-run wake: one F24 key tap on a virtual keyboard when the lock screen is up with the display on and no
+# face run going, never in kscreenlocker's grace time
+ExecStart=/usr/local/sbin/s15-face-run wake
+Restart=on-failure
+RestartSec=10
+Nice=5
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+DeviceAllow=/dev/uinput rw
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

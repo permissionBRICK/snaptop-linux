@@ -69,9 +69,11 @@ what you are about to do before anything that writes to disk, and report results
   user's password or the disk passphrase; the user types them. Never remove the `s15-login-gate check` line from
   `/etc/pam.d/sddm-autologin` or add automatic logins except through `login-lock.sh disable`.
 - Face unlock (docs/login.md#face-unlock): `sudo /opt/snaptop-linux/steamos/install-face.sh status`. Its PAM lines
-  are managed only by `login-lock.sh face-pam` (never edit them by hand, never drop the `s15-face` gate or the
-  `pam_deny` after Biopass: Biopass's "nothing to try" would unlock). Never turn on `install-face.sh admin on` (sudo,
-  polkit) without the user. A covered camera must never unlock the lock screen: test that after any change.
+  are managed only by `login-lock.sh face-pam` (never edit them by hand, never drop the `s15-face` lines or the
+  `pam_deny` after them: a refused run must fail). Never turn on `install-face.sh admin on` (sudo, polkit) without
+  the user. A covered camera must never unlock the lock screen, nor a face while the display is off (Escape) or
+  the lid closed: test that after any change (`tools/test-s15-face-run.py` for the runner). The lockout numbers are
+  root's (`s15-face lockout`), never in the user's Biopass settings.
 - Audio: `aplay -l` lists the X1E80100 card; Wi-Fi: `nmcli device wifi list`; GPU: `vulkaninfo --summary` (Turnip).
 - Standby: after one suspend, `cat /sys/kernel/debug/qcom_stats/cxsd` shows a rising count (needs debugfs);
   `/var/log/s15-sleep.log` logs every sleep with drain and residency.
