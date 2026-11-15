@@ -146,10 +146,14 @@ install_() {
 
 Done. Next (docs/login.md#face-unlock):
   1. Open "Biopass" from the application menu and let it download its models (Models), then close it.
-  2. sudo s15-face camera ir      IR camera only, works in the dark (rgb: colour camera with an IR presence check)
-  3. s15-face enrol               as yourself: adds your face 5 times (the app's own "add face" cannot pick the IR
-                                  camera); afterwards, save nothing in the app's settings page (step 2 again if so)
-  4. Log out or restart once: the first login after a boot always takes the password or the PIN.
+  2. sudo s15-face camera ir      the IR camera recognises, works in the dark (recommended); or
+                                  both: the colour and the IR camera must both recognise you (needs room light);
+                                  rgb: the colour camera recognises, the IR camera only checks for a face
+  3. s15-face enrol               as yourself: adds your face 5 times (in both: a colour and an IR picture each;
+                                  the app's own "add face" cannot pick the IR camera); afterwards, save nothing in
+                                  the app's settings page (step 2 again if so)
+  4. s15-face check               one scan with each step shown (face size, scores): sit as you usually do
+  5. Log out or restart once: the first login after a boot always takes the password or the PIN.
 EOF
 }
 
