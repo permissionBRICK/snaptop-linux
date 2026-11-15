@@ -1,9 +1,9 @@
-# Pinned inputs of the face unlock build (face/build.sh) and install (steamos/install-face.sh): sha256, file, URL.
-# Biopass's own pins (auth/Dependencies.cmake, auth/BundleLibcamera.cmake of the tag) as checksummed archives.
+# Pinned inputs of the face unlock build (face/build.sh): sha256, file, URL. Biopass's own pins
+# (auth/Dependencies.cmake, auth/BundleLibcamera.cmake of the tag) as checksummed archives. The app's dependencies come
+# from the lockfiles in Biopass's archive: its frontend packages from app/bun.lock (sha512 each, face/bunlock.py), its
+# Rust crates from app/src-tauri/Cargo.lock (sha256 each, cargo --locked); the Rust toolchain and Node.js from the
+# SteamOS image's own repository, into the build overlay only.
 BIOPASS_VERSION=1.5.1
-BIOPASS_DEB=biopass_${BIOPASS_VERSION}_arm64.deb
-BIOPASS_DEB_SHA256=6cf87a7353cfffc55ef6e12e8135277f3989745f1db13b4499075c9cbd24392d
-BIOPASS_DEB_URL=https://github.com/phucvinh57/biopass/releases/download/$BIOPASS_VERSION/$BIOPASS_DEB
 FACE_SOURCES="\
 d34c6eae6f5e063cdfe03a5300f33604e3d7bfcf104bf3ec9be07c45f87d9951 biopass-1.5.1.tar.gz https://github.com/phucvinh57/biopass/archive/refs/tags/1.5.1.tar.gz
 5317505e2da99be65f8e2775ba3c2afd6d2961fd78aba1bd8f56159f48820c78 onnxruntime-linux-aarch64-1.31.1.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-linux-aarch64-1.31.1.tgz
@@ -18,6 +18,7 @@ d8862955c6d74e5846b3f580b1605d2428b11d97a410d86e2fb13e857cd3a744 spdlog-1.17.0.t
 face_build_id() {
   local d
   d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-  echo "$BIOPASS_VERSION-$(cat "$d/sources.sh" "$d/build.sh" "$d/build-in-chroot.sh" "$d"/patches/*.patch |
+  echo "$BIOPASS_VERSION-$(cat "$d/sources.sh" "$d/build.sh" "$d/build-in-chroot.sh" "$d/bunlock.py" \
+    "$d"/node-test/*.mjs "$d"/patches/*.patch |
     sha256sum | cut -c1-12)"
 }

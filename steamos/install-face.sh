@@ -1,7 +1,7 @@
 #!/bin/bash
-# Face unlock with Biopass (docs/login.md#face-unlock): Biopass's arm64 release for the app, with its auth part
-# (helper, PAM module, libraries, libcamera) built on the laptop with our patches for the IR camera (face/build.sh),
-# s15-face and s15-face-run (gate and runs), s15-face.socket (root's count of false faces, for the lock screen's runs
+# Face unlock with Biopass (docs/login.md#face-unlock): Biopass built on the laptop with our patches (face/build.sh):
+# its auth part (helper, libraries, libcamera) for the IR camera and its app, which sets face unlock up (cameras,
+# faces, test scans); s15-face and s15-face-run (gate and runs), s15-face.socket (root's count of false faces, for the lock screen's runs
 # that run as the user), s15-face-wake.service (starts face on the lock screen by itself), and the PAM lines
 # through login-lock.sh. The count (/var/lib/s15-face/lockout) and the lockout numbers (root's /etc/s15-face.conf,
 # s15-face lockout) stay across restarts and SteamOS updates. Run as root in the installed SteamOS, from a checkout of this repository:
@@ -12,7 +12,8 @@
 #   sudo steamos/install-face.sh admin on|off         also for sudo and polkit dialogs (off by default, see the docs)
 #   steamos/install-face.sh apply-root <dir>          (s15-os-update) into a new SteamOS version before its first boot
 # Packages only from the image's own repository (pacman -S --needed, no system upgrade): the app's webkit2gtk-4.1.
-# The build (about 10 minutes) is kept in /var/lib/s15-face/cache and reused while face/ is unchanged.
+# The build (about 30 minutes; Rust and Node.js only in its overlay) is kept in /var/lib/s15-face/cache with its
+# downloads, and reused while face/ is unchanged.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(dirname "$HERE")
@@ -34,35 +35,24 @@ KEEP=/etc/atomic-update.conf.d/s15-face.conf   # s15-os-update carries these /et
 DEPS="webkit2gtk-4.1"            # the app; the rest Biopass needs is in the image (not fprintd: no fingerprints)
 ID=$(face_build_id)
 
-# The patched build for root $1: from the cache, else built against $1 in a chroot (overlay on a tmpfs). The tmpfs
-# lives in a mount namespace of its own (as the build's mounts do): no copy of it stays in other namespaces.
+# The patched build for root $1: from the cache, else built against $1 in a chroot (an overlay with its upper layer in
+# a work directory under /var/tmp, about 8 GB while it runs; build.sh keeps its mounts in a mount namespace of its
+# own, so none stays behind). Downloads are kept in the cache (their checksums are checked on every use).
 build() {
   local R=${1:-/} pkg=$CACHE/s15-face-$ID.tar.zst w
   if [ -f "$pkg" ] && [ "${REBUILD:-0}" != 1 ]; then echo "$pkg"; return; fi
   w=$(mktemp -d /var/tmp/s15-face-build.XXXXXX)
-  install -d -m0700 "$CACHE"
-  echo "building Biopass's auth part with our patches (about 10 minutes)..." >&2
-  # shellcheck disable=SC2016  # expanded by the inner shell
-  if ! unshare --mount --propagation private bash -c 'mount -t tmpfs -o size=6G tmpfs "$1" && bash "$2" "$3" "$1" &&
-       cp "$1/s15-face-$4.tar.zst" "$5.new"' _ "$w" "$REPO/face/build.sh" "$R" "$ID" "$pkg" > "$w.log" 2>&1; then
-    tail -30 "$w.log" >&2; rmdir "$w"; die "face build failed (log: $w.log)"
+  install -d -m0700 "$CACHE" "$CACHE/src"
+  echo "building Biopass and its app with our patches (about 30 minutes)..." >&2
+  if ! S15_FACE_SRC=$CACHE/src bash "$REPO/face/build.sh" "$R" "$w" > "$w.log" 2>&1 ||
+     ! cp "$w/s15-face-$ID.tar.zst" "$pkg.new"; then
+    tail -30 "$w.log" >&2; rm -rf "$w"; die "face build failed (log: $w.log)"
   fi
-  grep -E '^  |==' "$w.log" | grep -E 'tests|needs|passed|ALL' >&2 || true
-  rm -f "$CACHE"/s15-face-*.tar.zst
+  grep -E '^  |==' "$w.log" | grep -E 'tests|needs|pass|ALL' >&2 || true
+  rm -f "$CACHE"/s15-face-*.tar.zst "$CACHE"/biopass_*.deb
   mv "$pkg.new" "$pkg"
-  rmdir "$w"; rm -f "$w.log"
+  rm -rf "$w"; rm -f "$w.log"
   echo "$pkg"
-}
-
-deb() {
-  local d=$CACHE/$BIOPASS_DEB
-  install -d -m0700 "$CACHE"
-  if ! { [ -f "$d" ] && echo "$BIOPASS_DEB_SHA256  $d" | sha256sum -c --quiet 2>/dev/null; }; then
-    curl -fsSL --retry 3 -o "$d.part" "$BIOPASS_DEB_URL"
-    echo "$BIOPASS_DEB_SHA256  $d.part" | sha256sum -c --quiet || die "$BIOPASS_DEB: checksum mismatch"
-    mv -f "$d.part" "$d"
-  fi
-  echo "$d"
 }
 
 remove_files() {  # $1: root
@@ -75,32 +65,28 @@ remove_files() {  # $1: root
   rm -f "$R$STATE/files"
 }
 
-# Biopass into root $1: the app and its assets from the release, everything the app runs (biopass-helper and below)
-# from our build. Only usr/ is unpacked (the release's lib/security goes to usr/lib/security: /lib is a link).
+# Biopass into root $1, all from our build (the app with its menu entry, icons and polkit policy, the auth part).
 put() {
-  local R=$1 d pkg s
-  d=$(deb); pkg=$(build "${R:-/}")
+  local R=$1 pkg s pol
+  pkg=$(build "${R:-/}")
   s=$(mktemp -d /var/tmp/s15-face-stage.XXXXXX)
-  mkdir -p "$s/deb" "$s/root"
-  (cd "$s/deb" && bsdtar -xf "$d" && tar -xf data.tar.*)
-  for f in usr/bin/biopass usr/share/applications/biopass.desktop \
-           usr/share/polkit-1/actions/com.ticklab.biopass.policy; do
-    install -D -m"$(stat -c %a "$s/deb/$f")" "$s/deb/$f" "$s/root/$f"
-  done
-  (cd "$s/deb" && find usr/share/icons -name biopass.png -exec install -D -m0644 {} "$s/root/{}" \;)
+  mkdir -p "$s/root"
+  zstd -dc "$pkg" | tar -xf - -C "$s/root"
   # WebKitGTK's DMA-BUF renderer ends the app at once on this GPU under Wayland ("Error 71 (Protocol error)").
-  sed -i 's#^Exec=biopass$#Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass#' "$s/root/usr/share/applications/biopass.desktop"
   grep -q '^Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass$' "$s/root/usr/share/applications/biopass.desktop" ||
     die "biopass.desktop: unexpected Exec line"
-  zstd -dc "$pkg" | tar -xf - -C "$s/root"
   remove_files "$R"
   (cd "$s/root" && find . \( -type f -o -type l \) | sed 's#^\.##') > "$s/files"
   # polkit re-reads all its actions as soon as a .policy file appears; reading one that tar was still writing left it
-  # with none (every time). The policy file therefore comes last and complete, renamed into place.
-  local pol=usr/share/polkit-1/actions/com.ticklab.biopass.policy
-  tar -C "$s/root" --owner=0 --group=0 --exclude="$pol" -cf - usr | tar -C "$R/" -xpf - --no-overwrite-dir
-  install -m0644 "$s/root/$pol" "$R/${pol%/*}/.${pol##*/}.new"
-  mv -f "$R/${pol%/*}/.${pol##*/}.new" "$R/$pol"
+  # with none (every time). The policy files therefore come last and complete, each renamed into place.
+  tar -C "$s/root" --owner=0 --group=0 --exclude='usr/share/polkit-1/actions/*.policy' -cf - usr |
+    tar -C "$R/" -xpf - --no-overwrite-dir
+  install -d "$R/usr/share/polkit-1/actions"
+  for pol in "$s/root"/usr/share/polkit-1/actions/*.policy; do
+    pol=usr/share/polkit-1/actions/${pol##*/}
+    install -m0644 "$s/root/$pol" "$R/${pol%/*}/.${pol##*/}.new"
+    mv -f "$R/${pol%/*}/.${pol##*/}.new" "$R/$pol"
+  done
   # A build from the cache links the libraries of the version it was built for; one this version lacks: build again.
   local missing
   missing=$(chroot "${R:-/}" /bin/sh -c 'for f in /usr/bin/biopass /usr/bin/biopass-helper /usr/lib/security/libbiopass_pam.so \
@@ -158,7 +144,7 @@ polkit_check() {
 install_() {
   echo "== packages from the image's repository: $DEPS"
   pacman_deps ""
-  echo "== Biopass $BIOPASS_VERSION (app from the release, auth part built here: $ID)"
+  echo "== Biopass $BIOPASS_VERSION with our patches, built here ($ID)"
   put ""
   echo "  $(wc -l < "$STATE/files") files (list: $STATE/files)"
   echo "== PAM (login-lock.sh)"
@@ -170,16 +156,13 @@ install_() {
   polkit_check
   cat <<EOF
 
-Done. Next (docs/login.md#face-unlock):
-  1. Open "Biopass" from the application menu and let it download its models (Models), then close it.
-  2. sudo s15-face camera ir      the IR camera recognises, works in the dark (recommended); or
-                                  both: the colour and the IR camera must both recognise you (needs room light);
-                                  rgb: the colour camera recognises, the IR camera only checks for a face
-  3. s15-face enrol               as yourself: adds your face 5 times (in both: a colour and an IR picture each;
-                                  the app's own "add face" cannot pick the IR camera); afterwards, save nothing in
-                                  the app's settings page (step 2 again if so)
-  4. s15-face check               one scan with each step shown (face size, scores): sit as you usually do
+Done. Next, in the Biopass app (application menu; docs/login.md#face-unlock):
+  1. It downloads its models when it first starts (AI Models).
+  2. Configuration > Face Recognition > Cameras: IR camera (recommended), or both cameras; Save.
+  3. Enrolled faces: Start camera, Add 5 (sit as you usually do; with and without glasses).
+  4. Test: one scan with each step and each face's score; replace faces that score low.
   5. Lock the screen (Meta+L): face unlock starts by itself; at the login screen press Enter on the empty field.
+The same from a terminal: sudo s15-face camera ir; s15-face enrol; s15-face check (s15-face for the rest).
 EOF
 }
 
