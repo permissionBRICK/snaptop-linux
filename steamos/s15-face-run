@@ -1,0 +1,786 @@
+#!/usr/bin/python3 -I
+"""Face unlock runs (docs/login.md#face-unlock): when Biopass may look, what counts, and when a match unlocks.
+
+s15-face (the PAM entry points) runs this; Biopass's helper does the looking (biopass-helper auth --keep-looking,
+face/patches/0007): it keeps looking while it sees no face, and the first face it compares decides (exit 0 match,
+1 a face that did not match or that anti-spoofing flagged, 3 no face within the time, 2 nothing to try).
+
+Rules for every run:
+- Only while a display is on (a connected, enabled DRM connector with DPMS on) and the lid is open (logind). A
+  helper that is looking when that changes, or when the laptop wakes from sleep, is stopped within 0.2 s; a match
+  counts only if the display is still on and the lid open 0.4 s after it (Escape on the lock screen turns the
+  display off a moment after the key: a match from just before must not unlock a laptop the user is leaving).
+- A run ends after run_false_faces (3) false faces: faces seen that did not match, or that anti-spoofing flagged,
+  about a second apart. No face does not count.
+- Lockout, as the PIN's (counted since the last success: face, password, PIN, login): after free_false_faces (6)
+  false faces face waits first_wait (60 s), after each further one twice as long, up to max_wait (3600 s); after
+  off_after (15) it is off until a password or PIN login or unlock. The numbers: /etc/s15-face.conf (root's; the
+  user's Biopass settings are writable by any program running as the user), s15-face lockout. The count: the
+  user's /run/s15-face/<user> (gone at the next boot; s15-face reset clears it). Also refused: no password or PIN
+  login since boot, no IR camera or minimum face size in the settings, an account locked by wrong passwords
+  (pam_faillock).
+
+  s15-face-run watch       (pam_exec, kde-fingerprint, as the user) the lock screen: a run starts when the display
+                           is on, keeps looking (up to 60 s without a face), and the conversation stays open
+                           with the camera off while the display is off, lid closed or asleep; when it is on again
+                           a new run starts by itself. After a run that ended (3 false faces, 60 s without a face)
+                           Enter on the empty password field starts the next (rescan). Ends with a match (unlock)
+                           or when face is refused (lockout)
+  s15-face-run scan        (pam_exec, SDDM after an empty field; sudo/polkit when turned on) one run that looks
+                           for up to 6 s
+  s15-face-run gate        (pam_exec) exit 0 if face may be tried now; logs why not
+  s15-face-run rescan      (pam_exec in kde, the field is known empty) ask the lock screen's watch for a new run
+  s15-face-run wake        (s15-face-wake.service, root) starts face unlock on the lock screen by itself
+  s15-face-run state [user]  display, lid and the user's face state (for s15-face status)
+  s15-face-run lockout [keys | set KEY VALUE | reset-defaults]   the lockout numbers (s15-face lockout)
+"""
+import ctypes
+import fcntl
+import os
+import pwd
+import signal
+import struct
+import subprocess
+import sys
+import syslog
+import time
+
+STATE_DIR = "/run/s15-face"
+HELPER = "/usr/bin/biopass-helper"
+CONF = ".config/com.ticklab.biopass/config.yaml"
+DRM = "/sys/class/drm"
+FAILLOCK_CONF = "/etc/security/faillock.conf"
+LOCKOUT_CONF = "/etc/s15-face.conf"
+# The lockout's numbers: key -> (default, min, max, unit, meaning). A stable interface (s15-face lockout; the Biopass
+# app's settings call it through pkexec): keep the keys and their meaning.
+LOCKOUT_KEYS = {
+    "run_false_faces": (3, 1, 10, "faces", "false faces after which a run ends (the next on Enter or when the "
+                                           "display comes on again)"),
+    "free_false_faces": (6, 0, 100, "faces", "false faces since the last success before the first wait"),
+    "first_wait": (60, 0, 86400, "seconds", "the first wait, doubled with every further false face; 0: no waits"),
+    "max_wait": (3600, 0, 86400, "seconds", "the longest wait"),
+    "off_after": (15, 1, 100, "faces", "false faces since the last success after which face is off until a "
+                                       "password or PIN login or unlock"),
+}
+WATCH_LOOK_MS = 20000   # one helper on the lock screen; then a new one (the camera stays on in between)
+WATCH_NO_FACE_S = 60    # a lock screen run without any face ends (the camera goes off) after this
+SCAN_LOOK_MS = 6000     # login screen, sudo, polkit: their field waits for the run
+FALSE_PAUSE_S = 0.3     # after a false face; the helper's restart adds about 0.7 s
+CONFIRM_S = 0.4         # a match counts if the display is still on and the lid open after this
+SETTLE_S = 0.5          # the display must be on this long before a run starts
+POLL_S = 0.2            # while the helper looks
+IDLE_S = 0.5            # while waiting
+HELPER_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
+
+# Exit codes of biopass-helper auth (face/patches/0007)
+MATCH, FALSE_FACE, NOTHING, NO_FACE = 0, 1, 2, 3
+
+
+def log(msg):
+    syslog.openlog("s15-face", 0, syslog.LOG_AUTH)
+    syslog.syslog(syslog.LOG_NOTICE, msg)
+
+
+def valid_user(u):
+    import re
+    return bool(u) and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", u) is not None
+
+
+def set_pdeathsig(sig):
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(1, int(sig), 0, 0, 0)   # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        pass
+
+
+# --- the display and the lid ------------------------------------------------------------------------------------
+
+def display_on(drm=DRM):
+    """A connected, enabled connector with DPMS on (disconnected ones report "On" too)."""
+    try:
+        names = os.listdir(drm)
+    except OSError:
+        return False
+    for name in names:
+        if "-" not in name:
+            continue
+        try:
+            vals = [open(f"{drm}/{name}/{a}").read().strip() for a in ("status", "enabled", "dpms")]
+        except OSError:
+            continue
+        if vals == ["connected", "enabled", "On"]:
+            return True
+    return False
+
+
+_bus = None
+
+
+def lid_closed():
+    """logind's LidClosed; closed when it cannot be read (fail closed)."""
+    global _bus
+    try:
+        import dbus
+        if _bus is None:
+            _bus = dbus.SystemBus()
+        obj = _bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1")
+        return bool(obj.Get("org.freedesktop.login1.Manager", "LidClosed",
+                            dbus_interface="org.freedesktop.DBus.Properties", timeout=2))
+    except Exception:   # no dbus module or no answer
+        _bus = None
+    try:
+        out = subprocess.run(["busctl", "get-property", "org.freedesktop.login1", "/org/freedesktop/login1",
+                              "org.freedesktop.login1.Manager", "LidClosed"], capture_output=True, text=True,
+                             timeout=3, env=HELPER_ENV).stdout.strip()
+        return out != "b false"
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+class Sleep:
+    """Notices a suspend or hibernation in between: CLOCK_BOOTTIME runs on through it, CLOCK_MONOTONIC does not."""
+    def __init__(self):
+        self.mark()
+
+    def mark(self):
+        self.boot, self.mono = time.clock_gettime(time.CLOCK_BOOTTIME), time.monotonic()
+
+    def slept(self):
+        boot, mono = time.clock_gettime(time.CLOCK_BOOTTIME), time.monotonic()
+        gap = (boot - self.boot) - (mono - self.mono)
+        self.boot, self.mono = boot, mono
+        return gap > 2
+
+
+# --- the user's state, settings and password lockout -------------------------------------------------------------
+
+class State:
+    """/run/s15-face/<user>: key=value lines. fails = false faces since the last success, until = end of the wait
+    (CLOCK_BOOTTIME seconds), watch = the lock screen's watch, rescan = Enter presses on the lock screen's empty
+    field. The file is the user's (s15-face pam-account
+    creates it at a login); the directory is root's, so a user can change it but not create, replace or link it."""
+    def __init__(self, user, state_dir=STATE_DIR):
+        self.user, self.path = user, f"{state_dir}/{user}"
+
+    def _open(self):
+        fd = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW)
+        st = os.fstat(fd)
+        import stat as st_
+        if not st_.S_ISREG(st.st_mode) or st.st_uid != pwd.getpwnam(self.user).pw_uid:
+            os.close(fd)
+            raise OSError("not the user's state file")
+        return fd
+
+    @staticmethod
+    def _parse(text):
+        d = {}
+        for line in text.splitlines():
+            k, _, v = line.partition("=")
+            if k and v.isdigit():
+                d[k] = int(v)
+        return d
+
+    def exists(self):
+        try:
+            os.close(self._open())
+            return True
+        except (OSError, KeyError):
+            return False
+
+    def read(self):
+        try:
+            fd = self._open()
+        except (OSError, KeyError):
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            return self._parse(os.read(fd, 4096).decode(errors="replace"))
+        finally:
+            os.close(fd)
+
+    def update(self, change):
+        """change(dict) edits the values in place; returns the new values (None without a state file)."""
+        try:
+            fd = self._open()
+        except (OSError, KeyError):
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            d = self._parse(os.read(fd, 4096).decode(errors="replace"))
+            change(d)
+            data = "".join(f"{k}={v}\n" for k, v in d.items()).encode()
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, data)
+            return d
+        finally:
+            os.close(fd)
+
+    def add_false_face(self, conf):
+        """Counts one, starts the wait the count asks for; the new values (None without a state file)."""
+        def change(d):
+            d["fails"] = n = d.get("fails", 0) + 1
+            if n < conf["off_after"] and conf["first_wait"] and n >= conf["free_false_faces"]:
+                wait = min(conf["max_wait"], conf["first_wait"] * 2 ** min(n - conf["free_false_faces"], 30))
+                d["until"] = int(boottime() + wait)
+        return self.update(change)
+
+
+def boottime():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def lockout_conf(path=LOCKOUT_CONF):
+    """The lockout numbers: the defaults, with the valid values of a root-owned file not writable by others."""
+    import stat as st_
+    conf = {k: v[0] for k, v in LOCKOUT_KEYS.items()}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return conf
+    with os.fdopen(fd) as f:
+        st = os.fstat(f.fileno())
+        if not st_.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            log(f"{path}: not root's or writable by others, the defaults apply")
+            return conf
+        for line in f.read(65536).splitlines():
+            k, _, v = line.split("#", 1)[0].partition("=")
+            k, v = k.strip(), v.strip()
+            if k in LOCKOUT_KEYS and v.isdigit() and LOCKOUT_KEYS[k][1] <= int(v) <= LOCKOUT_KEYS[k][2]:
+                conf[k] = int(v)
+    return conf
+
+
+def configured(user):
+    """The user's Biopass settings name an IR camera, a minimum face size, and use no camera profiles (they would
+    override them; saving the app's settings page writes profiles and drops the keys the app does not know). Read
+    without following links and only if the user owns the file, also when run as root (login screen)."""
+    import yaml
+    try:
+        pw = pwd.getpwnam(user)
+        fd = os.open(os.path.join(pw.pw_dir, CONF), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
+            st = os.fstat(f.fileno())
+            if st.st_uid != pw.pw_uid or st.st_size > 1 << 20:
+                return False
+            face = ((yaml.safe_load(f.read()) or {}).get("methods") or {}).get("face") or {}
+    except (OSError, KeyError, yaml.YAMLError, AttributeError):
+        return False
+    ir = (face.get("anti_spoofing") or {}).get("ir_camera")
+    size = (face.get("detection") or {}).get("min_face_height")
+    sized = isinstance(size, (int, float)) and not isinstance(size, bool) and 0 < size <= 1
+    return isinstance(ir, str) and bool(ir.strip()) and sized and not face.get("camera_profiles")
+
+
+def faillocked(user, conf=FAILLOCK_CONF, now=None):
+    """pam_faillock's verdict from its tally file: deny failures within fail_interval, until unlock_time after the
+    last one (the settings as pam_faillock reads them: the last value in faillock.conf wins)."""
+    opts = {"deny": 3, "fail_interval": 900, "unlock_time": 600, "dir": "/var/run/faillock"}
+    try:
+        for line in open(conf):
+            k, _, v = line.split("#", 1)[0].partition("=")
+            k, v = k.strip(), v.strip()
+            if k in opts and v:
+                opts[k] = v if k == "dir" else int(v)
+    except (OSError, ValueError):
+        pass
+    if not opts["deny"]:
+        return False
+    try:
+        data = open(f"{opts['dir']}/{user}", "rb").read()
+    except OSError:
+        return False
+    now = time.time() if now is None else now
+    times = [t for _, _, status, t in struct.iter_unpack("<52sHHQ", data[:len(data) // 64 * 64]) if status & 1]
+    fails = sum(1 for t in times if now - t < opts["fail_interval"])
+    if fails < opts["deny"]:
+        return False
+    return not (opts["unlock_time"] and max(times) + opts["unlock_time"] < now)
+
+
+def off_reason(d, conf):
+    """Why face is off until a password or PIN (d: the state, None without one), or None."""
+    if d is None:
+        return "no login with the password or PIN since boot"
+    if d.get("fails", 0) >= conf["off_after"]:
+        return f"{d['fails']} false faces since the last success; the password or PIN turns it on again"
+    return None
+
+
+def refusal(user, state, conf):
+    """(off, why) if face may not be tried now: off = only a password or PIN turns it on again; else None."""
+    d = state.read()
+    why = off_reason(d, conf)
+    if why:
+        return True, why
+    left = d.get("until", 0) - boottime()
+    if left > 0:
+        return False, f"wait {int(left) + 1} s after {d.get('fails', 0)} false faces"
+    if not configured(user):
+        return False, "no IR camera or minimum face size in the Biopass settings (s15-face camera ir|rgb|both)"
+    if faillocked(user):
+        return False, "account locked by wrong passwords (pam_faillock)"
+    return None
+
+
+# --- one run ------------------------------------------------------------------------------------------------------
+
+class Runner:
+    def __init__(self, user, service, state, conf, parent=None, helper=HELPER, display=display_on, lid=lid_closed):
+        self.user, self.service, self.state, self.conf, self.parent = user, service, state, conf, parent
+        self.helper, self.display, self.lid = helper, display, lid
+        self.sleep = Sleep()
+        self.proc = None
+        self.last_lid = (0.0, False)
+
+    def lid_closed(self, fresh=False):
+        # one D-Bus call a second while looking: closing the lid also suspends or turns the display off
+        if fresh or time.monotonic() - self.last_lid[0] >= 1:
+            self.last_lid = (time.monotonic(), self.lid())
+        return self.last_lid[1]
+
+    def parent_gone(self):
+        return self.parent is not None and os.getppid() != self.parent
+
+    def stop_reason(self, fresh=False):
+        """Why no helper may look now, or None."""
+        if self.parent_gone():
+            return "the lock screen ended"
+        if self.sleep.slept():
+            return "woke from sleep"
+        if not self.display():
+            return "display off"
+        if self.lid_closed(fresh):
+            return "lid closed"
+        return None
+
+    def kill(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        self.proc = None
+
+    def run_helper(self, look_ms):
+        """(exit code, None) or (None, why it was stopped)."""
+        self.proc = subprocess.Popen(
+            [self.helper, "auth", "--username", self.user, "--service", self.service, "--keep-looking", str(look_ms)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=HELPER_ENV, cwd="/",
+            preexec_fn=lambda: set_pdeathsig(signal.SIGKILL))
+        deadline = time.monotonic() + look_ms / 1000 + 25
+        try:
+            while True:
+                try:
+                    return self.proc.wait(timeout=POLL_S), None
+                except subprocess.TimeoutExpired:
+                    pass
+                why = self.stop_reason()
+                if why is None and time.monotonic() > deadline:
+                    why = "the helper did not end"
+                if why:
+                    return None, why
+        finally:
+            self.kill()
+
+    def wait(self, seconds, fresh=False):
+        """Waits; why a helper may no longer look, or None. fresh: the lid read anew at the end."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            time.sleep(min(POLL_S, max(0.0, end - time.monotonic())))
+            why = self.stop_reason()
+            if why:
+                return why
+        return self.stop_reason(fresh=True) if fresh else None
+
+    def run(self, look_ms, no_face_s):
+        """One run: ("match"|"ended"|"stopped", why) or ("refused", (off, why))."""
+        false_faces, looked = 0, 0.0
+        while True:
+            why = refusal(self.user, self.state, self.conf)
+            if why:
+                return "refused", why
+            why = self.stop_reason()
+            if why:
+                return "stopped", why
+            t0 = time.monotonic()
+            rc, why = self.run_helper(look_ms)
+            if why:
+                return "stopped", why
+            if rc == MATCH:
+                why = self.wait(CONFIRM_S, fresh=True)
+                if why:
+                    log(f"{self.user}: match not used: {why} ({self.service})")
+                    return "stopped", why
+                return "match", ""
+            if rc == FALSE_FACE:
+                d = self.state.add_false_face(self.conf) or {}
+                false_faces += 1
+                wait = d.get("until", 0) - boottime()
+                log(f"{self.user}: false face {false_faces} of this run, {d.get('fails', '?')} since the last "
+                    f"success{f', face waits {int(wait) + 1} s' if wait > 0 else ''} ({self.service})")
+                if false_faces >= self.conf["run_false_faces"]:
+                    return "ended", f"{false_faces} false faces"
+                why = self.wait(FALSE_PAUSE_S)
+                if why:
+                    return "stopped", why
+                continue
+            if rc == NO_FACE:
+                looked += time.monotonic() - t0
+                if looked >= no_face_s:
+                    return "ended", f"no face for {round(looked)} s"
+                continue
+            return "ended", "nothing to try (no faces enrolled, no camera or models)" if rc == NOTHING \
+                else f"the helper failed ({rc})"
+
+
+def pam_user():
+    u = os.environ.get("PAM_USER", "")
+    if os.environ.get("PAM_TYPE") != "auth" or not valid_user(u):
+        sys.exit(1)
+    try:
+        uid = pwd.getpwnam(u).pw_uid
+    except KeyError:
+        sys.exit(1)
+    if os.getuid() not in (0, uid):
+        sys.exit(1)
+    return u
+
+
+def cmd_gate():
+    u = pam_user()
+    why = refusal(u, State(u), lockout_conf())
+    if why:
+        log(f"{u}: face refused: {why[1]} ({os.environ.get('PAM_SERVICE', '?')})")
+        sys.exit(1)
+    sys.exit(0)
+
+
+def cmd_scan():
+    u = pam_user()
+    service = os.environ.get("PAM_SERVICE", "")
+    set_pdeathsig(signal.SIGTERM)
+    r = Runner(u, service, State(u), lockout_conf())
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    try:
+        why = r.stop_reason(fresh=True)
+        if why:
+            log(f"{u}: face not tried: {why} ({service})")
+            sys.exit(1)
+        result, detail = r.run(SCAN_LOOK_MS, SCAN_LOOK_MS / 1000)
+    finally:
+        r.kill()
+    if result == "match":
+        sys.exit(0)
+    if result == "refused":
+        log(f"{u}: face refused: {detail[1]} ({service})")
+    sys.exit(1)
+
+
+def cmd_watch():
+    u = pam_user()
+    service = os.environ.get("PAM_SERVICE", "")
+    parent = os.getppid()
+    set_pdeathsig(signal.SIGTERM)
+    if parent == 1 or os.getppid() != parent:
+        sys.exit(1)
+    state = State(u)
+    r = Runner(u, service, state, lockout_conf(), parent=parent)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(1))
+    me = os.getpid()
+    if state.update(lambda d: d.__setitem__("watch", me)) is None:
+        log(f"{u}: face refused: no login with the password or PIN since boot ({service})")
+        sys.exit(1)
+    try:
+        sys.exit(watch_loop(r, state))
+    finally:
+        r.kill()
+        state.update(lambda d: d.pop("watch", None) if d.get("watch") == me else None)
+
+
+def watch_loop(r, state):
+    """0: a match (unlock); 1: face off until a password or PIN, or the lock screen ended. Ending makes kscreenlocker
+    hide its face hint; it starts the watch again only after a failed password (then it is checked again). Refused
+    for a while (a wait, pam_faillock, the settings): the watch stays and tries at the next start of a run."""
+    u, service = r.user, r.service
+    waiting = False   # a run ended: the next one starts when the display comes back on, or on Enter (rescan)
+    seen = (state.read() or {}).get("rescan", 0)
+    while True:
+        if r.parent_gone():
+            return 1
+        d = state.read()
+        why = off_reason(d, r.conf)
+        if why:
+            log(f"{u}: face refused: {why} ({service})")
+            return 1
+        if r.stop_reason():
+            waiting = False   # off and on again: a new run, as when the lock screen appears
+            time.sleep(IDLE_S)
+            continue
+        rescan = d.get("rescan", 0)
+        if waiting:
+            if rescan == seen:
+                time.sleep(IDLE_S)
+                continue
+            log(f"{u}: Enter on the empty field: a new run ({service})")
+        seen, waiting = rescan, False
+        if r.wait(SETTLE_S):
+            continue
+        result, detail = r.run(WATCH_LOOK_MS, WATCH_NO_FACE_S)
+        if result == "match":
+            log(f"{u}: face recognised ({service})")
+            return 0
+        if result == "refused":
+            log(f"{u}: face refused: {detail[1]} ({service})")
+            if detail[0]:
+                return 1
+            seen, waiting = (state.read() or {}).get("rescan", 0), True
+        if result == "ended":
+            log(f"{u}: run ended: {detail}; the next when the display is on again or on Enter ({service})")
+            seen, waiting = (state.read() or {}).get("rescan", 0), True
+        # stopped (display off, lid closed, woke from sleep): a new run once the display is on again
+
+
+def cmd_rescan():
+    """The field is empty (s15-face checked it): one more Enter for the lock screen's watch."""
+    u = pam_user()
+    State(u).update(lambda d: d.__setitem__("rescan", d.get("rescan", 0) + 1))
+    sys.exit(0)
+
+
+# --- the lock screen starts face unlock by itself (root) ---------------------------------------------------------
+# kscreenlocker starts its authenticators (and with them kde-fingerprint, our watch) only when its UI is shown or
+# hidden (a key, a mouse move or click, Escape, the fade-out) or 3 s after a failed password; never on its own when
+# it appears or after a wake. This taps F24 (no key has it) on a virtual keyboard once, as a first key press would.
+# Never while kscreenlocker's grace time may run: input then unlocks without a password (an idle lock: the greeter
+# runs without --immediateLock, with --graceTime <ms>; the first <ms> after it locked), never if the lock needs no
+# password (--nolock), only with the display on, the lid open, face allowed for the user and no watch running.
+
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_DEV_SETUP, UI_DEV_CREATE, UI_DEV_DESTROY = 0x40045564, 0x40045565, 0x405C5503, \
+    0x5501, 0x5502
+EV_SYN, EV_KEY, KEY_F24 = 0, 1, 194
+
+
+def tap_f24():
+    fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+        fcntl.ioctl(fd, UI_SET_KEYBIT, KEY_F24)
+        fcntl.ioctl(fd, UI_DEV_SETUP, struct.pack("HHHH80sI", 0x06, 0x1209, 0x5153, 1, b"s15-face wake", 0))
+        fcntl.ioctl(fd, UI_DEV_CREATE)
+        time.sleep(0.8)   # the compositor adds the new keyboard
+        for value in (1, 0):
+            os.write(fd, struct.pack("llHHi", 0, 0, EV_KEY, KEY_F24, value))
+            os.write(fd, struct.pack("llHHi", 0, 0, EV_SYN, 0, 0))
+            time.sleep(0.05)
+        time.sleep(0.3)
+        fcntl.ioctl(fd, UI_DEV_DESTROY)
+    finally:
+        os.close(fd)
+
+
+def greeter_args(uid):
+    """The command line of the user's kscreenlocker greeter, or None."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            if open(f"/proc/{pid}/comm").read().strip() != "kscreenlocker_g":
+                continue
+            return open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+    return None
+
+
+def grace_s(args):
+    """Seconds after the lock during which input unlocks without a password; None: never inject (no password)."""
+    if "--nolock" in args:
+        return None
+    if "--immediateLock" in args:
+        return 0.0
+    if "--graceTime" in args:
+        try:
+            return int(args[args.index("--graceTime") + 1]) / 1000
+        except (IndexError, ValueError):
+            return None
+    return 0.0
+
+
+def watch_alive(state):
+    pid = (state.read() or {}).get("watch")
+    if not pid:
+        return False
+    try:
+        return b"s15-face-run\0watch" in open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        return False
+
+
+def locked_sessions():
+    import dbus
+    bus = dbus.SystemBus()
+    mgr = dbus.Interface(bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1"),
+                         "org.freedesktop.login1.Manager")
+    out = []
+    for sid, uid, user, _seat, path in mgr.ListSessions():
+        p = dbus.Interface(bus.get_object("org.freedesktop.login1", path), "org.freedesktop.DBus.Properties")
+        s = p.GetAll("org.freedesktop.login1.Session")
+        if s["Class"] == "user" and s["Type"] in ("wayland", "x11") and s["Active"] and not s["Remote"] \
+                and s["LockedHint"]:
+            out.append((str(sid), int(uid), str(user)))
+    return out
+
+
+def cmd_wake(dry_run=False):
+    episodes = {}   # session -> since (first seen locked, monotonic), taps in this display-on episode, last tap
+    while True:
+        try:
+            locked = locked_sessions()
+        except Exception as e:   # logind restarting
+            log(f"wake: logind: {e}")
+            time.sleep(5)
+            continue
+        ids = {s[0] for s in locked}
+        for sid in list(episodes):
+            if sid not in ids:
+                del episodes[sid]
+        if not locked:
+            time.sleep(2)
+            continue
+        screen = display_on() and not lid_closed()
+        now = time.monotonic()
+        for sid, uid, user in locked:
+            ep = episodes.setdefault(sid, {"since": now, "taps": 0, "last": 0.0})
+            if not screen:
+                ep["taps"] = 0
+                continue
+            if ep["taps"] >= 2 or now - ep["last"] < 5 or not valid_user(user):
+                continue
+            state = State(user)
+            args = greeter_args(uid)
+            if args is None or watch_alive(state):
+                continue
+            grace = grace_s(args)
+            if grace is None or now - ep["since"] < (grace + 3 if grace else 1):
+                continue
+            if refusal(user, state, lockout_conf()):
+                continue
+            ep["taps"] += 1
+            ep["last"] = now
+            log(f"wake: {user}: lock screen on, no face unlock running: F24 to start it{' (dry run)' if dry_run else ''}")
+            if not dry_run:
+                try:
+                    tap_f24()
+                except OSError as e:
+                    log(f"wake: /dev/uinput: {e}")
+        time.sleep(IDLE_S)
+
+
+def cmd_state(user):
+    print(f"display: {'on' if display_on() else 'off'}, lid: {'closed' if lid_closed() else 'open'}")
+    if user:
+        st = State(user)
+        d = st.read()
+        if d is None:
+            print(f"{user}: no login with the password or PIN since boot (the first login after a boot takes the "
+                  "password or PIN)")
+            return
+        conf = lockout_conf()
+        print(f"{user}: {d.get('fails', 0)} false faces since the last success (off after {conf['off_after']}); "
+              f"lock screen face unlock {'running' if watch_alive(st) else 'not running'}")
+        why = refusal(user, st, conf)
+        print(f"  face now: {'refused: ' + why[1] if why else 'allowed'}")
+
+
+def write_lockout(conf, path=LOCKOUT_CONF):
+    """The values that differ from the defaults (a default changed later applies then), root's, renamed into place."""
+    lines = ["# Face unlock lockout (docs/login.md#face-unlock). Set with: sudo s15-face lockout set KEY VALUE",
+             "# Missing, invalid or out-of-range values: the defaults (s15-face lockout keys)."]
+    lines += [f"{k}={conf[k]}" for k in LOCKOUT_KEYS if conf[k] != LOCKOUT_KEYS[k][0]]
+    tmp = f"{path}.new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    try:
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o644)
+        os.write(fd, ("\n".join(lines) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def cmd_lockout(args, path=LOCKOUT_CONF):
+    """s15-face lockout: key=value lines (in effect); keys: KEY DEFAULT MIN MAX UNIT MEANING lines; set KEY VALUE
+    and reset-defaults (root): the new values as key=value lines. Exit 0; 2 for a bad key, value or usage; 1 not
+    root or not written."""
+    def show(conf):
+        for k in LOCKOUT_KEYS:
+            print(f"{k}={conf[k]}")
+    if not args:
+        show(lockout_conf(path))
+        return 0
+    if args == ["keys"]:
+        for k, (default, lo, hi, unit, what) in LOCKOUT_KEYS.items():
+            print(f"{k} {default} {lo} {hi} {unit} {what}")
+        return 0
+    if args[0] not in ("set", "reset-defaults") or (args[0] == "set" and len(args) != 3) or \
+            (args[0] == "reset-defaults" and len(args) != 1):
+        print("usage: s15-face lockout [keys | set KEY VALUE | reset-defaults]", file=sys.stderr)
+        return 2
+    conf = lockout_conf(path)
+    if args[0] == "set":
+        k, v = args[1], args[2]
+        if k not in LOCKOUT_KEYS:
+            print(f"s15-face lockout: unknown key {k} (s15-face lockout keys)", file=sys.stderr)
+            return 2
+        lo, hi = LOCKOUT_KEYS[k][1:3]
+        if not (v.isdigit() and lo <= int(v) <= hi):
+            print(f"s15-face lockout: {k} must be a whole number from {lo} to {hi}", file=sys.stderr)
+            return 2
+        conf[k] = int(v)
+    else:
+        conf = {k: d[0] for k, d in LOCKOUT_KEYS.items()}
+    if os.geteuid() != 0:
+        print("s15-face lockout: run as root (sudo, or pkexec)", file=sys.stderr)
+        return 1
+    try:
+        if args[0] == "reset-defaults":
+            if os.path.lexists(path):
+                os.unlink(path)
+        else:
+            write_lockout(conf, path)
+    except OSError as e:
+        print(f"s15-face lockout: {path}: {e}", file=sys.stderr)
+        return 1
+    log(f"lockout: {' '.join(args)} (by uid {os.getuid()})")
+    show(lockout_conf(path))
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "watch":
+        cmd_watch()
+    elif cmd == "scan":
+        cmd_scan()
+    elif cmd == "gate":
+        cmd_gate()
+    elif cmd == "rescan":
+        cmd_rescan()
+    elif cmd == "wake":
+        if os.getuid() != 0:
+            sys.exit("s15-face-run wake: run as root")
+        cmd_wake(dry_run="--dry-run" in sys.argv)
+    elif cmd == "lockout":
+        sys.exit(cmd_lockout(sys.argv[2:]))
+    elif cmd == "state":
+        cmd_state(sys.argv[2] if len(sys.argv) > 2 and valid_user(sys.argv[2]) else "")
+    else:
+        print(__doc__.strip())
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

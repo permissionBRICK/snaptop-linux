@@ -1,21 +1,34 @@
 #!/bin/bash
 # Face unlock (Biopass, docs/login.md#face-unlock): the PAM gate in front of Biopass and small helpers.
 #
-# PAM (pam_exec lines that steamos/login-lock.sh adds while face unlock is installed):
+# PAM (pam_exec lines that steamos/login-lock.sh adds while face unlock is installed; the runs themselves, when they
+# may look and what counts, are in s15-face-run):
 #   s15-face pam-empty    SDDM, auth, expose_authtok: face only when Enter is pressed on an empty password field, so
-#                         a typed password or PIN never waits for the camera
-#   s15-face pam-gate     the lock screen (kde-fingerprint), and sudo/polkit if turned on (install-face.sh admin on)
-#   s15-face pam-ok       the lock screen, after a face or password unlock: reset the count of failed scans
+#                         a typed password or PIN never waits for the camera; then the gate
+#   s15-face pam-gate     sudo/polkit if turned on (install-face.sh admin on): the gate
+#   s15-face pam-scan     SDDM, sudo/polkit, after the gate: one run (s15-face-run scan)
+#   s15-face pam-watch    the lock screen (kde-fingerprint): starts with the lock screen's first key press (or
+#                         s15-face-wake's), looks whenever the display is on, until a match (s15-face-run watch)
+#   s15-face pam-rescan   the lock screen's password service (kde), expose_authtok: Enter on the empty field asks the
+#                         watch for a new run and fails at once (no password check, so it never counts towards the
+#                         password lockout); anything typed goes on to the PIN and password checks
+#   s15-face pam-ok       the lock screen, after a face or password unlock: reset the count of false faces
 #   s15-face pam-account  SDDM, account phase (root): a login succeeded; from now on face may be used until the next
-#                         boot, and the count of failed scans starts again
-# The gates let Biopass run only after a login at the login screen since boot (the first login after a boot takes
+#                         boot, and the count of false faces starts again
+# The gate lets Biopass run only after a login at the login screen since boot (the first login after a boot takes
 # the password or the PIN), with an IR camera and a minimum face size in the user's Biopass settings (without the
-# IR camera a photo on a phone could pass, without the size a face across the room), and refuse after 5 face scans
-# in a row without a success, until the next password or PIN login or a password unlock of the lock screen (or
-# s15-face reset).
+# IR camera a photo on a phone could pass, without the size a face across the room), not while pam_faillock locks
+# the account, and counts false faces (faces seen that did not match, or that anti-spoofing flagged) since the last
+# success as the PIN counts wrong PINs: waits after 6, off after 15 until the next password or PIN login or unlock
+# (or s15-face reset); the numbers are root's (s15-face lockout). Runs look only while the display is on and the
+# lid open (s15-face-run).
 #
 #   s15-face status [user]
-#   s15-face reset [user]               (root) clear the count of failed scans
+#   s15-face reset [user]               (root) clear the count of false faces and the wait
+#   s15-face lockout                    the lockout numbers in effect, as KEY=VALUE lines (/etc/s15-face.conf, else
+#                                       the defaults); s15-face lockout keys: KEY DEFAULT MIN MAX UNIT MEANING
+#   s15-face lockout set KEY VALUE      (root) set one (whole numbers within MIN..MAX); prints the new values
+#   s15-face lockout reset-defaults     (root) all back to the defaults
 #   s15-face camera ir|rgb|both [user]  set the cameras in the user's Biopass configuration (Biopass app closed;
 #                                       without one yet, Biopass's defaults are written first), with the minimum
 #                                       face size and threshold below where the settings have none or a looser one:
@@ -34,13 +47,13 @@
 #                                       in ir: it is trained on colour images). Use this, not the app's settings
 #                                       page: saving that page drops the settings above
 #   s15-face check                      (as yourself) one face scan as the lock screen runs it, showing each step
-#                                       (face size, match scores); counts as no scan for the gates
+#                                       (face size, match scores); not counted, display and lid not checked
 #   s15-face snapshot ir|rgb [file]     one frame as Biopass sees it (default /tmp/s15-face-<camera>.png)
 #   s15-face cameras                    the cameras as Biopass's libcamera lists them
 set -u
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin   # pam_exec passes only the PAM environment
 STATE=/run/s15-face
-MAX_FAILS=5
+RUN=/usr/local/sbin/s15-face-run
 TOOL=/usr/lib/s15-face/camera_capture_test
 CONF=.config/com.ticklab.biopass/config.yaml
 DB=.config/com.ticklab.biopass/biopass.db
@@ -61,58 +74,21 @@ default_user() {
   echo "${u:-steamos}"
 }
 
-# The user's Biopass settings name an IR camera, a minimum face size, and use no camera profiles (they would
-# override them; saving the app's settings page writes profiles and drops the keys the app does not know). Read
-# without following links and only if the user owns the file, also when run as root (login screen).
-ir_configured() {
-  python3 -I - "$1" "$(getent passwd "$1" | cut -d: -f6)/$CONF" <<'EOF'
-import os, pwd, sys, yaml
-user, path = sys.argv[1:]
-try:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    st = os.fstat(fd)
-    if st.st_uid != pwd.getpwnam(user).pw_uid or st.st_size > 1 << 20:
-        sys.exit(1)
-    face = ((yaml.safe_load(os.fdopen(fd).read()) or {}).get("methods") or {}).get("face") or {}
-except (OSError, KeyError, yaml.YAMLError, AttributeError):
-    sys.exit(1)
-ir = (face.get("anti_spoofing") or {}).get("ir_camera")
-size = (face.get("detection") or {}).get("min_face_height")
-sized = isinstance(size, (int, float)) and not isinstance(size, bool) and 0 < size <= 1
-sys.exit(0 if isinstance(ir, str) and ir.strip() and sized and not face.get("camera_profiles") else 1)
-EOF
-}
-
-# Both gates: PAM auth phase, a login since boot, an IR camera set, fewer than MAX_FAILS scans without a success.
-# Counts this scan.
-gate() {
-  local u=${PAM_USER:-} f fails
-  [ "${PAM_TYPE:-}" = auth ] && valid_user "$u" || exit 1
-  f=$STATE/$u
-  if [ ! -f "$f" ] || [ -L "$f" ]; then
-    log "$u: face refused: no login with the password or PIN since boot (${PAM_SERVICE:-?})"
-    exit 1
-  fi
-  if ! ir_configured "$u"; then
-    log "$u: face refused: no IR camera or minimum face size in the Biopass settings (s15-face camera" \
-      "ir|rgb|both) (${PAM_SERVICE:-?})"
-    exit 1
-  fi
+# fails=0 and no wait in a user's state file, its other values (watch, rescan: s15-face-run) kept. Rewritten in
+# place, so the file stays the user's.
+state_clear() {
+  local f=$1 rest
   exec 9<"$f"; flock 9
-  fails=$(sed -n 's/^fails=\([0-9]*\)$/\1/p' "$f"); fails=${fails:-0}
-  if [ "$fails" -ge "$MAX_FAILS" ]; then
-    log "$u: face refused: $fails scans without a success; the password or PIN unlocks it again (${PAM_SERVICE:-?})"
-    exit 1
-  fi
-  echo "fails=$((fails + 1))" > "$f" || exit 1
-  exit 0
+  rest=$(grep -v -e '^fails=' -e '^until=' "$f" || true)
+  printf '%s\n' "fails=0" ${rest:+"$rest"} > "$f"
+  exec 9<&-
 }
 
 ok() {
   local u=${PAM_USER:-} f
   [ "${PAM_TYPE:-}" = auth ] && valid_user "$u" || exit 0
   f=$STATE/$u
-  [ -f "$f" ] && [ ! -L "$f" ] && echo "fails=0" > "$f"
+  [ -f "$f" ] && [ ! -L "$f" ] && state_clear "$f"
   exit 0
 }
 
@@ -142,14 +118,9 @@ camera_id() {
 }
 
 status() {
-  local u=${1:-$(default_user)} f
+  local u=${1:-$(default_user)}
   valid_user "$u" || die "bad user name"
-  f=$STATE/$u
-  if [ -f "$f" ]; then
-    echo "$u: login since boot: yes, $(sed -n 's/^fails=//p' "$f") of $MAX_FAILS failed scans since the last success"
-  else
-    echo "$u: login since boot: no (the first login after a boot takes the password or PIN)"
-  fi
+  "$RUN" state "$u"
   local home; home=$(getent passwd "$u" | cut -d: -f6)
   if [ -r "$home/$CONF" ]; then
     python3 -I - "$home/$CONF" <<'EOF'
@@ -191,7 +162,7 @@ reset() {
   [ "$(id -u)" = 0 ] || die "run as root (sudo)"
   valid_user "$u" || die "bad user name"
   f=$STATE/$u
-  if [ -f "$f" ]; then echo "fails=0" > "$f"; echo "$u: failed scans cleared"; else echo "$u: no login since boot"; fi
+  if [ -f "$f" ] && [ ! -L "$f" ]; then state_clear "$f"; echo "$u: false faces cleared"; else echo "$u: no login since boot"; fi
 }
 
 camera() {
@@ -463,8 +434,7 @@ check() {
   u=$(id -un)
   [ "$(id -u)" != 0 ] || die "run as yourself, not as root"
   [ -x "$HELPER" ] || die "face unlock is not installed (steamos/install-face.sh install)"
-  ir_configured "$u" || echo "Note: the lock screen refuses face now: no IR camera or minimum face size in the" \
-    "settings (s15-face camera ir|rgb|both)."
+  "$RUN" state "$u" | sed -n 's/^  face now: refused: /Note: the lock screen refuses face now: /p'
   echo "Scanning (look at the screen; the camera light comes on)..."
   out=$("$HELPER" auth --username "$u" --verbose 2>&1 >/dev/null); rc=$?
   grep -E 'FaceAuth: (Face on|No face|Recognition (PASSED|FAILED)|The .* frame came|Recognised on both|Could not|Both cameras must|No face enrolled|Anti-spoofing failed|AI anti-spoofing (detected spoof|check passed)|IR presence check (PASSED|FAILED))|camera appears covered' \
@@ -493,8 +463,15 @@ case "${1:-}" in
     # pam_exec expose_authtok: the field's value and a NUL on stdin; only an empty field may start a scan
     b=$(head -c 1 | od -An -tx1 | tr -d ' \n')
     [ -z "$b" ] || [ "$b" = 00 ] || exit 1
-    gate ;;
-  pam-gate) gate ;;
+    exec "$RUN" gate ;;
+  pam-gate) exec "$RUN" gate ;;
+  pam-scan) exec "$RUN" scan ;;
+  lockout) shift; exec "$RUN" lockout "$@" ;;
+  pam-watch) exec "$RUN" watch ;;
+  pam-rescan)
+    b=$(head -c 1 | od -An -tx1 | tr -d ' \n')
+    [ -z "$b" ] || [ "$b" = 00 ] || exit 1
+    exec "$RUN" rescan ;;
   pam-ok) ok ;;
   pam-account) account ;;
   status) status "${2:-}" ;;
@@ -505,5 +482,5 @@ case "${1:-}" in
   check) check ;;
   snapshot) snapshot "${2:-}" "${3:-}" ;;
   cameras) cameras ;;
-  *) sed -n '2,39p' "$0"; exit 2 ;;
+  *) sed -n '2,52p' "$0"; exit 2 ;;
 esac
