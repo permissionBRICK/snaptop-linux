@@ -58,6 +58,14 @@ if that portal reports no camera, websites cannot see one. Test a website after 
 In Firefox, set `media.webrtc.camera.allow-pipewire` to `true` in `about:config` and fully restart Firefox.
 Without that setting, the tested Flatpak build did not discover the camera even with a working portal.
 
+Both cameras share CSID0, and libcamera switches it to the camera it opens. Stock libcamera sets the media links
+up from its own copy of their state, read when the process started; with a second libcamera user (face unlock
+switches CSID0 to the IR camera at every scan) WirePlumber then skipped disabling the IR link, the CSID refused a
+second input (`Failed to setup link 'msm_csiphy4'[1] -> 'msm_csid0'[0]: Device or resource busy` in the journal),
+and browsers got no camera. `install-camera.sh` patches libcamera to set every link up from scratch (patch level 1
+in `/var/lib/s15-camera.version`; an older install rebuilds when the script runs again). Only one program can use
+the cameras at a time: a browser call blocks face unlock while it runs, and the other way round.
+
 Rapid reopen or resolution changes also require the CCI recovery patch in our kernel build. Without it,
 the OV02C10 can leave its controller stalled (`master 1 queue 0 timeout`), and WirePlumber may hang after
 the failed stream start. The patch resets CCI on runtime resume and retries a transfer once after the
