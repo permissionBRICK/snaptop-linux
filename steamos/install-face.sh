@@ -13,7 +13,7 @@
 #   sudo steamos/install-face.sh admin on|off         also for sudo and polkit dialogs (off by default, see the docs)
 #   steamos/install-face.sh apply-root <dir>          (s15-os-update) into a new SteamOS version before its first boot
 # Packages only from the image's own repository (pacman -S --needed, no system upgrade): the app's webkit2gtk-4.1.
-# The build (about 30 minutes; Rust and Node.js only in its overlay) is kept in /var/lib/s15-face/cache with its
+# The build (about 10 minutes; Rust and Node.js only in its overlay) is kept in /var/lib/s15-face/cache with its
 # downloads, and reused while face/ is unchanged.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -37,14 +37,14 @@ DEPS="webkit2gtk-4.1"            # the app; the rest Biopass needs is in the ima
 ID=$(face_build_id)
 
 # The patched build for root $1: from the cache, else built against $1 in a chroot (an overlay with its upper layer in
-# a work directory under /var/tmp, about 8 GB while it runs; build.sh keeps its mounts in a mount namespace of its
+# a work directory under /var/tmp, about 4 GB while it runs; build.sh keeps its mounts in a mount namespace of its
 # own, so none stays behind). Downloads are kept in the cache (their checksums are checked on every use).
 build() {
   local R=${1:-/} pkg=$CACHE/s15-face-$ID.tar.zst w
   if [ -f "$pkg" ] && [ "${REBUILD:-0}" != 1 ]; then echo "$pkg"; return; fi
   w=$(mktemp -d /var/tmp/s15-face-build.XXXXXX)
   install -d -m0700 "$CACHE" "$CACHE/src"
-  echo "building Biopass and its app with our patches (about 30 minutes)..." >&2
+  echo "building Biopass and its app with our patches (about 10 minutes)..." >&2
   if ! S15_FACE_SRC=$CACHE/src bash "$REPO/face/build.sh" "$R" "$w" > "$w.log" 2>&1 ||
      ! cp "$w/s15-face-$ID.tar.zst" "$pkg.new"; then
     tail -30 "$w.log" >&2; rm -rf "$w"; die "face build failed (log: $w.log)"

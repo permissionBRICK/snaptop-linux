@@ -7,7 +7,8 @@
 # code generators, Rust, Node.js) come from the image's own package repository into the overlay. Every source is pinned
 # and checksummed: the archives in sources.sh and the app's frontend packages (from its bun.lock) are downloaded and
 # checked before the chroot starts, the app's crates by cargo against its Cargo.lock in the chroot; then the build runs
-# offline. Native on ARM64 (about 30 minutes on the laptop), or on x86_64 under qemu-user binfmt (hours).
+# offline. Native on ARM64 (about 8 minutes on the laptop's 12 cores, the first time also about 0.4 GB of downloads),
+# or on x86_64 under qemu-user binfmt (hours).
 # Usage: build.sh <SteamOS rootfs.img or root directory> [workdir]   -> <workdir>/s15-face-<version>.tar.zst
 # The workdir must not sit on an overlay. S15_FACE_SRC: where downloads are kept (default <workdir>/src).
 set -euo pipefail
