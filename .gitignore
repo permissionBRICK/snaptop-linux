@@ -8,3 +8,4 @@ payload/
 *.mbn
 *.elf
 *.jsn
+__pycache__/

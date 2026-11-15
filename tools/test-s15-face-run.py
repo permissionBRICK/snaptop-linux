@@ -8,6 +8,8 @@ import importlib.util
 import os
 import struct
 import sys
+
+sys.dont_write_bytecode = True   # no steamos/__pycache__ from loading s15-face-run
 import tempfile
 import threading
 import time
