@@ -179,8 +179,9 @@ looser one:
 | `rgb` | the colour camera; the IR camera only checks that it sees some face | room light | a printed photo can pass the IR check |
 
 In `ir` Biopass's AI anti-spoofing models are off: they are trained on colour images and misjudge IR frames. In `rgb`
-and `both` `sudo s15-face antispoof on` turns them on for the colour picture (they also reject real faces in poor
-light; not through the app: saving its settings page drops our settings); in
+and `both` `sudo s15-face antispoof on` turns one on for the colour picture: MiniFASNet V2 (Biopass's default,
+MobileNetV3, took the real face for a spoof in 2 of 3 scans on this camera's pictures; MiniFASNet V2 passed 4 of 4).
+They may also reject real faces in poor light. Not through the app: saving its settings page drops our settings. In
 `both` the IR recognition replaces the IR presence check. `both` never falls back to one camera: in a dark room, or
 with the colour lens covered, face unlock fails and the password or PIN is needed (otherwise covering a lens would
 weaken it).

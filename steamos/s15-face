@@ -443,7 +443,13 @@ anti = face.setdefault("anti_spoofing", {})
 if on == "on" and face.get("camera") and face.get("camera") == anti.get("ir_camera"):
     sys.exit("s15-face: not in ir mode: the model is trained on colour images (s15-face camera both or rgb first)")
 anti["enable"] = on == "on"
-model = anti.setdefault("model", {"model_id": "mobilenetv3-antispoof", "threshold": 0.8})
+model = anti.setdefault("model", {})
+if on == "on":
+    # MiniFASNet V2, not Biopass's default MobileNetV3: on this colour camera's pictures (libcamera's software ISP)
+    # MobileNetV3 took the real face for a spoof in 2 of 3 scans (scores 0.90, 0.97 at a threshold of 0.8);
+    # MiniFASNet V2 passed it in 4 of 4
+    model["model_id"] = "minifas-v2"
+    model.setdefault("threshold", 0.8)
 tmp = path + ".s15-face"
 with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
     yaml.safe_dump(c, f, sort_keys=False)
@@ -461,7 +467,7 @@ check() {
     "settings (s15-face camera ir|rgb|both)."
   echo "Scanning (look at the screen; the camera light comes on)..."
   out=$("$HELPER" auth --username "$u" --verbose 2>&1 >/dev/null); rc=$?
-  grep -E 'FaceAuth: (Face on|No face|Recognition (PASSED|FAILED)|The .* frame came|Recognised on both|Could not|Both cameras must|No face enrolled|Anti-spoofing failed|IR presence check (PASSED|FAILED))|camera appears covered' \
+  grep -E 'FaceAuth: (Face on|No face|Recognition (PASSED|FAILED)|The .* frame came|Recognised on both|Could not|Both cameras must|No face enrolled|Anti-spoofing failed|AI anti-spoofing (detected spoof|check passed)|IR presence check (PASSED|FAILED))|camera appears covered' \
     <<< "$out" | sed -E "s/^\[[0-9-]+ ([0-9:.]+)\] \[[a-z]+\] \[[a-z]+\] (FaceAuth: )?/\1 /; s/ \(NOTE:.*\)\$//;
                          s#face='[^']*/(faces[^/]*/[^']*)'#\1#"
   case $rc in
