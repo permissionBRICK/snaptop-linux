@@ -152,9 +152,11 @@ Models page). On the Configuration page, under Face Recognition:
 2. **Enrolled faces**: **Start camera**, then **Add 5**: five pictures two seconds apart (in both cameras' mode a
    colour and an IR picture each). Look at the screen as you usually sit, turn your head a little between them, and
    add some with and without glasses.
-3. **Test**: one scan as the lock screen runs it, with each step (the face's size, scores) and each compared face's
-   score on its picture, red when it is not above the threshold. A face that stays red when you test is worth
-   deleting (its bin) and adding again; **Delete all** and **Add 5** enrol a camera anew.
+3. **Test**: one scan as the lock screen runs it, with each step (the face's size, scores), each camera's best score
+   against its threshold, the anti-spoofing score, whether both cameras saw one face, and each compared face's
+   score on its picture, red when it is not above its camera's threshold. A face that stays red when you test is
+   worth deleting (its bin) and adding again; **Delete all** and **Add 5** enrol a camera anew. If your own face
+   scores close to a camera's threshold, replace faces rather than lowering it (**Thresholds**).
 4. Lock the screen (Meta+L) and press a key: face unlock looks for you. After a wake from sleep, and at the login
    screen, it starts by itself.
 
@@ -172,7 +174,7 @@ shows the state (display, lid, the count of false faces, whether face is allowed
 
 #### The app
 
-Our build of Biopass's app (patches 0009-0011) knows this laptop's setup:
+Our build of Biopass's app (patches 0009-0011, 0013-0016) knows this laptop's setup:
 
 - **Cameras** lists the cameras by libcamera id (`biopass-helper list-cameras`, patch 0008): both cameras share all
   their `/dev/video` nodes, so Biopass's own list of video devices could not tell them apart. A mode sets the same
@@ -184,8 +186,13 @@ Our build of Biopass's app (patches 0009-0011) knows this laptop's setup:
 - **Enrolled faces** shows every camera's faces (`faces/`, `faces-ir/`, `faces-rgb/`), labelled by camera and by
   whether the mode uses them; a save that switches between the IR and the colour camera as the main camera moves
   them, as `s15-face camera` does. **Add faces** and **Test** use the saved settings: save the cameras first.
-- **Recognition threshold** warns below 0.6; **Anti-Spoofing** is off and locked in IR mode (the models are trained
-  on colour pictures).
+- **Thresholds**: each camera's recognition threshold (`recognition.threshold` for the colour camera,
+  `recognition.ir_threshold` for the IR camera, "same as colour" when it has none: the two cameras' pictures score
+  differently) and the anti-spoofing model's, side by side, each marked as used or not in the mode; below 0.6 it
+  warns. **Anti-Spoofing** is off and locked in IR mode (the models are trained on colour pictures).
+- **Unsaved changes are never lost without asking**: while there are any, a bar at the bottom offers Save and
+  Reset, and closing the window or leaving the page asks to save, discard or stay. Biopass's app closed and
+  dropped them without a word.
 - **Face Unlock Lockout** shows the [lockout settings](#lockout-settings) and your count of false faces, and
   changes them through `pkexec /usr/lib/s15-face/s15-face-lockout` (polkit action
   `org.snaptop-linux.s15-face.lockout`): it asks for the administrator password, as `sudo s15-face lockout set`
@@ -270,9 +277,12 @@ streams at a time, and the camera light is on while either does.
   decision takes about 0.8 s from the helper's start; between false faces the helper starts again (about 1 s).
 - One attempt: one picture (the IR camera: the brightest lit one of 4), the largest face in it, cropped as detected
   (not aligned) and scaled to 112x112; its EdgeFace embedding is compared with each enrolled face of that camera
-  (cosine similarity, 1 = identical). It matches when one enrolled face scores **above** `recognition.threshold`:
-  Biopass's default 0.5, `s15-face camera` sets 0.6 (measured on the laptop, sitting in front: the best of the 5
-  enrolled IR faces scored 0.34-0.92, mostly above 0.7; strangers, below). The attempt fails without a face, and
+  (cosine similarity, 1 = identical). It matches when one enrolled face scores **above** its camera's threshold:
+  `recognition.threshold` (the colour camera's; Biopass's default 0.5, `s15-face camera` sets 0.6), and since our
+  patch 0013 `recognition.ir_threshold` for the IR camera (as the main camera or in `both`; none: the same as
+  `threshold`), as the two cameras' pictures score differently (measured on the laptop, sitting in front: the best
+  of the 5 enrolled IR faces scored 0.34-0.92, mostly above 0.7; the user's own colour face sometimes only
+  0.48-0.51; strangers, below). The attempt fails without a face, and
   since our patch 0004 also when the face is lower than `detection.min_face_height` of the picture (`s15-face
   camera`: 0.2) or touches its edge; Biopass itself took any face that YOLO found, however small. Sitting in front
   of the laptop the face measured 0.29-0.47 of the picture's height in IR (560x360) and 0.44-0.60 in colour
@@ -282,7 +292,13 @@ streams at a time, and the camera light is on while either does.
   colour camera); once that picture has a face, the camera closes and the other one opens while the first face is
   compared; a match there too, on a picture at most 2.5 s after the first, unlocks. A miss on the second camera
   leaves it open, and the next attempt starts there. Measured: a scan that matches at once takes 1.3 s, the two
-  pictures 0.5 s apart.
+  pictures 0.5 s apart. Since patch 0013 both cameras must see **one face**: a photo on a phone held next to the
+  face matched on the colour camera, while the IR camera (a phone shows nothing in infrared) recognised the real
+  face beside it. The two faces' boxes, as fractions of each picture, must lie at most
+  `anti_spoofing.pair_max_offset` face sizes apart (0.5; 0 = no check) and their heights at most
+  `pair_max_size_ratio` apart (1.5); else the attempt fails like a spoof (a false face). The cameras sit side by
+  side: over 5 enrolment pairs the same face measured 0.95 of its colour width and 0.86 of its colour height in
+  IR, well inside that.
 - `s15-face check` runs one scan (`biopass-helper auth --verbose`, patch 0006: Biopass's own 5 attempts), with each
   step on the terminal: the face's size and how it compares with the minimum, the best score and the threshold. The
   app's Test runs `biopass-helper auth --verbose --keep-looking 6000` (as the login screen looks: the first face
@@ -382,8 +398,14 @@ streams at a time, and the camera light is on while either does.
   the first time about 0.4 GB of downloads. The result is kept in `/var/lib/s15-face/cache`, the downloads in
   `/var/lib/s15-face/cache/src`.
 - The app's menu entry starts it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`: WebKitGTK's DMA-BUF renderer ends it at
-  once on this GPU under Wayland ("Error 71 (Protocol error) dispatching to Wayland display"). From a terminal:
-  `WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass`.
+  once on this GPU under Wayland ("Error 71 (Protocol error) dispatching to Wayland display"; still so with
+  WebKitGTK 2.50.5, its GL runs on Mesa's zink here). From a terminal: `WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass`.
+- The app lagged (about 17 frames a second while scrolling, a CPU core busy): Biopass's settings cards had large
+  blurred shadows (`shadow-lg`, the expanded method card `shadow-md`) and a backdrop blur, which WebKitGTK paints
+  again on every scroll step; the face card is thousands of pixels tall. Measured with the app's page in a
+  WebKitGTK view in a nested KWin on the laptop (patch 0016): 17.5 frames a second with them, 60 without (16 ms
+  frames), and 4 % instead of 16 % CPU at rest. The DMA-BUF renderer, compositing and Skia settings made no
+  difference.
 - polkit re-reads all its actions as soon as a policy file appears. When the install unpacked the app's policy file
   with everything else, polkit read it half-written and was left with no actions at all, every time: Plasma then
   hid shutdown and sleep and ignored the lid. `install-face.sh` now puts the policy files (Biopass's and the
