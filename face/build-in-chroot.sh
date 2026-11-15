@@ -13,7 +13,12 @@ need=()
 for p in cli11 python-jinja python-ply python-yaml rust nodejs webkit2gtk-4.1; do
   pacman -Q "$p" >/dev/null 2>&1 || need+=("$p")
 done
-[ ${#need[@]} = 0 ] || pacman -S --needed --noconfirm "${need[@]}" >/dev/null
+# Valve's package server sometimes stalls a download (pacman gives up after 10 s without data): try again.
+for try in 1 2 3 4; do
+  [ ${#need[@]} = 0 ] || pacman -S --needed --noconfirm "${need[@]}" >/dev/null && break
+  [ "$try" = 4 ] && exit 1
+  echo "pacman: a download failed, again in 30 s"; sleep 30
+done
 log "sources and patches"
 rm -rf "$B/biopass-$V" "$T" "$STAGE" "$B/libcamera"; mkdir -p "$T/_deps" "$B/libcamera"
 tar -xf "$S/biopass-$V.tar.gz" -C "$B"
