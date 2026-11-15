@@ -1,0 +1,496 @@
+From ea1c49a8a9c9f72932fccba08af63a00755aaff6 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:20:21 +0000
+Subject: [PATCH] feat(face): match only a face in front of the camera
+ (min_face_height)
+
+Biopass matched the largest face YOLO found, however small: a face
+across the room (a few dozen pixels, scaled up to 112 for EdgeFace) or
+one cut off by the frame's edge was compared like a face in front of the
+screen, so a laptop unlocked for its owner walking past.
+
+detection.min_face_height (fraction of the frame height, default 0 = no
+check, as before): the largest face's box must be at least this tall
+and lie wholly inside the frame, or the attempt fails (Retry) without a
+match. Out of [0, 1] (or NaN) turns face off, as an out-of-range
+threshold does. The debug log gives the face box, its height in the
+frame and the verdict, and the best score of a failed match.
+
+face/common/face_framing.h holds the check as a pure function; tests:
+face_framing, config_validation, config_golden.
+---
+ auth/CMakeLists.txt                   |   1 +
+ auth/core/auth_config.cc              |   9 ++-
+ auth/core/auth_config.h               |  13 +++-
+ auth/face/CMakeLists.txt              |   1 +
+ auth/face/common/face_framing.cc      |  40 ++++++++++
+ auth/face/common/face_framing.h       |  30 ++++++++
+ auth/face/face_auth.cc                |  24 ++++++
+ auth/test/config_golden/main.cpp      |   2 +
+ auth/test/config_validation/main.cpp  |  23 +++++-
+ auth/test/face_framing/CMakeLists.txt |  14 ++++
+ auth/test/face_framing/main.cpp       | 102 ++++++++++++++++++++++++++
+ 11 files changed, 250 insertions(+), 9 deletions(-)
+ create mode 100644 auth/face/common/face_framing.cc
+ create mode 100644 auth/face/common/face_framing.h
+ create mode 100644 auth/test/face_framing/CMakeLists.txt
+ create mode 100644 auth/test/face_framing/main.cpp
+
+diff --git a/auth/CMakeLists.txt b/auth/CMakeLists.txt
+index 18a7220..78a255b 100644
+--- a/auth/CMakeLists.txt
++++ b/auth/CMakeLists.txt
+@@ -59,6 +59,7 @@ if(BUILD_TESTS)
+     add_subdirectory(test/camera_lifecycle)
+     add_subdirectory(test/frame_sampling)
+     add_subdirectory(test/frame_darkness)
++    add_subdirectory(test/face_framing)
+     add_subdirectory(test/fs_user)
+     add_subdirectory(test/helper_config)
+     add_subdirectory(test/user_file)
+diff --git a/auth/core/auth_config.cc b/auth/core/auth_config.cc
+index c31196e..3775373 100644
+--- a/auth/core/auth_config.cc
++++ b/auth/core/auth_config.cc
+@@ -62,9 +62,11 @@ std::vector<std::string> dedupeServices(const std::vector<std::string>& services
+ // NaN never does), detection keeps boxes whose score >= threshold. None of
+ // them has a safe value to clamp to, so face is turned off and PAM falls
+ // through to the next module. The anti-spoofing threshold only counts when
+-// anti-spoofing is on.
++// anti-spoofing is on. detection.min_face_height likewise: negative or NaN
++// would silently drop the check, above 1 nothing could pass.
+ bool faceThresholdsValid(const FaceMethodConfig& face) {
+   return thresholdInRange(face.detection.threshold) &&
++         thresholdInRange(face.detection.min_face_height) &&
+          thresholdInRange(face.recognition.threshold) &&
+          (!face.anti_spoofing.enable || thresholdInRange(face.anti_spoofing.model.threshold));
+ }
+@@ -78,8 +80,8 @@ void validateConfig(BiopassConfig& config) {
+ 
+   FaceMethodConfig& face = config.methods.face;
+   if (face.enable && !faceThresholdsValid(face)) {
+-    spdlog::warn("Biopass: a face threshold is outside [{}, {}], face is disabled", kMinThreshold,
+-                 kMaxThreshold);
++    spdlog::warn("Biopass: a face threshold or min_face_height is outside [{}, {}], face is disabled",
++                 kMinThreshold, kMaxThreshold);
+     face.enable = false;
+   }
+   face.retries = std::min(face.retries, kMaxFaceRetries);
+@@ -218,6 +220,7 @@ void parseFace(const YAML::Node& f, FaceMethodConfig& out) {
+   if (f["detection"]) {
+     readIf(f["detection"], "model_id", out.detection.model_id);
+     readIf(f["detection"], "threshold", out.detection.threshold);
++    readIf(f["detection"], "min_face_height", out.detection.min_face_height);
+   }
+   if (f["recognition"]) {
+     readIf(f["recognition"], "model_id", out.recognition.model_id);
+diff --git a/auth/core/auth_config.h b/auth/core/auth_config.h
+index ac3c032..972eca9 100644
+--- a/auth/core/auth_config.h
++++ b/auth/core/auth_config.h
+@@ -36,6 +36,11 @@ struct StrategyConfig {
+ struct DetectionConfig {
+   std::string model_id;
+   float threshold = 0.5f;
++  // The face box's minimum height as a fraction of the frame height, and the
++  // whole box inside the frame (face/common/face_framing.h): only someone
++  // sitting in front of the camera is matched, not a face across the room or
++  // at the frame's edge. 0 = no check (as before).
++  float min_face_height = 0.0f;
+ };
+ 
+ struct RecognitionConfig {
+@@ -119,14 +124,16 @@ inline constexpr int kMaxIrPresenceTimeoutMs = 10000;
+ inline constexpr uint32_t kMaxFingerprintRetries = 5;
+ inline constexpr uint32_t kMaxFingerprintTimeoutMs = 10000;
+ 
+-// Thresholds are probabilities or cosine similarities in [0, 1].
++// Thresholds are probabilities or cosine similarities in [0, 1];
++// detection.min_face_height is a fraction of the frame height in [0, 1].
+ inline constexpr float kMinThreshold = 0.0f;
+ inline constexpr float kMaxThreshold = 1.0f;
+ 
+ // Puts a config into the ranges the helper relies on. readConfig() calls it
+ // on every config it returns.
+-// - A face threshold outside [kMinThreshold, kMaxThreshold] (or NaN) turns
+-//   face off: there is no safe value to clamp it to. The anti-spoofing
++// - A face threshold or detection.min_face_height outside [kMinThreshold,
++//   kMaxThreshold] (or NaN) turns face off: there is no safe value to clamp
++//   it to. The anti-spoofing
+ //   threshold only counts while anti-spoofing is on.
+ // - order keeps each method once and appends the missing ones;
+ //   ignore_services drops empty and repeated names.
+diff --git a/auth/face/CMakeLists.txt b/auth/face/CMakeLists.txt
+index ca3e9d6..2e63c56 100644
+--- a/auth/face/CMakeLists.txt
++++ b/auth/face/CMakeLists.txt
+@@ -50,6 +50,7 @@ add_library(biopass_face_common STATIC
+     common/pixel_convert.cc
+     common/debug_image_io.cc
+     common/frame_darkness.cc
++    common/face_framing.cc
+     common/v4l2_capture.cc
+ )
+ set_target_properties(biopass_face_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
+diff --git a/auth/face/common/face_framing.cc b/auth/face/common/face_framing.cc
+new file mode 100644
+index 0000000..f4a21b3
+--- /dev/null
++++ b/auth/face/common/face_framing.cc
+@@ -0,0 +1,40 @@
++#include "face_framing.h"
++
++namespace biopass {
++
++float faceHeightFraction(int y1, int y2, int height) {
++  if (height <= 0 || y2 <= y1) {
++    return 0.0f;
++  }
++  return static_cast<float>(y2 - y1) / static_cast<float>(height);
++}
++
++FaceFraming checkFaceFraming(int x1, int y1, int x2, int y2, int width, int height,
++                             float min_height) {
++  // NaN fails the comparison too: no minimum.
++  if (!(min_height > 0.0f)) {
++    return FaceFraming::Ok;
++  }
++  if (width <= 0 || height <= 0 || x2 <= x1 || y2 <= y1 ||
++      faceHeightFraction(y1, y2, height) < min_height) {
++    return FaceFraming::TooSmall;
++  }
++  if (x1 <= 0 || y1 <= 0 || x2 >= width || y2 >= height) {
++    return FaceFraming::CutOff;
++  }
++  return FaceFraming::Ok;
++}
++
++const char* faceFramingName(FaceFraming framing) {
++  switch (framing) {
++    case FaceFraming::Ok:
++      return "ok";
++    case FaceFraming::TooSmall:
++      return "too small";
++    case FaceFraming::CutOff:
++      return "cut off";
++  }
++  return "?";
++}
++
++}  // namespace biopass
+diff --git a/auth/face/common/face_framing.h b/auth/face/common/face_framing.h
+new file mode 100644
+index 0000000..bb364c7
+--- /dev/null
++++ b/auth/face/common/face_framing.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++// Whether a detected face is framed as someone sitting in front of the
++// camera: tall enough and not cut off by the frame's edge. A face across the
++// room, or one barely in the frame, gives a small or partial crop whose
++// embedding says little about who it is. Pure, so it can be tested without a
++// camera or a model.
++
++namespace biopass {
++
++enum class FaceFraming {
++  Ok,
++  TooSmall,  // the face box is lower than min_height of the frame
++  CutOff,    // the face box touches the frame's edge: part of the face is outside
++};
++
++// The face box (x1, y1)-(x2, y2) in pixels, clamped to the width x height
++// frame as detection returns it. min_height: the box's minimum height as a
++// fraction of the frame height; 0 (or less, or NaN) checks nothing, neither
++// size nor edge. An empty frame or box is TooSmall when there is a minimum.
++FaceFraming checkFaceFraming(int x1, int y1, int x2, int y2, int width, int height,
++                             float min_height);
++
++// The box height as a fraction of the frame height; 0 for an empty frame.
++float faceHeightFraction(int y1, int y2, int height);
++
++// "ok", "too small" or "cut off", for logs.
++const char* faceFramingName(FaceFraming framing);
++
++}  // namespace biopass
+diff --git a/auth/face/face_auth.cc b/auth/face/face_auth.cc
+index 469345e..8f661cd 100644
+--- a/auth/face/face_auth.cc
++++ b/auth/face/face_auth.cc
+@@ -3,6 +3,7 @@
+ #include <spdlog/spdlog.h>
+ #include <sys/stat.h>
+ 
++#include <algorithm>
+ #include <exception>
+ #include <memory>
+ #include <optional>
+@@ -14,6 +15,7 @@
+ #include "auth_deadline.h"
+ #include "camera_capture.h"
+ #include "debug_image_io.h"
++#include "face_framing.h"
+ #include "frame_darkness.h"
+ #include "image_io.h"
+ #include "onnx_session.h"
+@@ -265,6 +267,24 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+     return AuthResult::Retry;
+   }
+ 
++  // Detections come largest first. A face across the room or cut off by the
++  // frame's edge is not matched (detection.min_face_height).
++  const Box& box = detectedImages[0].box;
++  const float min_height = face_config_.detection.min_face_height;
++  const FaceFraming framing = checkFaceFraming(box.x1, box.y1, box.x2, box.y2, loginFace.width,
++                                               loginFace.height, min_height);
++  spdlog::debug(
++      "FaceAuth: Face on the camera | {}x{} px at ({},{}) in {}x{}, height {:.2f} of the frame (min "
++      "{:.2f}), conf {:.2f}: {}",
++      box.x2 - box.x1, box.y2 - box.y1, box.x1, box.y1, loginFace.width, loginFace.height,
++      faceHeightFraction(box.y1, box.y2, loginFace.height), min_height, detectedImages[0].conf,
++      faceFramingName(framing));
++  if (framing != FaceFraming::Ok) {
++    spdlog::error("FaceAuth: Face on the camera {}: not in front of the camera",
++                  faceFramingName(framing));
++    return AuthResult::Retry;
++  }
++
+   ImageRGB face = detectedImages[0].image;
+ 
+   // The capture may have run past a sibling's success or the time budget;
+@@ -303,6 +323,7 @@ bool FaceAuth::matchAgainstEnrolled(const std::string& username, const ImageRGB&
+                                     const std::vector<std::string>& enrolled_paths) {
+   spdlog::debug("FaceAuth: Recognition | threshold={:.3f} enrolled_count={}",
+                 face_config_.recognition.threshold, enrolled_paths.size());
++  float best = -1.0f;
+   for (const auto& facePath : enrolled_paths) {
+     const auto faceBytes = readUserFile(username, facePath, kMaxImageFileBytes);
+     ImageRGB preparedFace = faceBytes ? decodeImage(*faceBytes) : ImageRGB{};
+@@ -312,6 +333,7 @@ bool FaceAuth::matchAgainstEnrolled(const std::string& username, const ImageRGB&
+     }
+ 
+     MatchResult match = recognizer_->match(preparedFace, face);
++    best = std::max(best, match.similarity);
+     spdlog::debug("FaceAuth: Recognition | face='{}' score={:.4f} threshold={:.3f} similar={}",
+                   facePath, match.similarity, face_config_.recognition.threshold, match.similar);
+     if (match.similar) {
+@@ -320,6 +342,8 @@ bool FaceAuth::matchAgainstEnrolled(const std::string& username, const ImageRGB&
+       return true;
+     }
+   }
++  spdlog::debug("FaceAuth: Recognition FAILED | best score={:.4f} threshold={:.3f}", best,
++                face_config_.recognition.threshold);
+   return false;
+ }
+ 
+diff --git a/auth/test/config_golden/main.cpp b/auth/test/config_golden/main.cpp
+index e8d5d44..8e99f59 100644
+--- a/auth/test/config_golden/main.cpp
++++ b/auth/test/config_golden/main.cpp
+@@ -55,6 +55,8 @@ void expectSameConfig(const BiopassConfig& a, const BiopassConfig& b, const std:
+   field(fa.camera_profiles == fb.camera_profiles, "face.camera_profiles");
+   field(fa.detection.model_id == fb.detection.model_id, "face.detection.model_id");
+   field(fa.detection.threshold == fb.detection.threshold, "face.detection.threshold");
++  field(fa.detection.min_face_height == fb.detection.min_face_height,
++        "face.detection.min_face_height");
+   field(fa.recognition.model_id == fb.recognition.model_id, "face.recognition.model_id");
+   field(fa.recognition.threshold == fb.recognition.threshold, "face.recognition.threshold");
+ 
+diff --git a/auth/test/config_validation/main.cpp b/auth/test/config_validation/main.cpp
+index 41efc88..7fdc0fe 100644
+--- a/auth/test/config_validation/main.cpp
++++ b/auth/test/config_validation/main.cpp
+@@ -1,5 +1,5 @@
+-// Checks validateConfig (core/auth_config.h): out-of-range thresholds turn
+-// the face method off instead of loosening it, and order and
++// Checks validateConfig (core/auth_config.h): out-of-range thresholds (and
++// detection.min_face_height) turn the face method off instead of loosening it, and order and
+ // ignore_services come out normalised. parseConfig: execution_mode and
+ // order names are read the way the helper always has. Exits non-zero on any
+ // failure.
+@@ -87,7 +87,7 @@ methods:
+       - {camera: /dev/v4l/by-id/usb-Dock-video-index0, ir_camera: null, allow_without_ir: true}
+       - {camera: /dev/v4l/by-path/pci-0-usb-0:8:1.0-video-index0, ir_camera: /dev/video2}
+       - {}
+-    detection: {model_id: det, threshold: 0.6}
++    detection: {model_id: det, threshold: 0.6, min_face_height: 0.3}
+     recognition: {model_id: rec, threshold: 0.7}
+     anti_spoofing:
+       enable: true
+@@ -113,6 +113,7 @@ void checkParse() {
+            "parse: strategy read");
+     expect(f.enable && f.retries == 3 && f.retry_delay == 100 && f.camera == "/dev/video0" &&
+                f.detection.model_id == "det" && f.detection.threshold == 0.6f &&
++               f.detection.min_face_height == 0.3f &&
+                f.recognition.model_id == "rec" && f.recognition.threshold == 0.7f,
+            "parse: face read");
+     expect(f.anti_spoofing.enable && f.anti_spoofing.model.model_id == "as" &&
+@@ -164,6 +165,8 @@ void checkParse() {
+             "schema_version: 2\nmethods:\n  face: {camera_profiles: [{allow_without_ir: ~}]}\n"},
+            {"camera_profiles camera not a string",
+             "schema_version: 2\nmethods:\n  face: {camera_profiles: [{camera: [1]}]}\n"},
++           {"detection.min_face_height not a number",
++            "schema_version: 2\nmethods:\n  face: {detection: {min_face_height: big}}\n"},
+            {"YAML syntax error", "schema_version: 2\nstrategy: {debug: true\n"},
+            {"not a map", "just a string\n"},
+            {"other schema_version", "schema_version: 1\nstrategy: {debug: true}\n"},
+@@ -184,6 +187,18 @@ void checkParse() {
+     expect(!c.methods.face.enable, "parse: detection.threshold .nan -> face off");
+   }
+ 
++  {
++    const BiopassConfig c = parseOrDie(
++        "schema_version: 2\nmethods:\n  face: {detection: {min_face_height: 1.5}}\n");
++    expect(!c.methods.face.enable, "parse: detection.min_face_height 1.5 -> face off");
++  }
++
++  {
++    const BiopassConfig c = parseOrDie("schema_version: 2\nmethods:\n  face: {enable: true}\n");
++    expect(c.methods.face.enable && c.methods.face.detection.min_face_height == 0.0f,
++           "parse: missing min_face_height -> 0 (no check)");
++  }
++
+   {
+     const BiopassConfig c = parseOrDie(
+         "schema_version: 2\nstrategy: {ignore_services: [polkit-1, '', polkit-1, sudo]}\n");
+@@ -279,6 +294,8 @@ int main() {
+                  [](BiopassConfig& c, float v) { c.methods.face.detection.threshold = v; });
+   checkThreshold("recognition.threshold",
+                  [](BiopassConfig& c, float v) { c.methods.face.recognition.threshold = v; });
++  checkThreshold("detection.min_face_height",
++                 [](BiopassConfig& c, float v) { c.methods.face.detection.min_face_height = v; });
+   checkThreshold("anti_spoofing.model.threshold (enabled)", [](BiopassConfig& c, float v) {
+     c.methods.face.anti_spoofing.enable = true;
+     c.methods.face.anti_spoofing.model.threshold = v;
+diff --git a/auth/test/face_framing/CMakeLists.txt b/auth/test/face_framing/CMakeLists.txt
+new file mode 100644
+index 0000000..15c4395
+--- /dev/null
++++ b/auth/test/face_framing/CMakeLists.txt
+@@ -0,0 +1,14 @@
++set(FACE_FRAMING_TEST face_framing_test)
++
++# face_framing.cc is plain box maths, built in directly so the test doesn't
++# pull libcamera in through biopass_face_common.
++add_executable(${FACE_FRAMING_TEST}
++    main.cpp
++    ${CMAKE_SOURCE_DIR}/face/common/face_framing.cc
++)
++
++target_include_directories(${FACE_FRAMING_TEST} PRIVATE
++    ${CMAKE_SOURCE_DIR}/face/common
++)
++
++add_test(NAME face_framing COMMAND ${FACE_FRAMING_TEST})
+diff --git a/auth/test/face_framing/main.cpp b/auth/test/face_framing/main.cpp
+new file mode 100644
+index 0000000..b9f1673
+--- /dev/null
++++ b/auth/test/face_framing/main.cpp
+@@ -0,0 +1,102 @@
++// When a detected face counts as someone sitting in front of the camera
++// (face/common/face_framing.h): its box at least min_height of the frame
++// height, and not touching the frame's edge. min_height 0 checks nothing.
++// Pure, no camera or model needed. Exits non-zero on any failure.
++
++#include <cmath>
++#include <cstdio>
++#include <limits>
++#include <string_view>
++
++#include "face_framing.h"
++
++namespace {
++
++using biopass::checkFaceFraming;
++using biopass::FaceFraming;
++
++int g_failures = 0;
++
++void expect(bool cond, const char* what) {
++  std::printf("[%s] %s\n", cond ? "PASS" : "FAIL", what);
++  if (!cond) {
++    g_failures++;
++  }
++}
++
++// A 560x360 IR frame, as the HM1092 delivers it.
++constexpr int kW = 560;
++constexpr int kH = 360;
++
++void checkFraction() {
++  using biopass::faceHeightFraction;
++  expect(std::fabs(faceHeightFraction(90, 270, kH) - 0.5f) < 1e-6f, "180 of 360 rows: 0.5");
++  expect(faceHeightFraction(0, kH, kH) == 1.0f, "full height: 1");
++  expect(faceHeightFraction(10, 10, kH) == 0.0f, "empty box: 0");
++  expect(faceHeightFraction(20, 10, kH) == 0.0f, "inverted box: 0");
++  expect(faceHeightFraction(0, 10, 0) == 0.0f, "empty frame: 0");
++}
++
++void checkNoMinimum() {
++  expect(checkFaceFraming(270, 170, 290, 190, kW, kH, 0.0f) == FaceFraming::Ok,
++         "no minimum: a tiny face passes");
++  expect(checkFaceFraming(0, 0, 100, 120, kW, kH, 0.0f) == FaceFraming::Ok,
++         "no minimum: a face at the edge passes (edge checked only with a minimum)");
++  expect(checkFaceFraming(270, 170, 290, 190, kW, kH, -0.5f) == FaceFraming::Ok,
++         "negative minimum: no check");
++  expect(checkFaceFraming(270, 170, 290, 190, kW, kH, std::numeric_limits<float>::quiet_NaN()) ==
++             FaceFraming::Ok,
++         "NaN minimum: no check");
++}
++
++void checkSize() {
++  // 0.30 of 360 rows = 108 rows.
++  expect(checkFaceFraming(200, 100, 300, 208, kW, kH, 0.30f) == FaceFraming::Ok,
++         "108 of 360 rows, minimum 0.30: ok (the minimum itself passes)");
++  expect(checkFaceFraming(200, 100, 300, 207, kW, kH, 0.30f) == FaceFraming::TooSmall,
++         "107 of 360 rows, minimum 0.30: too small");
++  expect(checkFaceFraming(260, 160, 290, 196, kW, kH, 0.30f) == FaceFraming::TooSmall,
++         "a face across the room (36 rows): too small");
++  expect(checkFaceFraming(150, 40, 400, 330, kW, kH, 0.30f) == FaceFraming::Ok,
++         "a face filling most of the frame, inside it: ok");
++  expect(checkFaceFraming(0, 0, 0, 0, kW, kH, 0.30f) == FaceFraming::TooSmall,
++         "empty box with a minimum: too small");
++  expect(checkFaceFraming(200, 100, 300, 250, 0, 0, 0.30f) == FaceFraming::TooSmall,
++         "empty frame with a minimum: too small");
++}
++
++void checkEdges() {
++  expect(checkFaceFraming(1, 1, kW - 1, kH - 1, kW, kH, 0.30f) == FaceFraming::Ok,
++         "one pixel inside every edge: ok");
++  expect(checkFaceFraming(0, 100, 150, 250, kW, kH, 0.30f) == FaceFraming::CutOff,
++         "touching the left edge: cut off");
++  expect(checkFaceFraming(200, 0, 350, 150, kW, kH, 0.30f) == FaceFraming::CutOff,
++         "touching the top edge: cut off");
++  expect(checkFaceFraming(410, 100, kW, 250, kW, kH, 0.30f) == FaceFraming::CutOff,
++         "touching the right edge: cut off");
++  expect(checkFaceFraming(200, 210, 350, kH, kW, kH, 0.30f) == FaceFraming::CutOff,
++         "touching the bottom edge: cut off");
++  expect(checkFaceFraming(0, 340, 20, kH, kW, kH, 0.30f) == FaceFraming::TooSmall,
++         "small and at the edge: reported as too small");
++}
++
++void checkNames() {
++  expect(std::string_view(biopass::faceFramingName(FaceFraming::Ok)) == "ok", "name: ok");
++  expect(std::string_view(biopass::faceFramingName(FaceFraming::TooSmall)) == "too small",
++         "name: too small");
++  expect(std::string_view(biopass::faceFramingName(FaceFraming::CutOff)) == "cut off",
++         "name: cut off");
++}
++
++}  // namespace
++
++int main() {
++  checkFraction();
++  checkNoMinimum();
++  checkSize();
++  checkEdges();
++  checkNames();
++
++  std::printf("%s\n", g_failures == 0 ? "All checks passed" : "Some checks FAILED");
++  return g_failures == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+

@@ -1,0 +1,188 @@
+From 5c82bb6b63216bff06aed8dcf7b37ca236289b86 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:20:31 +0000
+Subject: [PATCH] feat(helper): auth --verbose logs each step to stderr
+
+For trying face login from a terminal without turning on Debug Mode
+(which also saves pictures of failed faces): `biopass-helper auth
+--username <me> --verbose` logs at debug level to stderr (face found or
+not, its size, match scores) and keeps stdout silent.
+AuthConfig.verbose keeps AuthManager from turning logging off for the
+run, as it does without debug. The PAM module never passes it; without
+it nothing changes (stdout and stderr go to /dev/null).
+Test: auth_manager.
+---
+ auth/core/auth_manager.cc       |  2 +-
+ auth/core/auth_method.h         |  3 +++
+ auth/pam/helper.cc              | 27 ++++++++++++++++++++-------
+ auth/test/auth_manager/main.cpp | 27 +++++++++++++++++++++++++++
+ 4 files changed, 51 insertions(+), 8 deletions(-)
+
+diff --git a/auth/core/auth_manager.cc b/auth/core/auth_manager.cc
+index 2d2e7e8..3b9c023 100644
+--- a/auth/core/auth_manager.cc
++++ b/auth/core/auth_manager.cc
+@@ -176,7 +176,7 @@ AuthOutcome AuthManager::authenticate(const std::string& username) {
+     return AuthOutcome::Ignore;
+   }
+ 
+-  if (this->config_.debug) {
++  if (this->config_.debug || this->config_.verbose) {
+     spdlog::set_level(spdlog::level::debug);
+   } else {
+     spdlog::set_level(spdlog::level::off);
+diff --git a/auth/core/auth_method.h b/auth/core/auth_method.h
+index 231f322..5d9a3cf 100644
+--- a/auth/core/auth_method.h
++++ b/auth/core/auth_method.h
+@@ -9,6 +9,9 @@ enum AuthResult { Success, Failure, Retry, Unavailable };
+ 
+ struct AuthConfig {
+   bool debug = false;
++  // Log at debug level without what debug also does (saving failed faces):
++  // biopass-helper auth --verbose, run from a terminal.
++  bool verbose = false;
+ };
+ 
+ struct IAuthMethod {
+diff --git a/auth/pam/helper.cc b/auth/pam/helper.cc
+index 7f0072d..4353715 100644
+--- a/auth/pam/helper.cc
++++ b/auth/pam/helper.cc
+@@ -61,9 +61,14 @@ std::string todayDateString() {
+ // which may parse them as a line protocol (e.g. GNOME Shell's polkit agent
+ // reads polkit-agent-helper-1's output). Any stray line breaks its state
+ // machine and makes it retry auth in a tight loop (`pkexec id` hangs).
+-// Logs go only to a per-day file, and only in Debug Mode.
+-void setupBiopassLogger(const std::string& username, bool debug) {
++// Logs go only to a per-day file, and only in Debug Mode. `verbose` (auth
++// --verbose, run from a terminal, never by the PAM module) also logs to
++// stderr at debug level, without turning on Debug Mode.
++void setupBiopassLogger(const std::string& username, bool debug, bool verbose = false) {
+   std::vector<spdlog::sink_ptr> sinks;
++  if (verbose) {
++    sinks.push_back(std::make_shared<spdlog::sinks::stderr_sink_mt>());
++  }
+ 
+   const std::optional<biopass::UserPaths> user =
+       debug ? biopass::resolveUser(username) : std::nullopt;
+@@ -85,7 +90,7 @@ void setupBiopassLogger(const std::string& username, bool debug) {
+ 
+   auto logger = std::make_shared<spdlog::logger>("biopass", sinks.begin(), sinks.end());
+   spdlog::set_default_logger(logger);
+-  spdlog::set_level(debug ? spdlog::level::debug : spdlog::level::off);
++  spdlog::set_level(debug || verbose ? spdlog::level::debug : spdlog::level::off);
+ }
+ 
+ // An unseal running on its own thread (see unsealWithDeadline).
+@@ -317,7 +322,8 @@ int previewSession(const std::string& cameraPath, const std::string& modelPath,
+   return 0;
+ }
+ 
+-biopass::HelperExit authenticate(const std::string& username, const std::string& service) {
++biopass::HelperExit authenticate(const std::string& username, const std::string& service,
++                                 bool verbose) {
+   using biopass::HelperExit;
+   const char* pUsername = username.c_str();
+   // Counted from here so config and model loading come out of the budget too.
+@@ -335,10 +341,11 @@ biopass::HelperExit authenticate(const std::string& username, const std::string&
+     return HelperExit::Ignore;
+   }
+ 
+-  setupBiopassLogger(pUsername, config.strategy.debug);
++  setupBiopassLogger(pUsername, config.strategy.debug, verbose);
+ 
+   biopass::AuthConfig runtime_config;
+   runtime_config.debug = config.strategy.debug;
++  runtime_config.verbose = verbose;
+ 
+   biopass::AuthManager manager;
+   manager.setMode(config.strategy.execution_mode);
+@@ -402,6 +409,10 @@ int main(int argc, char** argv) {
+                        "Inherited fd for status lines relayed to the PAM conversation");
+   auth_cmd->add_option("--authtok-fd", authtokFd,
+                        "Inherited fd that receives the saved keyring password after a match");
++  bool verbose = false;
++  auth_cmd->add_flag("--verbose", verbose,
++                     "Log each step (face size, match scores) to stderr, for testing from a "
++                     "terminal; the PAM module never passes it");
+ 
+   try {
+     app.parse(argc, argv);
+@@ -433,7 +444,9 @@ int main(int argc, char** argv) {
+     const int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+     if (devnull >= 0) {
+       dup2(devnull, STDOUT_FILENO);
+-      dup2(devnull, STDERR_FILENO);
++      if (!verbose) {
++        dup2(devnull, STDERR_FILENO);
++      }
+       if (devnull > STDERR_FILENO) {
+         close(devnull);
+       }
+@@ -458,7 +471,7 @@ int main(int argc, char** argv) {
+     // An unexpected exception (config, model loading, thread start) would
+     // otherwise abort with a core dump. Fail closed with AuthErr instead.
+     try {
+-      const biopass::HelperExit result = authenticate(username, pamService);
++      const biopass::HelperExit result = authenticate(username, pamService, verbose);
+       if (result == biopass::HelperExit::Ok) {
+         // Its own try: a keyring problem must not turn a match into AuthErr.
+         bool finished = true;
+diff --git a/auth/test/auth_manager/main.cpp b/auth/test/auth_manager/main.cpp
+index 68ffd5a..c3e6373 100644
+--- a/auth/test/auth_manager/main.cpp
++++ b/auth/test/auth_manager/main.cpp
+@@ -8,8 +8,11 @@
+ #include <stdexcept>
+ #include <string>
+ #include <thread>
++#include <tuple>
+ #include <vector>
+ 
++#include <spdlog/spdlog.h>
++
+ #include "auth_manager.h"
+ 
+ namespace {
+@@ -306,6 +309,29 @@ void checkExceptions(ExecutionMode mode, const char* label) {
+   }
+ }
+ 
++// Debug or verbose (biopass-helper auth --verbose) log at debug level;
++// otherwise logging is off for the run.
++void checkLogLevel() {
++  for (const auto& [debug, verbose, level, what] :
++       std::vector<std::tuple<bool, bool, spdlog::level::level_enum, const char*>>{
++           {false, false, spdlog::level::off, "neither debug nor verbose: logging off"},
++           {true, false, spdlog::level::debug, "debug: debug level"},
++           {false, true, spdlog::level::debug, "verbose: debug level"},
++       }) {
++    std::vector<Calls> calls;
++    AuthManager manager;
++    setUp(manager, ExecutionMode::Sequential, {Spec{{AuthResult::Success}}}, calls);
++    biopass::AuthConfig config;
++    config.debug = debug;
++    config.verbose = verbose;
++    manager.setConfig(config);
++    spdlog::set_level(spdlog::level::info);
++    manager.authenticate("someone");
++    expect(spdlog::get_level() == level, what);
++  }
++  spdlog::set_level(spdlog::level::off);
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -320,6 +346,7 @@ int main() {
+   expect(calls[1].authenticate == 0, "sequential: stops after the first success");
+ 
+   checkTiming();
++  checkLogLevel();
+ 
+   if (g_failures != 0) {
+     std::printf("%d FAILED\n", g_failures);
+-- 
+2.43.0
+

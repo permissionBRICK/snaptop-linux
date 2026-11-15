@@ -1,0 +1,1170 @@
+From 31e7b81a1b4624278c84148d3fd44f1c32a8ec04 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:20:31 +0000
+Subject: [PATCH] feat(face): recognise on both the colour and the IR camera
+ (ir_recognition)
+
+With a colour and an IR camera, Biopass recognised with one of them and
+only checked that the IR camera saw some face, which a printed photo
+can pass.
+
+anti_spoofing.ir_recognition (default false): the IR camera recognises
+too, against faces enrolled for it in faces-ir/ (next to faces/, which
+the app lists and fills from the main camera). An attempt succeeds only
+when the main (colour) camera and the IR camera both match, on frames at
+most kBothCamerasMaxGap (2.5 s) apart, so matches from two moments or
+attempts are never combined. It replaces the IR presence check; the AI
+anti-spoofing model, when on, checks the colour frame. Faces must be
+enrolled for both cameras, else face is unavailable, and ir_recognition
+without an IR camera fails closed. When the IR camera is the main camera
+it recognises already and nothing changes.
+
+Cameras behind one capture pipeline stream one at a time: an attempt
+starts on the camera that is open, closes it once a face (framed as
+min_face_height asks) is found there and opens the other while the first
+face is matched. The second camera stays open, so the next attempt
+starts there and needs one switch, not two. Nothing falls back to one
+camera: when the colour camera sees no face (a dark room, a covered
+lens) the attempt fails.
+
+FaceAuth takes test seams (enrolled faces, detection, matching, clock)
+next to the camera opener; the debug log names the camera of each step.
+Tests: face_both_cameras, config_validation, config_golden.
+---
+ auth/CMakeLists.txt                        |   1 +
+ auth/core/auth_config.cc                   |  21 +-
+ auth/core/auth_config.h                    |  14 +-
+ auth/core/user_paths.h                     |   5 +-
+ auth/face/face_auth.cc                     | 312 ++++++++++++++---
+ auth/face/face_auth.h                      |  71 +++-
+ auth/test/config_golden/main.cpp           |   1 +
+ auth/test/config_validation/main.cpp       |  14 +-
+ auth/test/face_both_cameras/CMakeLists.txt |  15 +
+ auth/test/face_both_cameras/main.cpp       | 373 +++++++++++++++++++++
+ 10 files changed, 764 insertions(+), 63 deletions(-)
+ create mode 100644 auth/test/face_both_cameras/CMakeLists.txt
+ create mode 100644 auth/test/face_both_cameras/main.cpp
+
+diff --git a/auth/CMakeLists.txt b/auth/CMakeLists.txt
+index 78a255b..439cc8c 100644
+--- a/auth/CMakeLists.txt
++++ b/auth/CMakeLists.txt
+@@ -83,6 +83,7 @@ if(BUILD_TESTS)
+     add_subdirectory(test/face_match)
+     add_subdirectory(test/session_engine)
+     add_subdirectory(test/face_camera_reuse)
++    add_subdirectory(test/face_both_cameras)
+     add_subdirectory(test/pkexec_uid)
+     add_subdirectory(test/keyring_services)
+     add_subdirectory(test/authtok_channel)
+diff --git a/auth/core/auth_config.cc b/auth/core/auth_config.cc
+index 3775373..d9d0a5b 100644
+--- a/auth/core/auth_config.cc
++++ b/auth/core/auth_config.cc
+@@ -187,6 +187,8 @@ void parseAntiSpoofing(const YAML::Node& a, AntiSpoofingConfig& out) {
+   readOptionalString(a, "ir_camera", out.ir_camera);
+   readIf(a, "ir_warmup_delay_ms", out.ir_warmup_delay_ms);
+   readIf(a, "ir_presence_timeout_ms", out.ir_presence_timeout_ms);
++  // Strict: a typo must reject the config, never read as false.
++  readStrictBool(a, "ir_recognition", out.ir_recognition);
+ }
+ 
+ // A list of {camera, ir_camera, allow_without_ir} maps; null is no profiles, as in the app.
+@@ -336,13 +338,18 @@ bool hasImageExtension(const std::string& name) {
+   return ext == "jpg" || ext == "jpeg" || ext == "png";
+ }
+ 
+-std::vector<std::string> listFaces(const std::string& username) {
++namespace {
++
++// Image files in one of the user's face dirs (dir_of: a UserPaths member),
++// sorted.
++std::vector<std::string> listFacesIn(const std::string& username,
++                                     std::string (UserPaths::*dir_of)() const) {
+   std::vector<std::string> faces;
+   const std::optional<UserPaths> user = resolveUser(username);
+   if (!user) {
+     return faces;
+   }
+-  const std::string dir = user->facesDir();
++  const std::string dir = ((*user).*dir_of)();
+   // The dir is the user's: list it as the user. Callers read each file with
+   // readUserFile(), which skips anything that isn't a regular file.
+   ScopedFsUser as_user(user->uid, user->gid);
+@@ -364,6 +371,16 @@ std::vector<std::string> listFaces(const std::string& username) {
+   return faces;
+ }
+ 
++}  // namespace
++
++std::vector<std::string> listFaces(const std::string& username) {
++  return listFacesIn(username, &UserPaths::facesDir);
++}
++
++std::vector<std::string> listIrFaces(const std::string& username) {
++  return listFacesIn(username, &UserPaths::irFacesDir);
++}
++
+ int setupDataDirs(const std::string& dataDir) {
+   if (dataDir.empty()) {
+     return 1;
+diff --git a/auth/core/auth_config.h b/auth/core/auth_config.h
+index 972eca9..497258b 100644
+--- a/auth/core/auth_config.h
++++ b/auth/core/auth_config.h
+@@ -39,7 +39,8 @@ struct DetectionConfig {
+   // The face box's minimum height as a fraction of the frame height, and the
+   // whole box inside the frame (face/common/face_framing.h): only someone
+   // sitting in front of the camera is matched, not a face across the room or
+-  // at the frame's edge. 0 = no check (as before).
++  // at the frame's edge. 0 = no check (as before). Applies to every camera
++  // that recognises (the main camera, and the IR camera with ir_recognition).
+   float min_face_height = 0.0f;
+ };
+ 
+@@ -65,6 +66,13 @@ struct AntiSpoofingConfig {
+   // Retry budget for the IR presence check: the emitter blinks, so single
+   // frames may be all-white or all-dark. 0 = single attempt.
+   int ir_presence_timeout_ms = 1500;
++  // The IR camera recognises the face too, against the faces enrolled for it
++  // (faces-ir/, see listIrFaces): an attempt succeeds only when both the main
++  // and the IR camera match, captured at most kBothCamerasMaxGap apart
++  // (face_auth.h). Replaces the IR presence check. Needs an IR camera other
++  // than the main camera; when the IR camera is the main camera it already
++  // recognises and this changes nothing.
++  bool ir_recognition = false;
+ };
+ 
+ // One colour + IR camera pair in `camera_profiles` (see camera_profile.h).
+@@ -162,6 +170,10 @@ std::optional<BiopassConfig> readConfig(const std::string& username);
+ bool hasImageExtension(const std::string& name);
+ // Image files in the user's faces/ dir, sorted. Empty for an unknown user.
+ std::vector<std::string> listFaces(const std::string& username);
++// The same for faces-ir/: the faces enrolled with the IR camera when it is
++// not the main camera (anti_spoofing.ir_recognition). The app neither lists
++// nor fills it.
++std::vector<std::string> listIrFaces(const std::string& username);
+ // Creates faces/, debugs/ and logs/ (0700) under a data dir (see
+ // UserPaths::data_dir). Callers that run as root must hold a ScopedFsUser for
+ // the owner first, so a symlink in that dir can't make root create anything
+diff --git a/auth/core/user_paths.h b/auth/core/user_paths.h
+index 6bcee74..d50bd3b 100644
+--- a/auth/core/user_paths.h
++++ b/auth/core/user_paths.h
+@@ -14,12 +14,15 @@ struct UserPaths {
+   std::string home;
+   // <home>/.config/com.ticklab.biopass: config.yaml and biopass.db.
+   std::string config_dir;
+-  // <home>/.local/share/com.ticklab.biopass: faces/, debugs/ and logs/.
++  // <home>/.local/share/com.ticklab.biopass: faces/, faces-ir/, debugs/ and
++  // logs/.
+   std::string data_dir;
+ 
+   std::string configFile() const { return config_dir + "/config.yaml"; }
+   std::string dbFile() const { return config_dir + "/biopass.db"; }
+   std::string facesDir() const { return data_dir + "/faces"; }
++  // Faces enrolled with the IR camera when it is not the main camera.
++  std::string irFacesDir() const { return data_dir + "/faces-ir"; }
+   std::string debugsDir() const { return data_dir + "/debugs"; }
+   std::string logsDir() const { return data_dir + "/logs"; }
+ };
+diff --git a/auth/face/face_auth.cc b/auth/face/face_auth.cc
+index 8f661cd..b88c4b2 100644
+--- a/auth/face/face_auth.cc
++++ b/auth/face/face_auth.cc
+@@ -4,7 +4,9 @@
+ #include <sys/stat.h>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <exception>
++#include <future>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -58,6 +60,14 @@ bool sameCameraDevice(const std::string& a, const std::string& b) {
+          S_ISCHR(sb.st_mode) && sa.st_rdev == sb.st_rdev;
+ }
+ 
++// For logs: in both-cameras mode the main camera is the colour camera.
++const char* cameraName(bool both, bool ir) {
++  if (ir) {
++    return "IR camera";
++  }
++  return both ? "colour camera" : "camera";
++}
++
+ }  // namespace
+ 
+ bool FaceAuth::irIsMainCamera() const {
+@@ -67,11 +77,22 @@ bool FaceAuth::irIsMainCamera() const {
+          sameCameraDevice(*camera, *ir_camera);
+ }
+ 
++bool FaceAuth::bothCameras() const {
++  return face_config_.anti_spoofing.ir_recognition && !irIsMainCamera();
++}
++
++std::chrono::steady_clock::time_point FaceAuth::now() const {
++  return seams_.now ? seams_.now() : std::chrono::steady_clock::now();
++}
++
+ // An IR main camera may offer only NV12/YUYV, which a colour request would not
+ // treat as grey; ask for grey so every capture warms up and keeps the
+ // brightest of several frames. The colour timeout still bounds the capture.
+-std::unique_ptr<ICameraCaptureSession> FaceAuth::openMainCamera() const {
+-  ir_camera_session_.reset();
++std::unique_ptr<ICameraCaptureSession> FaceAuth::openSession(Camera which) const {
++  if (which == Camera::Ir) {
++    return open_camera_(face_config_.anti_spoofing.ir_camera, CameraCaptureFormat::V4L2Grey,
++                        kIrCaptureWarmupFrames, kIrCaptureTimeoutMs);
++  }
+   if (irIsMainCamera()) {
+     return open_camera_(face_config_.camera, CameraCaptureFormat::V4L2Grey, kIrCaptureWarmupFrames,
+                         kColorCaptureTimeoutMs);
+@@ -80,6 +101,15 @@ std::unique_ptr<ICameraCaptureSession> FaceAuth::openMainCamera() const {
+                       kColorCaptureTimeoutMs);
+ }
+ 
++std::unique_ptr<ICameraCaptureSession>& FaceAuth::sessionSlot(Camera which) {
++  return which == Camera::Ir ? ir_camera_session_ : camera_session_;
++}
++
++std::unique_ptr<ICameraCaptureSession> FaceAuth::openMainCamera() const {
++  ir_camera_session_.reset();
++  return openSession(Camera::Main);
++}
++
+ // The session opened to check is kept: beginAuthenticationSession() and the
+ // attempts capture from it rather than closing the camera and opening it again.
+ bool FaceAuth::isAvailable() const {
+@@ -123,7 +153,7 @@ ICameraCaptureSession* FaceAuth::irPresenceSession() {
+ }
+ 
+ bool FaceAuth::ensureModelsLoaded() {
+-  if (detector_ && recognizer_) {
++  if ((detector_ && recognizer_) || (seams_.detect && seams_.match)) {
+     return true;
+   }
+ 
+@@ -206,6 +236,9 @@ AuthResult FaceAuth::authenticate(const std::string& username, const AuthConfig&
+ 
+ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& config,
+                              std::atomic<bool>* cancel_signal) {
++  if (bothCameras()) {
++    return attemptBothCameras(username, config, cancel_signal);
++  }
+   if (!camera_session_) {
+     camera_session_ = openMainCamera();
+   }
+@@ -223,8 +256,8 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+     return AuthResult::Retry;
+   }
+ 
+-  std::vector<std::string> enrolledFaces = biopass::listFaces(username);
+-  if (enrolledFaces.empty()) {
++  const std::vector<std::string> enrolled = enrolledFaces(username, FaceSet::Main);
++  if (enrolled.empty()) {
+     spdlog::error("FaceAuth: No face enrolled for user {}, skipping", username);
+     return AuthResult::Unavailable;
+   }
+@@ -246,46 +279,11 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+     reportInfo("Biopass: looking for your face...");
+   }
+ 
+-  ImageRGB loginFace = camera_session_->capture();
+-  if (loginFace.empty()) {
+-    spdlog::error("FaceAuth: Could not read frame");
+-    camera_session_.reset();
+-    return AuthResult::Retry;
+-  }
+-  frames_captured_++;
+-
+-  std::vector<Detection> detectedImages = detector_->inference(loginFace);
+-  if (detectedImages.empty()) {
+-    // Detection always runs first, so the darkness check can only change the
+-    // failure message, never reject a frame that has a usable face.
+-    const LumaStats luma = measureLuma(loginFace);
+-    if (looksCovered(luma)) {
+-      covered_frames_++;
+-    }
+-    spdlog::error("FaceAuth: No face detected | luma mean={:.1f} stddev={:.1f}", luma.mean,
+-                  luma.stddev);
++  const std::optional<Sighting> seen = lookForFace(camera_session_, cameraName(false, false));
++  if (!seen) {
+     return AuthResult::Retry;
+   }
+-
+-  // Detections come largest first. A face across the room or cut off by the
+-  // frame's edge is not matched (detection.min_face_height).
+-  const Box& box = detectedImages[0].box;
+-  const float min_height = face_config_.detection.min_face_height;
+-  const FaceFraming framing = checkFaceFraming(box.x1, box.y1, box.x2, box.y2, loginFace.width,
+-                                               loginFace.height, min_height);
+-  spdlog::debug(
+-      "FaceAuth: Face on the camera | {}x{} px at ({},{}) in {}x{}, height {:.2f} of the frame (min "
+-      "{:.2f}), conf {:.2f}: {}",
+-      box.x2 - box.x1, box.y2 - box.y1, box.x1, box.y1, loginFace.width, loginFace.height,
+-      faceHeightFraction(box.y1, box.y2, loginFace.height), min_height, detectedImages[0].conf,
+-      faceFramingName(framing));
+-  if (framing != FaceFraming::Ok) {
+-    spdlog::error("FaceAuth: Face on the camera {}: not in front of the camera",
+-                  faceFramingName(framing));
+-    return AuthResult::Retry;
+-  }
+-
+-  ImageRGB face = detectedImages[0].image;
++  const ImageRGB& face = seen->face.image;
+ 
+   // The capture may have run past a sibling's success or the time budget;
+   // don't open the IR camera or match faces for a run that is over.
+@@ -293,9 +291,9 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+     return AuthResult::Failure;
+   }
+ 
+-  if (!checkAntiSpoof(face_config_, username, loginFace, detectedImages[0].box, config,
+-                      model_registry_, antispoof_model_, detector_.get(), irPresenceSession(),
+-                      cancel_signal, irIsMainCamera())) {
++  if (!checkAntiSpoof(face_config_, username, seen->frame, seen->face.box, config, model_registry_,
++                      antispoof_model_, detector_.get(), irPresenceSession(), cancel_signal,
++                      irIsMainCamera())) {
+     spdlog::warn("FaceAuth: Anti-spoofing failed — returning Failure (no retry allowed)");
+     // Always tear down the IR session so a subsequent call cannot reuse a
+     // partially-warmed camera to bypass the check; when the IR camera is the
+@@ -307,7 +305,7 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+     return AuthResult::Failure;
+   }
+ 
+-  if (matchAgainstEnrolled(username, face, enrolledFaces)) {
++  if (matchFace(username, face, FaceSet::Main, enrolled)) {
+     return AuthResult::Success;
+   }
+ 
+@@ -318,10 +316,218 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+   return AuthResult::Retry;
+ }
+ 
++// Both cameras stream only one at a time (see irPresenceSession), so the
++// attempt is sequential: the camera that is open captures first (the last
++// attempt's second camera stays open, so a face it sees needs one switch,
++// not two); once a face is found there, that camera closes and the other
++// opens while the first face is matched; a match there too, on a frame at
++// most kBothCamerasMaxGap after the first, is a success. Nothing falls back
++// to one camera: a camera that sees no face (no light for the colour camera,
++// a covered lens) fails the attempt.
++AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthConfig& config,
++                                        std::atomic<bool>* cancel_signal) {
++  const auto& ir_camera = face_config_.anti_spoofing.ir_camera;
++  if (!ir_camera || ir_camera->empty()) {
++    spdlog::error("FaceAuth: ir_recognition is on but no IR camera is set, face is refused");
++    return AuthResult::Unavailable;
++  }
++  const std::vector<std::string> main_faces = enrolledFaces(username, FaceSet::Main);
++  const std::vector<std::string> ir_faces = enrolledFaces(username, FaceSet::Ir);
++  if (main_faces.empty() || ir_faces.empty()) {
++    spdlog::error(
++        "FaceAuth: Both cameras must recognise user {}: {} face(s) enrolled for the colour camera "
++        "(faces/), {} for the IR camera (faces-ir/), skipping",
++        username, main_faces.size(), ir_faces.size());
++    return AuthResult::Unavailable;
++  }
++
++  if (!ensureModelsLoaded()) {
++    spdlog::error("FaceAuth: Models not available for user {}, skipping", username);
++    return AuthResult::Unavailable;
++  }
++
++  cancel_signal_ = cancel_signal;
++  if (cancel_signal && cancel_signal->load()) {
++    return AuthResult::Failure;
++  }
++
++  const Camera first =
++      ir_camera_session_ && ir_camera_session_->isOpen() ? Camera::Ir : Camera::Main;
++  const Camera second = first == Camera::Ir ? Camera::Main : Camera::Ir;
++  const auto name = [](Camera which) { return cameraName(true, which == Camera::Ir); };
++  const auto setOf = [](Camera which) {
++    return which == Camera::Ir ? FaceSet::Ir : FaceSet::Main;
++  };
++  const auto facesOf = [&](Camera which) -> const std::vector<std::string>& {
++    return which == Camera::Ir ? ir_faces : main_faces;
++  };
++
++  std::unique_ptr<ICameraCaptureSession>& first_slot = sessionSlot(first);
++  if (!first_slot || !first_slot->isOpen()) {
++    // Only the main camera gets here (the IR camera is first only when open).
++    // Never two sessions at once: free both before opening.
++    ir_camera_session_.reset();
++    camera_session_.reset();
++    first_slot = openSession(first);
++    if (!first_slot || !first_slot->isOpen()) {
++      spdlog::error("FaceAuth: Could not open the {}", name(first));
++      first_slot.reset();
++      return AuthResult::Retry;
++    }
++  }
++
++  if (!scan_announced_) {
++    scan_announced_ = true;
++    reportInfo("Biopass: looking for your face...");
++  }
++
++  const std::optional<Sighting> first_seen = lookForFace(first_slot, name(first));
++  if (!first_seen) {
++    return AuthResult::Retry;
++  }
++  if (cancel_signal && cancel_signal->load()) {
++    return AuthResult::Failure;
++  }
++
++  // Switch cameras now: the other one opens on its own thread while this one
++  // checks the first face. openSession() touches no member but the opener;
++  // the session is stored here once it is open.
++  first_slot.reset();
++  std::future<std::unique_ptr<ICameraCaptureSession>> opening =
++      std::async(std::launch::async, [this, second] { return openSession(second); });
++  const bool first_spoof =
++      first == Camera::Main && !aiAntiSpoofPasses(username, *first_seen, config, cancel_signal);
++  const bool first_match = !first_spoof && matchFace(username, first_seen->face.image,
++                                                     setOf(first), facesOf(first));
++  std::unique_ptr<ICameraCaptureSession>& second_slot = sessionSlot(second);
++  second_slot = opening.get();
++
++  if (first_spoof) {
++    spdlog::warn("FaceAuth: Anti-spoofing failed on the {} — returning Failure", name(first));
++    second_slot.reset();
++    return AuthResult::Failure;
++  }
++  if (!first_match) {
++    if (config.debug) {
++      saveFailedFace(username, first_seen->face.image, "not_similar");
++    }
++    // The other camera is open now: the next attempt starts there.
++    return AuthResult::Retry;
++  }
++  if (cancel_signal && cancel_signal->load()) {
++    return AuthResult::Failure;
++  }
++  if (!second_slot || !second_slot->isOpen()) {
++    spdlog::error("FaceAuth: Could not open the {}", name(second));
++    second_slot.reset();
++    return AuthResult::Retry;
++  }
++
++  const std::optional<Sighting> second_seen = lookForFace(second_slot, name(second));
++  if (!second_seen) {
++    return AuthResult::Retry;
++  }
++  const auto gap = second_seen->at - first_seen->at;
++  const long long gap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(gap).count();
++  if (gap > kBothCamerasMaxGap) {
++    spdlog::error("FaceAuth: The {} frame came {} ms after the {} frame (at most {} ms), not "
++                  "one moment",
++                  name(second), gap_ms, name(first), kBothCamerasMaxGap.count());
++    return AuthResult::Retry;
++  }
++  if (cancel_signal && cancel_signal->load()) {
++    return AuthResult::Failure;
++  }
++  if (second == Camera::Main && !aiAntiSpoofPasses(username, *second_seen, config, cancel_signal)) {
++    spdlog::warn("FaceAuth: Anti-spoofing failed on the {} — returning Failure", name(second));
++    second_slot.reset();
++    return AuthResult::Failure;
++  }
++  if (!matchFace(username, second_seen->face.image, setOf(second), facesOf(second))) {
++    if (config.debug) {
++      saveFailedFace(username, second_seen->face.image, "not_similar");
++    }
++    return AuthResult::Retry;
++  }
++  spdlog::debug("FaceAuth: Recognised on both cameras, {} ms apart", gap_ms);
++  return AuthResult::Success;
++}
++
++std::optional<FaceAuth::Sighting> FaceAuth::lookForFace(
++    std::unique_ptr<ICameraCaptureSession>& slot, const char* camera_name) {
++  ImageRGB frame = slot->capture();
++  const auto at = now();
++  if (frame.empty()) {
++    spdlog::error("FaceAuth: Could not read frame from the {}", camera_name);
++    slot.reset();
++    return std::nullopt;
++  }
++  frames_captured_++;
++
++  std::vector<Detection> faces = seams_.detect ? seams_.detect(frame) : detector_->inference(frame);
++  if (faces.empty()) {
++    // Detection always runs first, so the darkness check can only change the
++    // failure message, never reject a frame that has a usable face.
++    const LumaStats luma = measureLuma(frame);
++    if (looksCovered(luma)) {
++      covered_frames_++;
++    }
++    spdlog::error("FaceAuth: No face detected on the {} | luma mean={:.1f} stddev={:.1f}",
++                  camera_name, luma.mean, luma.stddev);
++    return std::nullopt;
++  }
++
++  // Detections come largest first.
++  const Box& box = faces[0].box;
++  const float min_height = face_config_.detection.min_face_height;
++  const FaceFraming framing =
++      checkFaceFraming(box.x1, box.y1, box.x2, box.y2, frame.width, frame.height, min_height);
++  spdlog::debug(
++      "FaceAuth: Face on the {} | {}x{} px at ({},{}) in {}x{}, height {:.2f} of the frame (min "
++      "{:.2f}), conf {:.2f}: {}",
++      camera_name, box.x2 - box.x1, box.y2 - box.y1, box.x1, box.y1, frame.width, frame.height,
++      faceHeightFraction(box.y1, box.y2, frame.height), min_height, faces[0].conf,
++      faceFramingName(framing));
++  if (framing != FaceFraming::Ok) {
++    spdlog::error("FaceAuth: Face on the {} {}: not in front of the camera", camera_name,
++                  faceFramingName(framing));
++    return std::nullopt;
++  }
++  return Sighting{std::move(frame), faces[0], at};
++}
++
++std::vector<std::string> FaceAuth::enrolledFaces(const std::string& username, FaceSet set) const {
++  if (seams_.enrolled) {
++    return seams_.enrolled(set);
++  }
++  return set == FaceSet::Ir ? listIrFaces(username) : listFaces(username);
++}
++
++bool FaceAuth::matchFace(const std::string& username, const ImageRGB& face, FaceSet set,
++                         const std::vector<std::string>& enrolled_paths) {
++  if (seams_.match) {
++    return seams_.match(face, set, enrolled_paths);
++  }
++  return matchAgainstEnrolled(username, face, enrolled_paths,
++                              cameraName(bothCameras(), set == FaceSet::Ir));
++}
++
++bool FaceAuth::aiAntiSpoofPasses(const std::string& username, const Sighting& seen,
++                                 const AuthConfig& config, std::atomic<bool>* cancel_signal) {
++  if (!face_config_.anti_spoofing.enable) {
++    return true;
++  }
++  FaceMethodConfig ai_only = face_config_;
++  ai_only.anti_spoofing.ir_camera.reset();
++  return checkAntiSpoof(ai_only, username, seen.frame, seen.face.box, config, model_registry_,
++                        antispoof_model_, detector_.get(), nullptr, cancel_signal, false);
++}
++
+ // Unreadable enrolled images are skipped, never matched.
+ bool FaceAuth::matchAgainstEnrolled(const std::string& username, const ImageRGB& face,
+-                                    const std::vector<std::string>& enrolled_paths) {
+-  spdlog::debug("FaceAuth: Recognition | threshold={:.3f} enrolled_count={}",
++                                    const std::vector<std::string>& enrolled_paths,
++                                    const char* camera_name) {
++  spdlog::debug("FaceAuth: Recognition on the {} | threshold={:.3f} enrolled_count={}", camera_name,
+                 face_config_.recognition.threshold, enrolled_paths.size());
+   float best = -1.0f;
+   for (const auto& facePath : enrolled_paths) {
+@@ -337,13 +543,13 @@ bool FaceAuth::matchAgainstEnrolled(const std::string& username, const ImageRGB&
+     spdlog::debug("FaceAuth: Recognition | face='{}' score={:.4f} threshold={:.3f} similar={}",
+                   facePath, match.similarity, face_config_.recognition.threshold, match.similar);
+     if (match.similar) {
+-      spdlog::debug("FaceAuth: Recognition PASSED | matched face='{}' score={:.4f}", facePath,
+-                    match.similarity);
++      spdlog::debug("FaceAuth: Recognition PASSED on the {} | matched face='{}' score={:.4f}",
++                    camera_name, facePath, match.similarity);
+       return true;
+     }
+   }
+-  spdlog::debug("FaceAuth: Recognition FAILED | best score={:.4f} threshold={:.3f}", best,
+-                face_config_.recognition.threshold);
++  spdlog::debug("FaceAuth: Recognition FAILED on the {} | best score={:.4f} threshold={:.3f}",
++                camera_name, best, face_config_.recognition.threshold);
+   return false;
+ }
+ 
+diff --git a/auth/face/face_auth.h b/auth/face/face_auth.h
+index 3428907..7104034 100644
+--- a/auth/face/face_auth.h
++++ b/auth/face/face_auth.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <chrono>
+ #include <functional>
+ #include <memory>
+ #include <optional>
+@@ -18,6 +19,13 @@
+ 
+ namespace biopass {
+ 
++// With anti_spoofing.ir_recognition, the most time between the frames the two
++// cameras matched in one attempt: both must show the face at (nearly) the
++// same moment, so a match on one camera can't be combined with one from
++// another moment or attempt. Covers closing one camera and opening the other
++// (about a second on a laptop with both behind one capture pipeline).
++inline constexpr std::chrono::milliseconds kBothCamerasMaxGap{2500};
++
+ class FaceAuth : public IAuthMethod {
+  public:
+   // Opens a camera session; same arguments as openCameraSession(). Used for
+@@ -26,15 +34,32 @@ class FaceAuth : public IAuthMethod {
+       const std::optional<std::string>& device_path, CameraCaptureFormat format, int warmup_frames,
+       int capture_timeout_ms)>;
+ 
++  // Which camera's enrolled faces: faces/ (the main camera) or faces-ir/
++  // (the IR camera, with ir_recognition).
++  enum class FaceSet { Main, Ir };
++
++  // Test seams; each one left empty is the real thing: the user's enrolled
++  // faces (listFaces/listIrFaces), the user's detection model, matching
++  // against the enrolled images with the user's recognition model, and the
++  // steady clock. With detect and match set, no model is loaded.
++  struct Seams {
++    std::function<std::vector<std::string>(FaceSet)> enrolled;
++    std::function<std::vector<Detection>(const ImageRGB&)> detect;
++    std::function<bool(const ImageRGB& face, FaceSet set, const std::vector<std::string>& enrolled)>
++        match;
++    std::function<std::chrono::steady_clock::time_point()> now;
++  };
++
+   // One sqlite connection per auth session, reused for every model_id lookup.
+   // open_camera: openCameraSession() unless a test passes a fake.
+   // The camera profile is picked once here, for this helper run.
+   FaceAuth(const FaceMethodConfig& config, const std::string& username,
+-           CameraOpener open_camera = nullptr)
++           CameraOpener open_camera = nullptr, Seams seams = {})
+       : face_config_(withCameraProfile(config)),
+         username_(username),
+         model_registry_(username),
+-        open_camera_(open_camera ? std::move(open_camera) : CameraOpener(openCameraSession)) {}
++        open_camera_(open_camera ? std::move(open_camera) : CameraOpener(openCameraSession)),
++        seams_(std::move(seams)) {}
+   ~FaceAuth() override = default;
+ 
+   std::string name() const override { return "Face"; }
+@@ -54,26 +79,66 @@ class FaceAuth : public IAuthMethod {
+   // stream together, and USB cameras share the bus). Public for tests.
+   ICameraCaptureSession* irPresenceSession();
+ 
++  // True when both cameras must recognise the face (ir_recognition with an
++  // IR camera other than the main camera, or none: then face fails closed).
++  bool bothCameras() const;
++
+  private:
++  enum class Camera { Main, Ir };
++
++  // A face found in a captured frame, framed as someone in front of the
++  // camera, and when the frame arrived.
++  struct Sighting {
++    ImageRGB frame;
++    Detection face;
++    std::chrono::steady_clock::time_point at;
++  };
++
+   // One attempt; authenticate() wraps it so nothing it throws escapes.
+   AuthResult attempt(const std::string& username, const AuthConfig& config,
+                      std::atomic<bool>* cancel_signal);
++  // One attempt with ir_recognition: a match on the camera that is open, then
++  // on the other one, within kBothCamerasMaxGap.
++  AuthResult attemptBothCameras(const std::string& username, const AuthConfig& config,
++                                std::atomic<bool>* cancel_signal);
+   // True when ir_camera names the same device as camera.
+   bool irIsMainCamera() const;
+   // The main camera; opened as grey when it is the IR camera. Closes the IR
+   // session first.
+   std::unique_ptr<ICameraCaptureSession> openMainCamera() const;
++  // A new session on `which` (main: as openMainCamera() opens it, IR: grey
++  // with the IR timeout). Touches no member but the opener, so it can run on
++  // another thread while this one matches a face.
++  std::unique_ptr<ICameraCaptureSession> openSession(Camera which) const;
++  std::unique_ptr<ICameraCaptureSession>& sessionSlot(Camera which);
++  // Captures from `session` and finds the largest face; nullopt (logged)
++  // when the capture fails (the session in `slot` is dropped), there is no
++  // face, or it is not framed as someone in front of the camera
++  // (detection.min_face_height).
++  std::optional<Sighting> lookForFace(std::unique_ptr<ICameraCaptureSession>& slot,
++                                      const char* camera_name);
+   // Loads detection + recognition once; false if either fails to load.
+   bool ensureModelsLoaded();
++  std::vector<std::string> enrolledFaces(const std::string& username, FaceSet set) const;
++  // True once `face` matches one of the enrolled images of `set`.
++  bool matchFace(const std::string& username, const ImageRGB& face, FaceSet set,
++                 const std::vector<std::string>& enrolled_paths);
+   // True once `face` matches one of the user's enrolled images.
+   bool matchAgainstEnrolled(const std::string& username, const ImageRGB& face,
+-                            const std::vector<std::string>& enrolled_paths);
++                            const std::vector<std::string>& enrolled_paths,
++                            const char* camera_name);
++  // Biopass's AI anti-spoofing model on a colour frame, when it is on; the
++  // IR presence check is not run (ir_recognition replaces it).
++  bool aiAntiSpoofPasses(const std::string& username, const Sighting& seen,
++                         const AuthConfig& config, std::atomic<bool>* cancel_signal);
++  std::chrono::steady_clock::time_point now() const;
+ 
+   FaceMethodConfig face_config_;
+   // Owner of the registry and model files, which are read as this user.
+   std::string username_;
+   ModelRegistry model_registry_;
+   CameraOpener open_camera_;
++  Seams seams_;
+   // Opened by isAvailable() (hence mutable) and kept for the auth session.
+   mutable std::unique_ptr<ICameraCaptureSession> camera_session_;
+   // Closed by openMainCamera() (hence mutable) before the main camera opens.
+diff --git a/auth/test/config_golden/main.cpp b/auth/test/config_golden/main.cpp
+index 8e99f59..e9f1cde 100644
+--- a/auth/test/config_golden/main.cpp
++++ b/auth/test/config_golden/main.cpp
+@@ -69,6 +69,7 @@ void expectSameConfig(const BiopassConfig& a, const BiopassConfig& b, const std:
+   field(aa.ir_warmup_delay_ms == ab.ir_warmup_delay_ms, "anti_spoofing.ir_warmup_delay_ms");
+   field(aa.ir_presence_timeout_ms == ab.ir_presence_timeout_ms,
+         "anti_spoofing.ir_presence_timeout_ms");
++  field(aa.ir_recognition == ab.ir_recognition, "anti_spoofing.ir_recognition");
+ 
+   const auto& pa = a.methods.fingerprint;
+   const auto& pb = b.methods.fingerprint;
+diff --git a/auth/test/config_validation/main.cpp b/auth/test/config_validation/main.cpp
+index 7fdc0fe..fd318b4 100644
+--- a/auth/test/config_validation/main.cpp
++++ b/auth/test/config_validation/main.cpp
+@@ -95,6 +95,7 @@ methods:
+       ir_camera: /dev/video2
+       ir_warmup_delay_ms: 100
+       ir_presence_timeout_ms: 200
++      ir_recognition: true
+   fingerprint:
+     enable: true
+     retries: 2
+@@ -120,7 +121,7 @@ void checkParse() {
+                f.anti_spoofing.model.threshold == 0.9f &&
+                f.anti_spoofing.ir_camera == "/dev/video2" &&
+                f.anti_spoofing.ir_warmup_delay_ms == 100 &&
+-               f.anti_spoofing.ir_presence_timeout_ms == 200,
++               f.anti_spoofing.ir_presence_timeout_ms == 200 && f.anti_spoofing.ir_recognition,
+            "parse: anti_spoofing read");
+     const auto& p = f.camera_profiles;
+     expect(p.size() == 3 && p[0].camera == "/dev/v4l/by-id/usb-Dock-video-index0" &&
+@@ -165,6 +166,12 @@ void checkParse() {
+             "schema_version: 2\nmethods:\n  face: {camera_profiles: [{allow_without_ir: ~}]}\n"},
+            {"camera_profiles camera not a string",
+             "schema_version: 2\nmethods:\n  face: {camera_profiles: [{camera: [1]}]}\n"},
++           {"anti_spoofing.ir_recognition: yes",
++            "schema_version: 2\nmethods:\n  face: {anti_spoofing: {ir_recognition: yes}}\n"},
++           {"anti_spoofing.ir_recognition: 'true' (a string)",
++            "schema_version: 2\nmethods:\n  face: {anti_spoofing: {ir_recognition: 'true'}}\n"},
++           {"anti_spoofing.ir_recognition: ~",
++            "schema_version: 2\nmethods:\n  face: {anti_spoofing: {ir_recognition: ~}}\n"},
+            {"detection.min_face_height not a number",
+             "schema_version: 2\nmethods:\n  face: {detection: {min_face_height: big}}\n"},
+            {"YAML syntax error", "schema_version: 2\nstrategy: {debug: true\n"},
+@@ -195,8 +202,9 @@ void checkParse() {
+ 
+   {
+     const BiopassConfig c = parseOrDie("schema_version: 2\nmethods:\n  face: {enable: true}\n");
+-    expect(c.methods.face.enable && c.methods.face.detection.min_face_height == 0.0f,
+-           "parse: missing min_face_height -> 0 (no check)");
++    expect(c.methods.face.enable && c.methods.face.detection.min_face_height == 0.0f &&
++               !c.methods.face.anti_spoofing.ir_recognition,
++           "parse: missing min_face_height and ir_recognition -> 0 (no check) and off");
+   }
+ 
+   {
+diff --git a/auth/test/face_both_cameras/CMakeLists.txt b/auth/test/face_both_cameras/CMakeLists.txt
+new file mode 100644
+index 0000000..5a67d32
+--- /dev/null
++++ b/auth/test/face_both_cameras/CMakeLists.txt
+@@ -0,0 +1,15 @@
++set(FACE_BOTH_CAMERAS_TEST face_both_cameras_test)
++
++add_executable(${FACE_BOTH_CAMERAS_TEST} main.cpp)
++
++target_link_libraries(${FACE_BOTH_CAMERAS_TEST} PRIVATE
++    biopass_face
++    biopass_onnx
++)
++
++add_test(NAME face_both_cameras COMMAND ${FACE_BOTH_CAMERAS_TEST})
++# biopass_face pulls in the bundled libcamera.so, which needs
++# libcamera-base.so (see test/capture_policy).
++set_tests_properties(face_both_cameras PROPERTIES
++    ENVIRONMENT "LD_LIBRARY_PATH=${LIBCAMERA_SODIR}"
++)
+diff --git a/auth/test/face_both_cameras/main.cpp b/auth/test/face_both_cameras/main.cpp
+new file mode 100644
+index 0000000..388d0ce
+--- /dev/null
++++ b/auth/test/face_both_cameras/main.cpp
+@@ -0,0 +1,373 @@
++// FaceAuth with anti_spoofing.ir_recognition (face/face_auth.h): the face
++// must be recognised on both the main (colour) camera and the IR camera,
++// each against its own enrolled faces, on frames at most kBothCamerasMaxGap
++// apart. Only one camera streams at a time: an attempt starts on the camera
++// that is open, switches once a face is found there, and leaves the other
++// camera open for the next attempt. Nothing falls back to one camera. And
++// detection.min_face_height: a face that is too small or cut off is never
++// matched, on either camera.
++// Fake cameras, detector, matcher and clock: no camera or model needed.
++// Exits non-zero on any failure.
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <deque>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "camera_capture.h"
++#include "face_auth.h"
++
++namespace {
++
++using biopass::AuthResult;
++using biopass::FaceAuth;
++using Clock = std::chrono::steady_clock;
++using std::chrono::milliseconds;
++
++int g_failures = 0;
++
++void expect(bool cond, const std::string& what) {
++  std::printf("[%s] %s\n", cond ? "PASS" : "FAIL", what.c_str());
++  if (!cond) {
++    g_failures++;
++  }
++}
++
++constexpr const char* kUser = "biopass-no-such-user";
++constexpr const char* kRgb = "/dev/fake-rgb";
++constexpr const char* kIr = "/dev/fake-ir";
++// Frame sizes tell the fakes which camera a frame came from.
++constexpr int kRgbWidth = 640;
++constexpr int kIrWidth = 560;
++constexpr int kHeight = 360;
++
++// What the fake detector finds in the next frame of a camera.
++enum class Seen { Face, NoFace, Small, Edge };
++
++struct Rig {
++  // Camera opens and sessions, as in test/face_camera_reuse.
++  std::vector<std::string> opens;
++  int live = 0;
++  int max_live_at_open = 0;
++  std::map<std::string, int> fail_opens;  // path -> opens left to fail
++  // Per camera: what each next frame shows (default: a face), and how long a
++  // capture takes on the fake clock.
++  std::map<int, std::deque<Seen>> seen;
++  std::map<int, milliseconds> capture_time{{kRgbWidth, milliseconds(100)},
++                                           {kIrWidth, milliseconds(100)}};
++  // Per face set: the next match results (default: match).
++  std::map<FaceAuth::FaceSet, std::deque<bool>> matches;
++  std::vector<std::string> matched_sets;  // "rgb" / "ir", in order
++  std::map<FaceAuth::FaceSet, std::vector<std::string>> enrolled{
++      {FaceAuth::FaceSet::Main, {"faces/a.jpg"}}, {FaceAuth::FaceSet::Ir, {"faces-ir/a.jpg"}}};
++  Clock::time_point now{};
++};
++
++class FakeSession : public biopass::ICameraCaptureSession {
++ public:
++  FakeSession(Rig& rig, int width) : rig_(rig), width_(width) { rig_.live++; }
++  ~FakeSession() override { rig_.live--; }
++  bool isOpen() const override { return true; }
++  ImageRGB capture() override {
++    rig_.now += rig_.capture_time[width_];
++    return ImageRGB(width_, kHeight);
++  }
++
++ private:
++  Rig& rig_;
++  int width_;
++};
++
++FaceAuth::CameraOpener opener(Rig& rig) {
++  return [&rig](const std::optional<std::string>& path, biopass::CameraCaptureFormat, int,
++                int) -> std::unique_ptr<biopass::ICameraCaptureSession> {
++    const std::string p = path.value_or("<default>");
++    rig.opens.push_back(p == kIr ? "ir" : "rgb");
++    rig.max_live_at_open = std::max(rig.max_live_at_open, rig.live);
++    if (rig.fail_opens[p] > 0) {
++      rig.fail_opens[p]--;
++      return nullptr;
++    }
++    return std::make_unique<FakeSession>(rig, p == kIr ? kIrWidth : kRgbWidth);
++  };
++}
++
++FaceAuth::Seams seams(Rig& rig) {
++  FaceAuth::Seams s;
++  s.enrolled = [&rig](FaceAuth::FaceSet set) { return rig.enrolled[set]; };
++  s.detect = [&rig](const ImageRGB& frame) -> std::vector<biopass::Detection> {
++    auto& queue = rig.seen[frame.width];
++    Seen what = Seen::Face;
++    if (!queue.empty()) {
++      what = queue.front();
++      queue.pop_front();
++    }
++    biopass::Box box(100, 60, 260, 260);  // 200 of 360 rows, inside the frame
++    if (what == Seen::NoFace) {
++      return {};
++    }
++    if (what == Seen::Small) {
++      box = biopass::Box(300, 150, 340, 200);  // 50 rows: across the room
++    } else if (what == Seen::Edge) {
++      box = biopass::Box(0, 60, 160, 260);  // touches the left edge
++    }
++    return {biopass::Detection(0, "face", 0.9f, box, frame.crop(box.x1, box.y1, box.x2, box.y2))};
++  };
++  s.match = [&rig](const ImageRGB&, FaceAuth::FaceSet set, const std::vector<std::string>&) {
++    rig.matched_sets.push_back(set == FaceAuth::FaceSet::Ir ? "ir" : "rgb");
++    auto& queue = rig.matches[set];
++    if (queue.empty()) {
++      return true;
++    }
++    const bool result = queue.front();
++    queue.pop_front();
++    return result;
++  };
++  s.now = [&rig] { return rig.now; };
++  return s;
++}
++
++biopass::FaceMethodConfig bothConfig() {
++  biopass::FaceMethodConfig config;
++  config.camera = kRgb;
++  config.anti_spoofing.ir_camera = kIr;
++  config.anti_spoofing.ir_recognition = true;
++  config.detection.min_face_height = 0.3f;
++  return config;
++}
++
++std::string joined(const std::vector<std::string>& v) {
++  std::string out;
++  for (const auto& s : v) {
++    out += (out.empty() ? "" : ",") + s;
++  }
++  return out;
++}
++
++// The face on both cameras: colour first (opened by the availability check),
++// then the IR camera, which opens while the colour face is matched.
++void checkBothMatch() {
++  Rig rig;
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  expect(face.bothCameras(), "both: ir_recognition with a separate IR camera");
++  expect(face.isAvailable(), "both: available");
++  face.beginAuthenticationSession();
++  const AuthResult result = face.authenticate(kUser, biopass::AuthConfig{});
++  expect(result == AuthResult::Success, "both match: success");
++  expect(joined(rig.opens) == "rgb,ir", "both match: colour, then IR (" + joined(rig.opens) + ")");
++  expect(joined(rig.matched_sets) == "rgb,ir",
++         "both match: colour face against faces/, IR face against faces-ir/");
++  expect(rig.max_live_at_open == 0, "both match: never two sessions at once");
++  face.endAuthenticationSession();
++  expect(rig.live == 0, "both match: session end closes the camera");
++}
++
++// Too little light for the colour camera (or its lens covered): no face
++// there, so the IR camera never decides alone.
++void checkNoFallbackToIr() {
++  Rig rig;
++  rig.seen[kRgbWidth] = {Seen::NoFace, Seen::NoFace, Seen::NoFace};
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  for (int i = 0; i < 3; ++i) {
++    expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++           "no colour face: attempt " + std::to_string(i + 1) + " retries");
++  }
++  expect(joined(rig.opens) == "rgb", "no colour face: the IR camera is never opened (" +
++                                         joined(rig.opens) + ")");
++  expect(rig.matched_sets.empty(), "no colour face: nothing is matched");
++}
++
++// A face across the room or at the frame's edge is not matched.
++void checkFraming() {
++  Rig rig;
++  rig.seen[kRgbWidth] = {Seen::Small, Seen::Edge};
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "small colour face: retry");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "colour face at the edge: retry");
++  expect(rig.matched_sets.empty() && joined(rig.opens) == "rgb",
++         "small or cut-off colour face: neither matched nor switched");
++
++  // The same on the IR camera: matched on colour, too small in IR.
++  Rig rig2;
++  rig2.seen[kIrWidth] = {Seen::Small};
++  FaceAuth face2(bothConfig(), kUser, opener(rig2), seams(rig2));
++  face2.isAvailable();
++  expect(face2.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "small IR face: retry");
++  expect(joined(rig2.matched_sets) == "rgb", "small IR face: not matched");
++}
++
++// Colour matches, IR doesn't: the IR camera stays open, the next attempt
++// starts there and switches back to colour.
++void checkStartsOnOpenCamera() {
++  Rig rig;
++  rig.matches[FaceAuth::FaceSet::Ir] = {false};
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "IR not recognised: retry");
++  expect(rig.live == 1 && joined(rig.opens) == "rgb,ir", "IR not recognised: the IR camera stays open");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "next attempt: success");
++  expect(joined(rig.opens) == "rgb,ir,rgb",
++         "next attempt: starts on the open IR camera, one switch to colour (" +
++             joined(rig.opens) + ")");
++  expect(joined(rig.matched_sets) == "rgb,ir,ir,rgb",
++         "next attempt: IR matched first, then colour (" + joined(rig.matched_sets) + ")");
++  expect(rig.max_live_at_open == 0, "starts on open camera: never two sessions at once");
++}
++
++// The first camera doesn't recognise: the other one is open anyway (it was
++// opened while matching), and the next attempt starts there.
++void checkFirstNotRecognised() {
++  Rig rig;
++  rig.matches[FaceAuth::FaceSet::Main] = {false};
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "colour not recognised: retry");
++  expect(joined(rig.matched_sets) == "rgb", "colour not recognised: IR not matched in that attempt");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "next attempt, from the IR camera: success");
++  expect(joined(rig.opens) == "rgb,ir,rgb", "colour not recognised: then IR, then colour (" +
++                                                joined(rig.opens) + ")");
++}
++
++// Two frames too far apart are not one moment.
++void checkGap() {
++  Rig rig;
++  rig.capture_time[kIrWidth] = biopass::kBothCamerasMaxGap + milliseconds(1);
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "IR frame after the gap: retry although both would match");
++  expect(joined(rig.matched_sets) == "rgb", "IR frame after the gap: not matched");
++
++  Rig rig2;
++  rig2.capture_time[kIrWidth] = biopass::kBothCamerasMaxGap;
++  FaceAuth face2(bothConfig(), kUser, opener(rig2), seams(rig2));
++  face2.isAvailable();
++  expect(face2.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "IR frame exactly at the gap: success");
++}
++
++// Faces must be enrolled for both cameras.
++void checkEnrolment() {
++  Rig rig;
++  rig.enrolled[FaceAuth::FaceSet::Ir].clear();
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Unavailable,
++         "no IR faces enrolled: unavailable");
++  expect(rig.matched_sets.empty(), "no IR faces enrolled: nothing matched");
++
++  Rig rig2;
++  rig2.enrolled[FaceAuth::FaceSet::Main].clear();
++  FaceAuth face2(bothConfig(), kUser, opener(rig2), seams(rig2));
++  face2.isAvailable();
++  expect(face2.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Unavailable,
++         "no colour faces enrolled: unavailable");
++}
++
++// ir_recognition without an IR camera fails closed; with the IR camera as
++// the main camera it recognises already (one camera, faces/), and off it is
++// the IR presence check as before.
++void checkConfigs() {
++  Rig rig;
++  biopass::FaceMethodConfig no_ir = bothConfig();
++  no_ir.anti_spoofing.ir_camera.reset();
++  FaceAuth face(no_ir, kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Unavailable,
++         "ir_recognition without an IR camera: unavailable");
++  expect(rig.matched_sets.empty(), "ir_recognition without an IR camera: nothing matched");
++
++  biopass::FaceMethodConfig ir_main = bothConfig();
++  ir_main.camera = kIr;
++  FaceAuth face2(ir_main, kUser, opener(rig), seams(rig));
++  expect(!face2.bothCameras(), "IR camera as the main camera: one camera, faces/");
++
++  Rig rig3;
++  biopass::FaceMethodConfig off = bothConfig();
++  off.anti_spoofing.ir_recognition = false;
++  FaceAuth face3(off, kUser, opener(rig3), seams(rig3));
++  expect(!face3.bothCameras(), "ir_recognition off: one camera (with the IR presence check)");
++}
++
++// One camera: min_face_height applies there too. (No IR camera set: the
++// IR presence check would need the real detector.)
++void checkSingleCameraFraming() {
++  Rig rig;
++  rig.seen[kRgbWidth] = {Seen::Small, Seen::Edge, Seen::Face};
++  biopass::FaceMethodConfig one = bothConfig();
++  one.anti_spoofing.ir_camera.reset();
++  one.anti_spoofing.ir_recognition = false;
++  FaceAuth face(one, kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "one camera, small face: retry");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "one camera, face at the edge: retry");
++  expect(rig.matched_sets.empty(), "one camera: small or cut-off faces not matched");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "one camera, face in front: success");
++  expect(joined(rig.opens) == "rgb", "one camera: opened once");
++}
++
++// The second camera does not open: retry, and the next attempt opens the
++// colour camera again (nothing is left open).
++void checkSecondOpenFails() {
++  Rig rig;
++  rig.fail_opens[kIr] = 1;
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "IR camera does not open: retry");
++  expect(rig.live == 0, "IR camera does not open: no session left");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "next attempt: success");
++  expect(joined(rig.opens) == "rgb,ir,rgb,ir", "IR camera does not open: colour opened again (" +
++                                                   joined(rig.opens) + ")");
++  expect(rig.max_live_at_open == 0, "IR camera does not open: never two sessions at once");
++}
++
++// A cancelled run (another method won, or the time budget is spent) does not
++// switch cameras or match.
++void checkCancel() {
++  Rig rig;
++  std::atomic<bool> cancel{true};
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}, &cancel) == AuthResult::Failure,
++         "cancelled: failure");
++  expect(rig.matched_sets.empty() && joined(rig.opens) == "rgb", "cancelled: nothing matched");
++}
++
++}  // namespace
++
++int main() {
++  checkBothMatch();
++  checkNoFallbackToIr();
++  checkFraming();
++  checkStartsOnOpenCamera();
++  checkFirstNotRecognised();
++  checkGap();
++  checkEnrolment();
++  checkConfigs();
++  checkSingleCameraFraming();
++  checkSecondOpenFails();
++  checkCancel();
++
++  std::printf("%s\n", g_failures == 0 ? "All checks passed" : "Some checks FAILED");
++  return g_failures == 0 ? 0 : 1;
++}
+-- 
+2.43.0
+
