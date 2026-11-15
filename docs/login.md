@@ -194,6 +194,12 @@ time, and the camera light is on while either does.
   `/home` (read-only).
 - Logs: `journalctl -t s15-face` (refusals), Biopass's own in `~/.local/share/com.ticklab.biopass/logs/` when debug
   logging is on in the app.
+- The app's menu entry starts it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`: WebKitGTK's DMA-BUF renderer ends it at
+  once on this GPU under Wayland ("Error 71 (Protocol error) dispatching to Wayland display"). From a terminal:
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass`.
+- polkit re-reads its actions when the app's policy file comes or goes. After one install it was left with none,
+  and Plasma hid shutdown and sleep and ignored the lid; `install-face.sh` checks for that afterwards and restarts
+  polkit and Plasma's polkit agent and power management if needed.
 
 Your data stays with your user: settings in `~/.config/com.ticklab.biopass/config.yaml`, enrolled faces (cropped
 images) and models in `~/.local/share/com.ticklab.biopass/`, on the encrypted partition on an encrypted install.

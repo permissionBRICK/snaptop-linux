@@ -80,6 +80,10 @@ put() {
     install -D -m"$(stat -c %a "$s/deb/$f")" "$s/deb/$f" "$s/root/$f"
   done
   (cd "$s/deb" && find usr/share/icons -name biopass.png -exec install -D -m0644 {} "$s/root/{}" \;)
+  # WebKitGTK's DMA-BUF renderer ends the app at once on this GPU under Wayland ("Error 71 (Protocol error)").
+  sed -i 's#^Exec=biopass$#Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass#' "$s/root/usr/share/applications/biopass.desktop"
+  grep -q '^Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass$' "$s/root/usr/share/applications/biopass.desktop" ||
+    die "biopass.desktop: unexpected Exec line"
   zstd -dc "$pkg" | tar -xf - -C "$s/root"
   remove_files "$R"
   (cd "$s/root" && find . \( -type f -o -type l \) | sed 's#^\.##') > "$s/files"
@@ -115,6 +119,20 @@ pacman_deps() {  # $1: root ("" = running system)
   [ $ok = 1 ] || die "pacman -S $DEPS in $R failed"
 }
 
+# polkit re-reads its actions when /usr/share/polkit-1/actions changes. After one install it was left with none:
+# Plasma then hid shutdown and sleep and ignored the lid and the power button. If that happened, restart it and the
+# Plasma parts that asked it.
+polkit_check() {
+  local n u
+  n=$(pkaction 2>/dev/null | wc -l)
+  [ "$n" -ge 50 ] && return 0
+  echo "polkit lists $n actions: restarting it and Plasma's polkit agent and power management" >&2
+  systemctl restart polkit
+  for u in $(loginctl list-users --no-legend | awk '{print $2}'); do
+    systemctl --user -M "$u@" try-restart plasma-polkit-agent.service plasma-powerdevil.service 2>/dev/null || true
+  done
+}
+
 install_() {
   echo "== packages from the image's repository: $DEPS"
   pacman_deps ""
@@ -123,6 +141,7 @@ install_() {
   echo "  $(wc -l < "$STATE/files") files (list: $STATE/files)"
   echo "== PAM (login-lock.sh)"
   bash "$HERE/login-lock.sh" face-pam
+  polkit_check
   cat <<EOF
 
 Done. Next (docs/login.md#face-unlock):
@@ -150,6 +169,7 @@ uninstall() {
   remove_files ""
   rm -f /usr/local/sbin/s15-face
   rm -rf "$STATE"
+  polkit_check
   echo "Biopass removed; PAM files as before. Kept: webkit2gtk-4.1 (pacman -Rs webkit2gtk-4.1 removes it), and"
   echo "each user's enrolled faces and settings in ~/.local/share/com.ticklab.biopass and ~/.config/com.ticklab.biopass."
 }
