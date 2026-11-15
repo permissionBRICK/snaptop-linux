@@ -119,6 +119,7 @@ def check_lockout_counting():
     fresh = m.Lockout(USER, directory=f"{T}/new-lockout-dir", direct=True)
     expect(m.refusal(USER, fresh, c) is None and fresh.get()["fails"] == 0,
            "lockout: no file yet (first login after install or boot) -> allowed")
+    fresh.false_face(c)
     expect(os.stat(f"{T}/new-lockout-dir").st_mode & 0o777 == 0o700 and
            os.stat(f"{T}/new-lockout-dir/{USER}").st_mode & 0o777 == 0o600, "lockout: directory 0700, file 0600")
     # a lockout file that is a link, or readable by others, is not used: refused, not "allowed"
@@ -409,6 +410,49 @@ def check_grace():
     expect(m.grace_s(["/usr/lib/kscreenlocker_greet"]) == 0, "wake: idle lock, grace 0 -> no grace")
 
 
+def alive(pid):
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def check_kill_tree():
+    """A helper whose child sits in a process group of its own (as libcamera's softisp_ipa_proxy does): stopping the
+    helper must leave nothing."""
+    import subprocess
+    d = tempfile.mkdtemp(dir=T)
+    h = f"{d}/helper"
+    open(h, "w").write(f"""#!/bin/bash
+python3 -c 'import os, time; os.setpgid(0, 0); open("{d}/kid.tmp", "w").write(str(os.getpid())); os.rename("{d}/kid.tmp", "{d}/kid"); time.sleep(300)' &
+sleep 300
+""")
+    os.chmod(h, 0o755)
+    p = subprocess.Popen([h])
+    for _ in range(100):
+        if os.path.exists(f"{d}/kid"):
+            break
+        time.sleep(0.05)
+    kid = int(open(f"{d}/kid").read())
+    expect(os.getpgid(kid) == kid and alive(kid), "kill tree: the helper's child runs in its own process group")
+    m.kill_tree(p)
+    time.sleep(0.3)
+    expect(p.returncode is not None and not alive(kid), "kill tree: helper and its child are both gone")
+    # the runner's stop uses it: display off while a helper with a child looks
+    rig, st = Rig(), state()
+    open(rig.helper, "w").write(open(h).read().replace(d, rig.dir))
+    r = rig.runner(st, conf())
+    threading.Timer(0.6, lambda: setattr(rig, "on", False)).start()
+    res = r.run(5000, 10)
+    time.sleep(0.3)
+    kid = int(open(f"{rig.dir}/kid").read())
+    expect(res == ("stopped", "display off") and not alive(kid), "kill tree: a stopped run leaves no worker")
+    # reading the count creates nothing (the wake service reads it in a read-only file system)
+    lk = m.Lockout(USER, directory=f"{T}/never-made", direct=True)
+    expect(lk.get() == {"fails": 0, "until": 0} and not os.path.exists(f"{T}/never-made"),
+           "lockout: reading a missing count creates nothing")
+
+
 def check_sleep():
     s = m.Sleep()
     expect(not s.slept(), "sleep: no suspend in between")
@@ -427,6 +471,7 @@ check_runs()
 check_watch()
 check_grace()
 check_sleep()
+check_kill_tree()
 import shutil
 shutil.rmtree(T, ignore_errors=True)
 print("ALL PASS" if failures == 0 else f"{failures} FAILED")
