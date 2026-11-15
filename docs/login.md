@@ -114,46 +114,80 @@ sudo s15-pin set       # 6-12 digits, typed twice; s15-pin clear removes it, s15
 
 ## Face unlock
 
-Optional: the login screen and Desktop Mode's lock screen also recognise your face with the IR camera (or with both
-cameras), as Windows Hello does. It uses [Biopass](https://github.com/phucvinh57/biopass) 1.5.1 (face and
-fingerprint unlock for Linux PAM, MIT license): the app from Biopass's arm64 release, its authentication part built
-on the laptop with our patches for this IR camera, a minimum face size, a mode that needs both cameras and a helper
-that keeps looking while it sees no face (`face/patches/`, to be offered upstream). When to look, what counts and
-when a match unlocks is ours: `s15-face` and `s15-face-run`.
+An optional module: the login screen and Desktop Mode's lock screen also recognise your face with the IR camera (or
+with both cameras), as Windows Hello does. It uses [Biopass](https://github.com/phucvinh57/biopass) 1.5.1 (face and
+fingerprint unlock for Linux PAM, MIT license), built on the laptop with our patches (`face/patches/`): its
+authentication part for this IR camera, a minimum face size, a mode that needs both cameras and a helper that keeps
+looking while it sees no face (0001-0008, to be offered upstream), and its app, which sets all of it up: the
+cameras, your faces, test scans, the thresholds and the lockout (0009-0011). When to look, what counts and when a
+match unlocks is ours: `s15-face` and `s15-face-run`. `s15-face` is also the command line for everything the app
+does.
 
 > **State 2026-11-15:** in use on the laptop in `both` mode. Checked on the laptop without a person at the keyboard:
 > the PAM stacks end to end (lock screen and login screen, with the user's face), the display-off stop (with the
 > real camera, the display simulated), the lockout service, pam_setcred for PIN, password and face on every stack.
 > Not yet tried by hand: the lock screen starting by itself (the F24 tap), Escape and the lid on the real lock
 > screen, across the room, in a dark room, with a photo on a phone.
+> The app built from source (patches 0008-0011) is installed and checked on the laptop: the build with all its tests,
+> the camera list (`hm1092` mono, `ov02c10` colour), the lockout through pkexec, a scan, and the app's page with the
+> real settings and faces (on a virtual display). Not yet done by hand in the app: Add 5, Test, saving a mode change,
+> Apply in the lockout card (the password dialog).
 
 ### Setting it up
 
 Needs the login password ([above](#setting-it-up)). In Konsole (Desktop Mode):
 
 ```sh
-sudo /opt/snaptop-linux/steamos/install-face.sh install    # about 15 minutes the first time (it builds)
+sudo /opt/snaptop-linux/steamos/install-face.sh install    # about 10 minutes the first time (it builds)
 ```
 
-1. Start **Biopass** from the application menu once: it downloads its models (Models page). Close it.
-2. Choose the cameras (recommended: `ir`; strictest: `both`, [below](#cameras)) and add your face, as yourself, not
-   with sudo (5 pictures two seconds apart, in `both` a colour and an IR picture each: look at the screen, turn your
-   head a little between them, with and without glasses):
-   ```sh
-   sudo s15-face camera ir     # or: sudo s15-face camera both
-   s15-face enrol
-   s15-face check              # one scan, each step shown: face size and scores
-   ```
-   The app lists the faces under Saved Faces, but its own "add face" cannot pick the IR camera: it lists only
-   `/dev/video` nodes, which both cameras share, and would take the colour camera. Saving the app's settings page
-   turns the camera settings into a camera profile and drops the settings it does not know (the minimum face size,
-   `both`); face unlock then refuses until `sudo s15-face camera ir` (or `both`) again.
-3. Lock the screen (Meta+L): face unlock starts by itself after a moment; at the login screen press Enter on the
+Then open **Biopass** from the application menu (as yourself). It downloads its models when it first starts (AI
+Models page). On the Configuration page, under Face Recognition:
+
+1. **Cameras**: choose the mode (recommended: IR camera; strictest: both cameras, [below](#cameras)) and press
+   **Save** (top right). The camera pickers name the sensors (`hm1092` is the IR camera, `ov02c10` the colour
+   camera).
+2. **Enrolled faces**: **Start camera**, then **Add 5**: five pictures two seconds apart (in both cameras' mode a
+   colour and an IR picture each). Look at the screen as you usually sit, turn your head a little between them, and
+   add some with and without glasses.
+3. **Test**: one scan as the lock screen runs it, with each step (the face's size, scores) and each compared face's
+   score on its picture, red when it is not above the threshold. A face that stays red when you test is worth
+   deleting (its bin) and adding again; **Delete all** and **Add 5** enrol a camera anew.
+4. Lock the screen (Meta+L): face unlock starts by itself after a moment; at the login screen press Enter on the
    empty password field.
+
+The same from a terminal, as yourself (camera and antispoof need sudo; close the app first):
+
+```sh
+sudo s15-face camera ir     # or: sudo s15-face camera both
+s15-face enrol              # 5 pictures (pairs in both)
+s15-face check              # one scan, each step shown: face size and scores
+```
 
 `sudo s15-face snapshot ir` saves one frame as Biopass sees it (`/tmp/s15-face-ir.png`); `s15-face status`
 shows the state (display, lid, the count of false faces, whether face is allowed now); `sudo
 /opt/snaptop-linux/steamos/install-face.sh status` the installation.
+
+#### The app
+
+Our build of Biopass's app (patches 0009-0011) knows this laptop's setup:
+
+- **Cameras** lists the cameras by libcamera id (`biopass-helper list-cameras`, patch 0008): both cameras share all
+  their `/dev/video` nodes, so Biopass's own list of video devices could not tell them apart. A mode sets the same
+  settings as `s15-face camera` (including the minimum face size and threshold where they are missing or looser),
+  and **Minimum face size** has its own slider. The app never writes camera profiles (face unlock refuses them);
+  profiles from an earlier save of the unpatched app are read as the camera settings and replaced on Save.
+- **Saving keeps every setting the app has no field for**: it writes its values into `config.yaml` as it is at that
+  moment; Biopass's app used to drop everything it did not know.
+- **Enrolled faces** shows every camera's faces (`faces/`, `faces-ir/`, `faces-rgb/`), labelled by camera and by
+  whether the mode uses them; a save that switches between the IR and the colour camera as the main camera moves
+  them, as `s15-face camera` does. **Add faces** and **Test** use the saved settings: save the cameras first.
+- **Recognition threshold** warns below 0.6; **Anti-Spoofing** is off and locked in IR mode (the models are trained
+  on colour pictures).
+- **Face Unlock Lockout** shows the [lockout settings](#lockout-settings) and your count of false faces, and
+  changes them through `pkexec /usr/lib/s15-face/s15-face-lockout` (polkit action
+  `org.snaptop-linux.s15-face.lockout`): it asks for the administrator password, as `sudo s15-face lockout set`
+  does. They are not part of the Save button.
 
 ### What it does
 
@@ -187,20 +221,21 @@ writable by others: the defaults. The file is kept across SteamOS updates.
 ```sh
 s15-face lockout                          # the values in effect, KEY=VALUE per line
 s15-face lockout keys                     # KEY DEFAULT MIN MAX UNIT MEANING per line
-sudo s15-face lockout set first_wait 120  # one value (a whole number within its range); prints the new values
+sudo s15-face lockout set first_wait 120  # a whole number within its range; several KEY VALUE pairs at once are
+                                          # checked first and written together; prints the new values
 sudo s15-face lockout reset-defaults      # all back to the defaults
 ```
 
-`set` and `reset-defaults` need root (sudo, or pkexec for an app's settings page) and exit 2 for an unknown key, a
+Or in the Biopass app (Face Unlock Lockout, [above](#the-app)). `set` and `reset-defaults` need root (sudo, or the
+app's pkexec) and exit 2 for an unknown key, a
 value out of range or bad usage, 1 when not root or the file could not be written. Only values that differ from
 the defaults are written, so a default changed in a later version applies then.
 
 #### Cameras
 
-`sudo s15-face camera ir|rgb|both` writes `camera`, `anti_spoofing.ir_camera` and `anti_spoofing.ir_recognition` in
-Biopass's settings, as libcamera camera ids (both cameras share their video nodes, so the app's device list cannot
-tell them apart), and the minimum face size and threshold [below](#how-it-works) where the settings have none or a
-looser one:
+The app's Cameras section, or `sudo s15-face camera ir|rgb|both`, writes `camera`, `anti_spoofing.ir_camera` and
+`anti_spoofing.ir_recognition` in Biopass's settings, as libcamera camera ids (both cameras share their video nodes),
+and the minimum face size and threshold [below](#how-it-works) where the settings have none or a looser one:
 
 | Mode | Recognises | Needs | Against a photo |
 |---|---|---|---|
@@ -209,17 +244,17 @@ looser one:
 | `rgb` | the colour camera; the IR camera only checks that it sees some face | room light | a printed photo can pass the IR check |
 
 In `ir` Biopass's AI anti-spoofing models are off: they are trained on colour images and misjudge IR frames. In `rgb`
-and `both` `sudo s15-face antispoof on` turns one on for the colour picture: MiniFASNet V2 (Biopass's default,
-MobileNetV3, took the real face for a spoof in 2 of 3 scans on this camera's pictures; MiniFASNet V2 passed 4 of 4).
-They may also reject real faces in poor light. Not through the app: saving its settings page drops our settings. In
+and `both` the app's Anti-Spoofing model (or `sudo s15-face antispoof on`) turns one on for the colour picture: take
+MiniFASNet V2 (Biopass's default, MobileNetV3, took the real face for a spoof in 2 of 3 scans on this camera's
+pictures; MiniFASNet V2 passed 4 of 4). They may also reject real faces in poor light. In
 `both` the IR recognition replaces the IR presence check. `both` never falls back to one camera: in a dark room, or
 with the colour lens covered, face unlock fails and the password or PIN is needed (otherwise covering a lens would
 weaken it).
 
 Enrolled faces stay with their camera, so switching modes needs no new enrolment for a camera that has faces:
-`faces/` holds the main camera's (the ones the app lists: the IR camera's in `ir`, the colour camera's in `rgb` and
-`both`), `faces-ir/` the IR camera's in `rgb` and `both`, `faces-rgb/` the colour camera's while in `ir`; `s15-face
-camera` moves them when the main camera changes. Faces from one camera do not match the other. Only one camera
+`faces/` holds the main camera's (the IR camera's in `ir`, the colour camera's in `rgb` and `both`), `faces-ir/` the
+IR camera's in `rgb` and `both`, `faces-rgb/` the colour camera's while in `ir`; the app's Save and `s15-face camera`
+move them when the main camera changes. Faces from one camera do not match the other. Only one camera
 streams at a time, and the camera light is on while either does.
 
 ### How it works
@@ -247,8 +282,10 @@ streams at a time, and the camera light is on while either does.
   leaves it open, and the next attempt starts there. Measured: a scan that matches at once takes 1.3 s, the two
   pictures 0.5 s apart.
 - `s15-face check` runs one scan (`biopass-helper auth --verbose`, patch 0006: Biopass's own 5 attempts), with each
-  step on the terminal: the face's size and how it compares with the minimum, the best score and the threshold. It
-  is not counted and does not check the display.
+  step on the terminal: the face's size and how it compares with the minimum, the best score and the threshold. The
+  app's Test runs `biopass-helper auth --verbose --keep-looking 6000` (as the login screen looks: the first face
+  compared decides) and also reads each enrolled face's score from the helper's log. Neither is counted, and
+  neither checks the display.
 - Our patches: the IR camera delivers only raw 10-bit frames (`R10_CSI2P`, 560x360, far below full scale); they are
   unpacked and stretched to 8-bit grey from their own black level and brightest pixels, turned upright (the camera
   is mounted upside down and cannot flip), and the dark frames of the IR light (it flashes 50 ms every 100 ms on
@@ -309,13 +346,25 @@ streams at a time, and the camera light is on while either does.
   in `~/.local/share/com.ticklab.biopass/logs/` when debug logging is on in the app (it also keeps pictures of
   failed faces in `debugs/` then); `s15-face check` shows the same steps without it. `tools/test-s15-face-run.py`
   tests the runner without a camera (a fake helper and display).
+- The build (`face/build.sh`, in a chroot of the running SteamOS under an overlay in `/var/tmp`, nothing installed
+  on the system): the archives in `face/sources.sh` are pinned by sha256; the app's frontend packages come from
+  Biopass's `app/bun.lock`, each checked against its sha512 (`face/bunlock.py`, as bun would lay them out: the
+  image's repository has no bun), its crates from `app/src-tauri/Cargo.lock` (`cargo fetch --locked`, each checked
+  against its sha256); Rust and Node.js from the SteamOS image's own repository into the overlay; then it builds
+  offline and runs the tests our patches touch (the auth part's, the app's Rust tests, its frontend tests with Node
+  in place of `bun test`). The image's Rust 1.93 is older than the 1.95 that one crate (`rusqlite_migration` 2.6)
+  declares; it builds with it (`--ignore-rust-version`) and the app's database tests pass. Measured on the laptop
+  (12 cores): 7.5 minutes (the auth part 2.5, the app 3, its tests 1), up to 4 GB in `/var/tmp` while it runs, and
+  the first time about 0.4 GB of downloads. The result is kept in `/var/lib/s15-face/cache`, the downloads in
+  `/var/lib/s15-face/cache/src`.
 - The app's menu entry starts it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`: WebKitGTK's DMA-BUF renderer ends it at
   once on this GPU under Wayland ("Error 71 (Protocol error) dispatching to Wayland display"). From a terminal:
   `WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass`.
 - polkit re-reads all its actions as soon as a policy file appears. When the install unpacked the app's policy file
   with everything else, polkit read it half-written and was left with no actions at all, every time: Plasma then
-  hid shutdown and sleep and ignored the lid. `install-face.sh` now puts that file last, complete, with a rename,
-  and still checks afterwards (restarting polkit and Plasma's polkit agent and power management if needed).
+  hid shutdown and sleep and ignored the lid. `install-face.sh` now puts the policy files (Biopass's and the
+  lockout's) last, complete, each with a rename, and still checks afterwards (restarting polkit and Plasma's polkit
+  agent and power management if needed).
 
 Your data stays with your user: settings in `~/.config/com.ticklab.biopass/config.yaml`, enrolled faces (cropped
 images: `faces/`, `faces-ir/`, `faces-rgb/`) and models in `~/.local/share/com.ticklab.biopass/`, on the encrypted

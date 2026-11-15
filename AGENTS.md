@@ -73,7 +73,8 @@ what you are about to do before anything that writes to disk, and report results
   `pam_deny` after them: a refused run must fail). Never turn on `install-face.sh admin on` (sudo, polkit) without
   the user. A covered camera must never unlock the lock screen, nor a face while the display is off (Escape) or
   the lid closed: test that after any change (`tools/test-s15-face-run.py` for the runner). The lockout numbers are
-  root's (`s15-face lockout`), never in the user's Biopass settings.
+  root's (`s15-face lockout`), never in the user's Biopass settings. The Biopass app is built from source with our
+  patches (`face/`); its settings page must never drop keys of `config.yaml` or write camera profiles.
 - Audio: `aplay -l` lists the X1E80100 card; Wi-Fi: `nmcli device wifi list`; GPU: `vulkaninfo --summary` (Turnip).
 - Standby: after one suspend, `cat /sys/kernel/debug/qcom_stats/cxsd` shows a rising count (needs debugfs);
   `/var/log/s15-sleep.log` logs every sleep with drain and residency.

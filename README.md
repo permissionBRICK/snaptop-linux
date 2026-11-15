@@ -59,7 +59,8 @@ then set a login password in SteamOS (`passwd`, then `sudo /opt/snaptop-linux/st
 [docs/login.md](docs/login.md)).
 Encryption without a login password only protects the SSD taken out of the laptop.
 With the login password on, face unlock with the IR camera can be added (`steamos/install-face.sh`,
-[docs/login.md](docs/login.md#face-unlock); built and checked offline, not yet tested on the laptop).
+[docs/login.md](docs/login.md#face-unlock)): an optional module, set up in the Biopass app (cameras, faces, test
+scans, lockout), or with `s15-face` from a terminal.
 
 Optional: `games/` adds Windows games to Steam with Proton ARM64 and the fixes old games need ([docs/games.md](docs/games.md)).
 
@@ -98,7 +99,7 @@ windows/      Prepare-S15.ps1 (BitLocker, partition, firmware export), reboot-to
 steamos/      image download, firmware/UCM fetch, SteamOS adaptations, boot partition, standby/Wi-Fi/input helpers
 kernel/       build.sh (native or cross), config, our patches
 desktop-net/  Plasma Wi-Fi/Bluetooth applets built against the image
-face/         face unlock: our Biopass patches for the IR camera and the build against the image
+face/         face unlock: our Biopass patches (IR camera, app) and the build against the image
 games/        Steam shortcut writer, Proton prefix tweaks, DSOAL fetcher, tool mover
 power/        power logger, report, sleep log hook
 tools/        hardware diagnostics
