@@ -1,0 +1,21 @@
+[Unit]
+Description=Face unlock: the count of false faces (s15-face, docs/login.md#face-unlock)
+
+[Service]
+# one request per connection: "get|false|ok USER", a user's process only for itself (SO_PEERCRED)
+ExecStart=/usr/local/sbin/s15-face-run serve
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+TimeoutStartSec=10
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+StateDirectory=s15-face/lockout
+StateDirectoryMode=0700
+RuntimeDirectory=s15-face
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes

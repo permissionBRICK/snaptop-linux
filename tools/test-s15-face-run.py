@@ -60,10 +60,18 @@ def check_display():
     expect(not m.display_on(f"{T}/nothing"), "display: no DRM directory -> off")
 
 
-def state():
+def state(fails=0, until=0):
+    """A fresh lockout count (root's file, as the service and the root paths use it)."""
     d = tempfile.mkdtemp(dir=T)
-    open(f"{d}/{USER}", "w").write("fails=0\n")
-    return m.State(USER, d)
+    lk = m.Lockout(USER, directory=d, direct=True)
+    lk._file(lambda v: v.update(fails=fails, until=until))
+    return lk
+
+
+def runtime():
+    d = tempfile.mkdtemp(dir=T)
+    m.make_runtime(USER, d)
+    return m.Runtime(USER, d)
 
 
 def conf(**kw):
@@ -76,38 +84,80 @@ def check_lockout_counting():
     st = state()
     c = conf()
     for n in range(1, 6):
-        st.add_false_face(c)
-    d = st.read()
-    expect(d["fails"] == 5 and "until" not in d, "lockout: 5 false faces, no wait yet (6 free)")
+        st.false_face(c)
+    d = st.get()
+    expect(d["fails"] == 5 and d["until"] == 0, "lockout: 5 false faces, no wait yet (6 free)")
     expect(m.refusal(USER, st, c) is None, "lockout: 5 false faces -> allowed")
-    st.add_false_face(c)
-    d = st.read()
-    left = d["until"] - m.boottime()
+    st.false_face(c)
+    left = st.get()["until"] - time.time()
     expect(55 < left <= 60, f"lockout: the 6th -> wait 60 s ({left:.0f})")
     r = m.refusal(USER, st, c)
     expect(r is not None and r[0] is False and r[1].startswith("wait"), f"lockout: during the wait -> refused ({r})")
-    st.add_false_face(c)
-    left = st.read()["until"] - m.boottime()
+    st.false_face(c)
+    left = st.get()["until"] - time.time()
     expect(115 < left <= 120, f"lockout: the 7th -> 120 s ({left:.0f})")
     for _ in range(6):
-        st.add_false_face(c)
-    left = st.read()["until"] - m.boottime()
+        st.false_face(c)
+    left = st.get()["until"] - time.time()
     expect(3595 < left <= 3600, f"lockout: the 13th -> capped at max_wait 3600 s ({left:.0f})")
-    st.add_false_face(c)
-    st.add_false_face(c)
+    st.false_face(c)
+    st.false_face(c)
     r = m.refusal(USER, st, c)
     expect(r is not None and r[0] is True, f"lockout: 15 false faces -> off until a password ({r})")
+    # kept on disk: a new Lockout (a restart) sees the same count
+    expect(m.Lockout(USER, directory=st.dir, direct=True).get()["fails"] == 15,
+           "lockout: the count is in the file (survives a restart)")
+    st.reset()
+    expect(st.get() == {"fails": 0, "until": 0} and m.refusal(USER, st, c) is None, "lockout: reset -> allowed")
     st2 = state()
     c0 = conf(first_wait=0)
     for _ in range(14):
-        st2.add_false_face(c0)
-    expect("until" not in st2.read() and m.refusal(USER, st2, c0) is None, "lockout: first_wait 0 -> no waits")
-    expect(m.refusal(USER, m.State(USER, f"{T}/none"), c) == (True, "no login with the password or PIN since boot"),
-           "lockout: no state file (no login since boot) -> off")
-    # a state file that is a link or someone else's is not used
+        st2.false_face(c0)
+    expect(st2.get()["until"] == 0 and m.refusal(USER, st2, c0) is None, "lockout: first_wait 0 -> no waits")
+    fresh = m.Lockout(USER, directory=f"{T}/new-lockout-dir", direct=True)
+    expect(m.refusal(USER, fresh, c) is None and fresh.get()["fails"] == 0,
+           "lockout: no file yet (first login after install or boot) -> allowed")
+    expect(os.stat(f"{T}/new-lockout-dir").st_mode & 0o777 == 0o700 and
+           os.stat(f"{T}/new-lockout-dir/{USER}").st_mode & 0o777 == 0o600, "lockout: directory 0700, file 0600")
+    # a lockout file that is a link, or readable by others, is not used: refused, not "allowed"
     d = tempfile.mkdtemp(dir=T)
     os.symlink(f"{T}/elsewhere", f"{d}/{USER}")
-    expect(m.State(USER, d).read() is None, "state: a link is not followed")
+    r = m.refusal(USER, m.Lockout(USER, directory=d, direct=True), c)
+    expect(r is not None and r[0] is False and not os.path.exists(f"{T}/elsewhere"),
+           f"lockout: a link is not followed -> refused ({r})")
+    d = tempfile.mkdtemp(dir=T)
+    open(f"{d}/{USER}", "w").write("fails=0\n")
+    os.chmod(f"{d}/{USER}", 0o644)
+    expect(m.refusal(USER, m.Lockout(USER, directory=d, direct=True), c) is not None,
+           "lockout: a file readable by others -> refused")
+    # the service is not there: refused (never looks without counting)
+    r = m.refusal(USER, m.Lockout(USER, sock=f"{T}/no.sock", direct=False), c)
+    expect(r is not None and r[0] is False and "cannot be read" in r[1], "lockout: no service -> refused")
+
+
+def check_service():
+    ld, sd = tempfile.mkdtemp(dir=T), tempfile.mkdtemp(dir=T)
+    os.chmod(sd, 0o755)
+    req = lambda uid, line: m.serve_request(uid, line, ld, f"{T}/no-such.conf", sd)
+    expect(req(65534, "get nobody") == "fails=0 until=0", "service: a user asks about itself -> its count")
+    expect(os.stat(f"{sd}/nobody").st_uid == 65534 and os.stat(f"{sd}/nobody").st_mode & 0o777 == 0o600,
+           "service: get makes the user's runtime file (the user's, 0600)")
+    expect(req(65534, "false nobody") == "fails=1 until=0", "service: false -> counted")
+    expect(os.stat(f"{ld}/nobody").st_uid == 0 and os.stat(f"{ld}/nobody").st_mode & 0o777 == 0o600,
+           "service: the count is root's file, 0600")
+    expect(req(65534, "get root") == "denied" and req(65534, "false root") == "denied"
+           and req(65534, "ok root") == "denied", "service: a user asking about another user -> denied")
+    expect(req(0, "false nobody") == "fails=2 until=0", "service: root may count for any user")
+    for _ in range(4):
+        req(65534, "false nobody")
+    r = req(65534, "get nobody")
+    until = int(r.split("until=")[1])
+    expect(r.startswith("fails=6 ") and 55 < until - time.time() <= 60,
+           f"service: the 6th -> the default wait of 60 s, from root's numbers ({r})")
+    expect(req(65534, "ok nobody") == "fails=0 until=0", "service: ok (after a success) -> reset")
+    expect(req(65534, "set nobody 0") == "denied" and req(65534, "get ../etc") == "denied"
+           and req(65534, "get nosuchuser1") == "denied" and req(65534, "") == "denied",
+           "service: anything else -> denied")
 
 
 def check_lockout_conf():
@@ -200,15 +250,16 @@ exit "$1"
     def n_runs(self):
         return len(open(self.runs).read().splitlines()) if os.path.exists(self.runs) else 0
 
-    def runner(self, st, c, parent=None):
-        return m.Runner(USER, "kde-fingerprint", st, c, parent=parent, helper=self.helper,
+    def runner(self, lk, c, parent=None):
+        return m.Runner(USER, "kde-fingerprint", lk, c, parent=parent, helper=self.helper,
                         display=lambda: self.on, lid=lambda: self.closed)
 
 
 def check_runs():
-    rig, st = Rig(), state()
+    rig, st = Rig(), state(fails=4)
     rig.codes("0 0.1")
     expect(rig.runner(st, conf()).run(5000, 10) == ("match", ""), "run: a match with the display on -> match")
+    expect(st.get()["fails"] == 0, "run: a match resets the count")
     expect("--keep-looking 5000" in open(rig.runs).read() and "--service kde-fingerprint" in open(rig.runs).read(),
            "run: the helper gets --keep-looking and the service")
 
@@ -239,29 +290,28 @@ def check_runs():
     rig, st = Rig(), state()
     rig.codes("1 0.05", "3 0.05", "1 0.05", "1 0.05", "0 0.05")
     res = rig.runner(st, conf()).run(5000, 10)
-    expect(res == ("ended", "3 false faces") and st.read()["fails"] == 3 and rig.n_runs() == 4,
+    expect(res == ("ended", "3 false faces") and st.get()["fails"] == 3 and rig.n_runs() == 4,
            f"run: 3 false faces end the run; the no-face helper in between did not count ({res})")
 
     rig, st = Rig(), state()
     rig.codes("3 0.1", "3 0.1", "3 0.1", "3 0.1")
     res = rig.runner(st, conf()).run(5000, 0.25)
-    expect(res[0] == "ended" and res[1].startswith("no face") and st.read()["fails"] == 0,
+    expect(res[0] == "ended" and res[1].startswith("no face") and st.get()["fails"] == 0,
            f"run: no face until the run's limit -> ended, nothing counted ({res})")
 
     rig, st = Rig(), state()
     rig.codes("2 0.05")
     res = rig.runner(st, conf()).run(5000, 10)
-    expect(res[0] == "ended" and "nothing to try" in res[1] and st.read()["fails"] == 0,
+    expect(res[0] == "ended" and "nothing to try" in res[1] and st.get()["fails"] == 0,
            "run: helper exit 2 (nothing to try) -> ended, not counted")
 
     rig, st = Rig(), state()
     rig.codes("1 0.05", "1 0.05", "0 0.05")
     res = rig.runner(st, conf(free_false_faces=1)).run(5000, 10)
-    expect(res[0] == "refused" and res[1][0] is False and st.read()["fails"] == 1,
+    expect(res[0] == "refused" and res[1][0] is False and st.get()["fails"] == 1,
            f"run: a false face that starts a wait -> the run stops at once ({res})")
 
-    rig, st = Rig(), state()
-    open(st.path, "w").write("fails=15\n")
+    rig, st = Rig(), state(fails=15)
     rig.codes("0 0.05")
     res = rig.runner(st, conf()).run(5000, 10)
     expect(res[0] == "refused" and res[1][0] is True and rig.n_runs() == 0, "run: locked out -> no helper")
@@ -269,24 +319,24 @@ def check_runs():
 
 def check_watch():
     # A run of 3 false faces ends; Enter (rescan) starts the next, which matches.
-    rig, st = Rig(), state()
+    rig, st, rt = Rig(), state(), runtime()
     rig.codes("1 0.05", "1 0.05", "1 0.05", "0 0.05")
     r = rig.runner(st, conf())
     out = {}
-    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(r, st)), daemon=True)
+    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(r, rt)), daemon=True)
     th.start()
     time.sleep(1.5)
     expect(th.is_alive() and rig.n_runs() == 3, f"watch: after 3 false faces it waits ({rig.n_runs()} helpers)")
-    st.update(lambda d: d.__setitem__("rescan", d.get("rescan", 0) + 1))
+    rt.update(lambda d: d.__setitem__("rescan", d.get("rescan", 0) + 1))
     th.join(5)
     expect(out.get("rc") == 0 and rig.n_runs() == 4, "watch: Enter -> a new run -> match -> 0")
 
     # Display off while looking: the helper stops; on again: a new run by itself.
-    rig, st = Rig(), state()
+    rig, st, rt = Rig(), state(), runtime()
     rig.codes("0 5", "0 0.05")
     r = rig.runner(st, conf())
     out = {}
-    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(r, st)), daemon=True)
+    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(r, rt)), daemon=True)
     th.start()
     time.sleep(0.5)
     rig.on = False
@@ -297,11 +347,11 @@ def check_watch():
     expect(out.get("rc") == 0 and rig.n_runs() == 2, "watch: display on again -> a new run by itself -> match")
 
     # A run that ended waits for the display to go off and on again, too.
-    rig, st = Rig(), state()
+    rig, st, rt = Rig(), state(), runtime()
     rig.codes("1 0.05", "1 0.05", "1 0.05", "0 0.05")
     r = rig.runner(st, conf())
     out = {}
-    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(r, st)), daemon=True)
+    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(r, rt)), daemon=True)
     th.start()
     time.sleep(1.2)
     rig.on = False
@@ -311,36 +361,34 @@ def check_watch():
     expect(out.get("rc") == 0 and rig.n_runs() == 4, "watch: ended run, display off and on -> a new run -> match")
 
     # Off after off_after false faces: the watch ends (kscreenlocker then hides the face hint).
-    rig, st = Rig(), state()
-    open(st.path, "w").write("fails=13\n")
+    rig, st, rt = Rig(), state(fails=13), runtime()
     rig.codes("1 0.05", "1 0.05", "1 0.05")
     out = {}
     nowait = conf(first_wait=0)
-    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(rig.runner(st, nowait), st)), daemon=True)
+    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(rig.runner(st, nowait), rt)), daemon=True)
     th.start()
     th.join(5)
-    expect(out.get("rc") == 1 and st.read()["fails"] == 15, "watch: the 15th false face -> off, the watch ends (1)")
+    expect(out.get("rc") == 1 and st.get()["fails"] == 15, "watch: the 15th false face -> off, the watch ends (1)")
 
     # During a wait it stays and refuses; after the wait the next trigger starts a run.
-    rig, st = Rig(), state()
-    open(st.path, "w").write(f"fails=6\nuntil={int(m.boottime()) + 2}\n")
+    rig, st, rt = Rig(), state(fails=6, until=int(time.time()) + 2), runtime()
     rig.codes("0 0.05")
     out = {}
-    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(rig.runner(st, conf()), st)), daemon=True)
+    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(rig.runner(st, conf()), rt)), daemon=True)
     th.start()
     time.sleep(0.5)
     expect(th.is_alive() and rig.n_runs() == 0, "watch: during a wait no helper, the watch stays")
     time.sleep(2.0)
-    st.update(lambda d: d.__setitem__("rescan", 1))
+    rt.update(lambda d: d.__setitem__("rescan", 1))
     th.join(5)
     expect(out.get("rc") == 0 and rig.n_runs() == 1, "watch: after the wait, Enter -> run -> match")
 
     # The lock screen ended (greeter exited): the watch ends and its helper with it.
-    rig, st = Rig(), state()
+    rig, st, rt = Rig(), state(), runtime()
     rig.codes("0 10")
     r = m.Runner(USER, "kde-fingerprint", st, conf(), parent=-1, helper=rig.helper, display=lambda: True,
                  lid=lambda: False)
-    expect(m.watch_loop(r, st) == 1 and rig.n_runs() == 0, "watch: parent gone -> ends at once")
+    expect(m.watch_loop(r, rt) == 1 and rig.n_runs() == 0, "watch: parent gone -> ends at once")
 
 
 def check_grace():
@@ -365,6 +413,7 @@ if os.geteuid() != 0:
 check_display()
 check_lockout_counting()
 check_lockout_conf()
+check_service()
 check_faillock()
 check_runs()
 check_watch()

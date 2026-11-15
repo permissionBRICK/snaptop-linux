@@ -1,9 +1,10 @@
 #!/bin/bash
 # Face unlock with Biopass (docs/login.md#face-unlock): Biopass's arm64 release for the app, with its auth part
 # (helper, PAM module, libraries, libcamera) built on the laptop with our patches for the IR camera (face/build.sh),
-# s15-face and s15-face-run (gate and runs), s15-face-wake.service (starts face on the lock screen by itself), and
-# the PAM lines through login-lock.sh. The lockout numbers (root's /etc/s15-face.conf, s15-face lockout) stay
-# across SteamOS updates. Run as root in the installed SteamOS, from a checkout of this repository:
+# s15-face and s15-face-run (gate and runs), s15-face.socket (root's count of false faces, for the lock screen's runs
+# that run as the user), s15-face-wake.service (starts face on the lock screen by itself), and the PAM lines
+# through login-lock.sh. The count (/var/lib/s15-face/lockout) and the lockout numbers (root's /etc/s15-face.conf,
+# s15-face lockout) stay across restarts and SteamOS updates. Run as root in the installed SteamOS, from a checkout of this repository:
 #   sudo steamos/install-face.sh install [--rebuild]  install or update (idempotent). Face unlock works once the
 #                                                     login password is on (login-lock.sh enable), from the next login
 #   sudo steamos/install-face.sh status
@@ -27,6 +28,8 @@ STATE=/var/lib/s15-face          # build id (= installed), file list, admin flag
 CACHE=$STATE/cache
 WAKE=/etc/systemd/system/s15-face-wake.service
 WAKE_LINK=/etc/systemd/system/multi-user.target.wants/s15-face-wake.service
+SOCK_UNITS="/etc/systemd/system/s15-face.socket /etc/systemd/system/s15-face@.service"
+SOCK_LINK=/etc/systemd/system/sockets.target.wants/s15-face.socket
 KEEP=/etc/atomic-update.conf.d/s15-face.conf   # s15-os-update carries these /etc files into a new version
 DEPS="webkit2gtk-4.1"            # the app; the rest Biopass needs is in the image (not fprintd: no fingerprints)
 ID=$(face_build_id)
@@ -112,8 +115,10 @@ put() {
   install -D -m0755 "$HERE/s15-face" "$R/usr/local/sbin/s15-face"
   install -D -m0755 "$HERE/s15-face-run" "$R/usr/local/sbin/s15-face-run"
   install -D -m0644 "$HERE/s15-face-wake.service" "$R$WAKE"
-  install -d "$R${WAKE_LINK%/*}"
+  install -d "$R${WAKE_LINK%/*}" "$R${SOCK_LINK%/*}"
   ln -sfn "$WAKE" "$R$WAKE_LINK"
+  install -m0644 "$HERE/s15-face.socket" "$HERE/s15-face@.service" "$R/etc/systemd/system/"
+  ln -sfn /etc/systemd/system/s15-face.socket "$R$SOCK_LINK"
   install -d "$R${KEEP%/*}"
   printf '%s\n' '# snaptop-linux face unlock (steamos/install-face.sh): the lockout numbers (s15-face lockout)' \
     /etc/s15-face.conf > "$R$KEEP"
@@ -159,7 +164,8 @@ install_() {
   echo "== PAM (login-lock.sh)"
   bash "$HERE/login-lock.sh" face-pam
   systemctl daemon-reload
-  systemctl restart s15-face-wake.service
+  systemctl restart s15-face.socket s15-face-wake.service
+  echo "  s15-face.socket: $(systemctl is-active s15-face.socket) (the count of false faces)"
   echo "  s15-face-wake: $(systemctl is-active s15-face-wake.service) (starts face unlock on the lock screen)"
   polkit_check
   cat <<EOF
@@ -173,7 +179,7 @@ Done. Next (docs/login.md#face-unlock):
                                   the app's own "add face" cannot pick the IR camera); afterwards, save nothing in
                                   the app's settings page (step 2 again if so)
   4. s15-face check               one scan with each step shown (face size, scores): sit as you usually do
-  5. Log out or restart once: the first login after a boot always takes the password or the PIN.
+  5. Lock the screen (Meta+L): face unlock starts by itself; at the login screen press Enter on the empty field.
 EOF
 }
 
@@ -190,8 +196,10 @@ apply_root() {
 uninstall() {
   rm -f "$STATE/build" "$STATE/admin"
   bash "$HERE/login-lock.sh" face-pam
-  systemctl disable --now s15-face-wake.service 2>/dev/null || true
-  rm -f "$WAKE_LINK" "$WAKE" "$KEEP" /etc/s15-face.conf
+  systemctl disable --now s15-face-wake.service s15-face.socket 2>/dev/null || true
+  # shellcheck disable=SC2086
+  rm -f "$WAKE_LINK" "$WAKE" "$SOCK_LINK" $SOCK_UNITS "$KEEP" /etc/s15-face.conf /run/s15-face.sock
+  rm -rf /run/s15-face
   systemctl daemon-reload
   remove_files ""
   rm -f /usr/local/sbin/s15-face /usr/local/sbin/s15-face-run
@@ -207,7 +215,8 @@ status() {
     local missing=0
     while read -r f; do [ -e "$f" ] || { echo "  missing $f"; missing=1; }; done < "$STATE/files"
     [ $missing = 0 ] && echo "  all $(wc -l < "$STATE/files") files present"
-    echo "  s15-face-wake: $(systemctl is-active s15-face-wake.service 2>/dev/null)"
+    echo "  s15-face.socket: $(systemctl is-active s15-face.socket 2>/dev/null)," \
+      "s15-face-wake: $(systemctl is-active s15-face-wake.service 2>/dev/null)"
     echo "  lockout (s15-face lockout): $(/usr/local/sbin/s15-face lockout | tr '\n' ' ')"
   else
     echo "not installed"

@@ -44,9 +44,9 @@ FL_END='# s15-login-lock end'
 # empty field; a typed password or PIN never waits for the camera) and on the lock screen (kscreenlocker's
 # kde-fingerprint service, next to the password; Enter on its empty field starts a new face run instead of a
 # password check); sudo and polkit only after install-face.sh admin on. s15-face is the gate and runs Biopass's
-# helper (s15-face-run): never the first login after a boot, only with the display on and the lid open, false faces
-# counted with a lockout like the PIN's. Single-spaced lines (Valve's files align with several spaces), so they are
-# removed exactly and the files are as before byte for byte.
+# helper (s15-face-run): only with the display on and the lid open, false faces counted with a lockout like the
+# PIN's (root's count, kept across restarts). Single-spaced lines (Valve's files align with several spaces), so
+# they are removed exactly and the files are as before byte for byte.
 FACE_DIR=/var/lib/s15-face
 FACE_KNOWN=$HERE/face-pam.sha256
 FACE_MARK='# snaptop-linux face unlock (docs/login.md#face-unlock, steamos/login-lock.sh face-pam)'
@@ -277,11 +277,11 @@ face_pam_add() {  # $1: root, $2: yes = sudo and polkit too
     "$FACE_ADMIN" "$FACE_PREAUTH" "$FACE_SCAN"
   chmod 0644 "$k.new"; mv -f "$k.new" "$k"
   # polkit's password helper is sandboxed (no devices, no netlink, no /home); Biopass needs the cameras, udev and the
-  # user's Biopass files (read only), s15-face the user's count of false faces.
+  # user's Biopass files (read only), s15-face root's count of false faces.
   install -d "$R/etc/systemd/system/polkit-agent-helper@.service.d"
   printf '%s\n' '[Service]' '# docs/login.md#face-unlock (install-face.sh admin on): Biopass in polkit dialogs' \
     'PrivateDevices=no' 'DeviceAllow=char-video4linux rw' 'DeviceAllow=char-media rw' 'DeviceAllow=/dev/udmabuf rw' \
-    'RestrictAddressFamilies=AF_UNIX AF_NETLINK' 'ProtectHome=read-only' 'ReadWritePaths=-/run/s15-face' \
+    'RestrictAddressFamilies=AF_UNIX AF_NETLINK' 'ProtectHome=read-only' 'ReadWritePaths=-/var/lib/s15-face/lockout' \
     > "$R$FACE_POLKIT_DROPIN"
 }
 

@@ -13,15 +13,14 @@
 #                         watch for a new run and fails at once (no password check, so it never counts towards the
 #                         password lockout); anything typed goes on to the PIN and password checks
 #   s15-face pam-ok       the lock screen, after a face or password unlock: reset the count of false faces
-#   s15-face pam-account  SDDM, account phase (root): a login succeeded; from now on face may be used until the next
-#                         boot, and the count of false faces starts again
-# The gate lets Biopass run only after a login at the login screen since boot (the first login after a boot takes
-# the password or the PIN), with an IR camera and a minimum face size in the user's Biopass settings (without the
-# IR camera a photo on a phone could pass, without the size a face across the room), not while pam_faillock locks
-# the account, and counts false faces (faces seen that did not match, or that anti-spoofing flagged) since the last
-# success as the PIN counts wrong PINs: waits after 6, off after 15 until the next password or PIN login or unlock
-# (or s15-face reset); the numbers are root's (s15-face lockout). Runs look only while the display is on and the
-# lid open (s15-face-run).
+#   s15-face pam-account  SDDM, account phase (root): a login succeeded; the count of false faces starts again
+# The gate lets Biopass run only with an IR camera and a minimum face size in the user's Biopass settings (without
+# the IR camera a photo on a phone could pass, without the size a face across the room), not while pam_faillock
+# locks the account, and counts false faces (faces seen that did not match, or that anti-spoofing flagged) since the
+# last success as the PIN counts wrong PINs: waits after 6, off after 15 until the next password or PIN login or
+# unlock (or s15-face reset). The count is root's and survives restarts, so face works at the first login after a
+# boot too; the numbers are root's (s15-face lockout). Runs look only while the display is on and the lid open
+# (s15-face-run).
 #
 #   s15-face status [user]
 #   s15-face reset [user]               (root) clear the count of false faces and the wait
@@ -52,7 +51,6 @@
 #   s15-face cameras                    the cameras as Biopass's libcamera lists them
 set -u
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin   # pam_exec passes only the PAM environment
-STATE=/run/s15-face
 RUN=/usr/local/sbin/s15-face-run
 TOOL=/usr/lib/s15-face/camera_capture_test
 CONF=.config/com.ticklab.biopass/config.yaml
@@ -72,36 +70,6 @@ default_user() {
   local u
   u=$(cat /usr/lib/sddm/sddm.conf.d/*.conf /etc/sddm.conf.d/*.conf 2>/dev/null | sed -n 's/^User=//p' | tail -1)
   echo "${u:-steamos}"
-}
-
-# fails=0 and no wait in a user's state file, its other values (watch, rescan: s15-face-run) kept. Rewritten in
-# place, so the file stays the user's.
-state_clear() {
-  local f=$1 rest
-  exec 9<"$f"; flock 9
-  rest=$(grep -v -e '^fails=' -e '^until=' "$f" || true)
-  printf '%s\n' "fails=0" ${rest:+"$rest"} > "$f"
-  exec 9<&-
-}
-
-ok() {
-  local u=${PAM_USER:-} f
-  [ "${PAM_TYPE:-}" = auth ] && valid_user "$u" || exit 0
-  f=$STATE/$u
-  [ -f "$f" ] && [ ! -L "$f" ] && state_clear "$f"
-  exit 0
-}
-
-account() {
-  local u=${PAM_USER:-} f
-  [ "${PAM_TYPE:-}" = account ] && [ "$(id -u)" = 0 ] && valid_user "$u" || exit 0
-  # root-only directory: a user can update their own file but not create, replace or link one
-  install -d -m0755 "$STATE"
-  f=$STATE/$u
-  [ -L "$f" ] && rm -f "$f"
-  [ -f "$f" ] || install -m0600 -o "$u" -g "$(id -gn "$u")" /dev/null "$f"
-  echo "fails=0" > "$f"
-  exit 0
 }
 
 cameras() {
@@ -158,11 +126,10 @@ EOF
 }
 
 reset() {
-  local u=${1:-$(default_user)} f
+  local u=${1:-$(default_user)}
   [ "$(id -u)" = 0 ] || die "run as root (sudo)"
   valid_user "$u" || die "bad user name"
-  f=$STATE/$u
-  if [ -f "$f" ] && [ ! -L "$f" ]; then state_clear "$f"; echo "$u: false faces cleared"; else echo "$u: no login since boot"; fi
+  "$RUN" reset "$u"
 }
 
 camera() {
@@ -395,7 +362,7 @@ EOF
 }
 
 # One face scan as the lock screen runs it (Biopass's helper with the user's settings), with its steps on the
-# terminal. Not counted by the gates; their own checks (login since boot, settings) are shown separately.
+# terminal. Not counted; the gate's own checks (lockout, settings) are shown separately.
 antispoof() {
   local on=${1:-} u=${2:-$(default_user)} home
   case $on in on|off) ;; *) die "usage: s15-face antispoof on|off [user]" ;; esac
@@ -472,8 +439,8 @@ case "${1:-}" in
     b=$(head -c 1 | od -An -tx1 | tr -d ' \n')
     [ -z "$b" ] || [ "$b" = 00 ] || exit 1
     exec "$RUN" rescan ;;
-  pam-ok) ok ;;
-  pam-account) account ;;
+  pam-ok) exec "$RUN" ok ;;
+  pam-account) exec "$RUN" account ;;
   status) status "${2:-}" ;;
   reset) reset "${2:-}" ;;
   camera) camera "${2:-}" "${3:-}" ;;
@@ -482,5 +449,5 @@ case "${1:-}" in
   check) check ;;
   snapshot) snapshot "${2:-}" "${3:-}" ;;
   cameras) cameras ;;
-  *) sed -n '2,52p' "$0"; exit 2 ;;
+  *) sed -n '2,51p' "$0"; exit 2 ;;
 esac

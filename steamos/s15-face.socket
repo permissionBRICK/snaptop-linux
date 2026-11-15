@@ -1,0 +1,11 @@
+[Unit]
+Description=Face unlock: the count of false faces (s15-face, docs/login.md#face-unlock)
+
+[Socket]
+ListenStream=/run/s15-face.sock
+SocketMode=0666
+Accept=yes
+MaxConnections=16
+
+[Install]
+WantedBy=sockets.target
