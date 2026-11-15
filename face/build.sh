@@ -10,6 +10,10 @@
 # Usage: build.sh <SteamOS rootfs.img or root directory> [workdir]   -> <workdir>/s15-face-<version>.tar.zst
 # The workdir must not sit on an overlay (install-face.sh gives it a tmpfs).
 set -euo pipefail
+# All mounts of the build (image, overlay, chroot binds) in a mount namespace of its own: they do not propagate into
+# the namespaces of running services (which would keep copies, and the tmpfs and the loop device with them, after
+# the build) and vanish with the build.
+[ -n "${S15_FACE_NS:-}" ] || exec env S15_FACE_NS=1 unshare --mount --propagation private bash "$0" "$@"
 HERE=$(cd "$(dirname "$0")" && pwd)
 IMG=$(realpath "${1:?SteamOS rootfs.img or root directory}"); W=$(realpath -m "${2:-$HOME/snaptop-build/face}")
 [ "$(uname -m)" = aarch64 ] || [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] || { echo "needs qemu-user binfmt for aarch64"; exit 1; }

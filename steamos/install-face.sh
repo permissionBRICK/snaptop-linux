@@ -26,22 +26,23 @@ CACHE=$STATE/cache
 DEPS="webkit2gtk-4.1"            # the app; the rest Biopass needs is in the image (not fprintd: no fingerprints)
 ID=$(face_build_id)
 
-# The patched build for root $1: from the cache, else built against $1 in a chroot (overlay on a tmpfs).
+# The patched build for root $1: from the cache, else built against $1 in a chroot (overlay on a tmpfs). The tmpfs
+# lives in a mount namespace of its own (as the build's mounts do): no copy of it stays in other namespaces.
 build() {
   local R=${1:-/} pkg=$CACHE/s15-face-$ID.tar.zst w
   if [ -f "$pkg" ] && [ "${REBUILD:-0}" != 1 ]; then echo "$pkg"; return; fi
   w=$(mktemp -d /var/tmp/s15-face-build.XXXXXX)
-  mount -t tmpfs -o size=6G tmpfs "$w"
-  # shellcheck disable=SC2064  # $w expanded now: it is local
-  trap "umount -R '$w' 2>/dev/null; rmdir '$w'" EXIT
-  echo "building Biopass's auth part with our patches (about 10 minutes)..." >&2
-  bash "$REPO/face/build.sh" "$R" "$w" > "$w.log" 2>&1 ||
-    { tail -30 "$w.log" >&2; die "face build failed (log: $w.log)"; }
-  grep -E '^  |==' "$w.log" | grep -E 'tests|needs|passed|ALL' >&2 || true
   install -d -m0700 "$CACHE"
+  echo "building Biopass's auth part with our patches (about 10 minutes)..." >&2
+  # shellcheck disable=SC2016  # expanded by the inner shell
+  if ! unshare --mount --propagation private bash -c 'mount -t tmpfs -o size=6G tmpfs "$1" && bash "$2" "$3" "$1" &&
+       cp "$1/s15-face-$4.tar.zst" "$5.new"' _ "$w" "$REPO/face/build.sh" "$R" "$ID" "$pkg" > "$w.log" 2>&1; then
+    tail -30 "$w.log" >&2; rmdir "$w"; die "face build failed (log: $w.log)"
+  fi
+  grep -E '^  |==' "$w.log" | grep -E 'tests|needs|passed|ALL' >&2 || true
   rm -f "$CACHE"/s15-face-*.tar.zst
-  cp "$w/s15-face-$ID.tar.zst" "$pkg"
-  umount -R "$w"; rmdir "$w"; rm -f "$w.log"; trap - EXIT
+  mv "$pkg.new" "$pkg"
+  rmdir "$w"; rm -f "$w.log"
   echo "$pkg"
 }
 
