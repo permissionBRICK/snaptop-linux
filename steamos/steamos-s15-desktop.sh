@@ -133,18 +133,10 @@ Terminal=false
 Type=Application
 StartupNotify=false
 EOF
-# The Frame image has no Plasma network/Bluetooth applets (plasma-nm, bluedevil); NetworkManager's text UI works.
-cat > "$D/WiFi.desktop" <<'EOF2'
-[Desktop Entry]
-Name=Wi-Fi
-Comment=Connect to a Wi-Fi network (NetworkManager text UI)
-Exec=konsole --hide-menubar -e nmtui connect
-Icon=network-wireless
-Terminal=false
-Type=Application
-StartupNotify=false
-EOF2
-chmod 0755 "$D/Return.desktop" "$D/WiFi.desktop"; chown -R 1000:1000 "$D" 2>/dev/null || true
+# The Wi-Fi icon (NetworkManager's text UI) from before the network and Bluetooth applets came (desktop-net) is gone:
+# the system tray does that now.
+rm -f "$D/WiFi.desktop"
+chmod 0755 "$D/Return.desktop"; chown -R 1000:1000 "$D" 2>/dev/null || true
 # Battery and Bluetooth stay visible in the system tray. Both hide themselves in the tray's overflow when they have
 # nothing to report: on AC with the battery not charging (the normal state with a charge limit), no Bluetooth device
 # connected. A Plasma update script runs once per user at the next Plasma start (also after a new user's default
