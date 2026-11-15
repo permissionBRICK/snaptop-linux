@@ -113,8 +113,17 @@ size = (f.get("detection") or {}).get("min_face_height")
 print(f"Biopass: face {'on' if f.get('enable', True) else 'off'}, mode {mode}")
 print(f"  camera {cam or 'auto'}, IR camera {ir or 'none'}")
 size = f"{size} of the picture's height" if size else "none (face refused)"
-print(f"  minimum face height {size}, recognition threshold {(f.get('recognition') or {}).get('threshold')}, "
-      f"AI anti-spoofing {'on' if a.get('enable') else 'off'}, {f.get('retries')} attempts")
+r = f.get("recognition") or {}
+ir_t = r.get("ir_threshold")
+ir_t = f"{ir_t}" if ir_t is not None else f"{r.get('threshold')} (the colour camera's)"
+print(f"  minimum face height {size}, recognition threshold colour {r.get('threshold')}, IR {ir_t}")
+m = a.get("model") or {}
+spoof = f"on ({m.get('model_id')}, a spoof from {m.get('threshold')})" if a.get("enable") else "off"
+pair = ""
+if a.get("ir_recognition") is True and cam != ir:
+    pair = (f", one face on both cameras: at most {a.get('pair_max_offset', 0.5)} face sizes apart, "
+            f"sizes at most {a.get('pair_max_size_ratio', 1.5)} apart")
+print(f"  AI anti-spoofing {spoof}, {f.get('retries', 5)} attempts{pair}")
 EOF
   else
     echo "Biopass: not set up for $u yet (start the Biopass app once)"
@@ -201,6 +210,10 @@ if not (number(size) and 0 < size <= 1):
 rec = face.setdefault("recognition", {})
 if not (number(rec.get("threshold")) and rec["threshold"] >= float(min_threshold)):
     rec["threshold"] = float(min_threshold)
+# the IR camera's own threshold, if it has one (else it takes the colour camera's above)
+if rec.get("ir_threshold") is not None and not (number(rec["ir_threshold"]) and
+                                                rec["ir_threshold"] >= float(min_threshold)):
+    rec["ir_threshold"] = float(min_threshold)
 tmp = path + ".s15-face"
 with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
     yaml.safe_dump(c, f, sort_keys=False)
@@ -236,8 +249,10 @@ if was_ir != now_ir:
         moved = f"{a} IR faces faces/ -> faces-ir/, {b} colour faces faces-rgb/ -> faces/"
     if a or b:
         print(f"moved {moved}")
+ir_t = rec.get("ir_threshold")
 print(f"mode: {mode}\ncamera: {face['camera']}\nIR camera: {ir}\nminimum face height: "
-      f"{det['min_face_height']} of the picture's height\nrecognition threshold: {rec['threshold']}")
+      f"{det['min_face_height']} of the picture's height\nrecognition threshold: colour {rec['threshold']}, IR "
+      f"{ir_t if ir_t is not None else rec['threshold']}")
 n_main, n_ir = len(images(faces)), len(images(faces_ir))
 if mode == "ir":
     print(f"enrolled: {n_main} IR faces (faces/)")
@@ -406,7 +421,7 @@ check() {
   "$RUN" state "$u" | sed -n 's/^  face now: refused: /Note: the lock screen refuses face now: /p'
   echo "Scanning (look at the screen; the camera light comes on)..."
   out=$("$HELPER" auth --username "$u" --verbose 2>&1 >/dev/null); rc=$?
-  grep -E 'FaceAuth: (Face on|No face|Recognition (PASSED|FAILED)|The .* frame came|Recognised on both|Could not|Both cameras must|No face enrolled|Anti-spoofing failed|AI anti-spoofing (detected spoof|check passed)|IR presence check (PASSED|FAILED))|camera appears covered' \
+  grep -E 'FaceAuth: (Face on|No face|Recognition (PASSED|FAILED)|The .* frame came|Recognised on both|One face on both|The faces on the colour|Could not|Both cameras must|No face enrolled|Anti-spoofing failed|AI anti-spoofing (detected spoof|check passed)|IR presence check (PASSED|FAILED))|camera appears covered' \
     <<< "$out" | sed -E "s/^\[[0-9-]+ ([0-9:.]+)\] \[[a-z]+\] \[[a-z]+\] (FaceAuth: )?/\1 /; s/ \(NOTE:.*\)\$//;
                          s#face='[^']*/(faces[^/]*/[^']*)'#\1#"
   case $rc in
