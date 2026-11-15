@@ -79,9 +79,18 @@ log "app: build ($(rustc --version), $J jobs)"
 (cd "$A/src-tauri" && cargo build --release --frozen --ignore-rust-version -j "$J" --features tauri/custom-protocol) \
   > "$B/app-build.log" 2>&1 || { grep -E -A8 '^error' "$B/app-build.log" | head -60; exit 1; }
 log "app: tests"
-(cd "$A/src-tauri" && cargo test --release --frozen --ignore-rust-version -j "$J") > "$B/app-test.log" 2>&1 ||
+# With the build's features: cargo test also builds the app's binary (for the integration tests), and one without
+# tauri/custom-protocol is a development build that loads its pages from Vite's dev server (localhost:1420).
+(cd "$A/src-tauri" && cargo test --release --frozen --ignore-rust-version -j "$J" --features tauri/custom-protocol) \
+  > "$B/app-test.log" 2>&1 ||
   { grep -E 'FAILED|panicked|^error' -A6 "$B/app-test.log" | head -60; exit 1; }
 echo "  app: $(grep -E '^test result' "$B/app-test.log" | awk '{p+=$4; f+=$6} END {print p " passed, " f " failed"}')"
+# The production build embeds the frontend (each file of dist/assets by its path); a development build has none.
+strings "$A/src-tauri/target/release/biopass" > "$B/app-strings.txt"
+for f in "$A"/dist/assets/*; do
+  grep -qF "/assets/${f##*/}" "$B/app-strings.txt" || { echo "app: ${f##*/} not embedded: a development build"; exit 1; }
+done
+echo "  app: frontend embedded ($(find "$A/dist/assets" -type f | wc -l) assets)"
 log "stage"
 L=$STAGE/usr/lib/biopass; LB=$T/libcamera-bundle
 install -D -m0755 "$T/pam/biopass-helper" "$STAGE/usr/bin/biopass-helper"
