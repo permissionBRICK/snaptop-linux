@@ -631,6 +631,13 @@ def check_wake():
         sessions["/g1"]["Active"] = False
         w.check_greeter()
         expect(w.greeter_session is None, "wake: the greeter went away -> its scan stops")
+        expect(not w.greeter_after_logout, "wake: a login screen without a logout before -> starts by itself")
+        w.on_sessions("2", "/s2")            # the user's session ends (a logout)
+        sessions.pop("/s2")
+        sessions["/g1"]["Active"] = True
+        w.check_greeter()
+        expect(w.greeter_session == "/g1" and w.greeter_after_logout,
+               "wake: the login screen right after a logout -> on Enter only")
     finally:
         for k, v in saved.items():
             setattr(m, k, v)
@@ -659,6 +666,17 @@ def check_greeter_loop():
     rt.update(lambda d: d.__setitem__("rescan", d.get("rescan", 0) + 1))
     th.join(5)
     expect(out.get("rc") == 0 and calls == [1, 1], "greeter: Enter -> a new run, match taken -> ends (0)")
+    rig, st, rt = Rig(), state(), runtime()
+    rig.codes("0 0.05")
+    out = {}
+    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(rig.runner(st, conf()), rt, lambda: True,
+                                                                           start_waiting=True)), daemon=True)
+    th.start()
+    time.sleep(1.0)
+    expect(th.is_alive() and rig.n_runs() == 0, "greeter: after a logout no run by itself")
+    rt.update(lambda d: d.__setitem__("rescan", d.get("rescan", 0) + 1))
+    th.join(5)
+    expect(out.get("rc") == 0 and rig.n_runs() == 1, "greeter: after a logout, Enter -> run -> login")
 
 
 def check_sleep():

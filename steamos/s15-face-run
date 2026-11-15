@@ -644,12 +644,14 @@ def cmd_watch():
         runtime.update(lambda d: d.pop("watch", None) if d.get("watch") == me else None)
 
 
-def watch_loop(r, runtime, on_match=None):
+def watch_loop(r, runtime, on_match=None, start_waiting=False):
     """0: a match (unlock); 1: face off until a password or PIN, or the lock screen ended. Ending makes kscreenlocker
     hide its face hint; it starts the watch again only after a failed password (then it is checked again). Refused
     for a while (a wait, pam_faillock, the settings): the watch stays and tries at the next start of a run."""
     u, service = r.user, r.service
-    waiting = False   # a run ended: the next one starts when the display comes back on, or on Enter (rescan)
+    # waiting: a run ended (or none may start by itself yet): the next one starts when the display comes back on, or
+    # on Enter (rescan)
+    waiting = start_waiting
     seen = (runtime.read() or {}).get("rescan", 0)
     while True:
         if r.parent_gone():
@@ -1010,8 +1012,10 @@ def sddm_login(user, session, sock_path, timeout=30):
         c.close()
 
 
-def cmd_greeter(user):
-    """(root, s15-face-wake's child while SDDM's greeter is up) the login screen's background scan."""
+def cmd_greeter(user, after_logout=False):
+    """(root, s15-face-wake's child while SDDM's greeter is up) the login screen's background scan. after_logout: the
+    user's session ended a moment ago (a logout): they are still in front, so the first run waits for Enter or the
+    display going off and on, as the lock screen does after Meta+L."""
     if os.geteuid() != 0 or not valid_user(user):
         sys.exit(2)
     parent = os.getppid()
@@ -1042,8 +1046,10 @@ def cmd_greeter(user):
         log(f"{user}: login screen: SDDM {'logs in' if ok else 'refused the login'} ({session})")
         return ok
 
+    if after_logout:
+        log(f"{user}: login screen right after a logout: face unlock on Enter or when the display was off")
     try:
-        sys.exit(watch_loop(r, rt, on_match))
+        sys.exit(watch_loop(r, rt, on_match, start_waiting=after_logout))
     finally:
         r.kill()
         rt.update(lambda d: d.pop("watch", None) if d.get("watch") == me else None)
@@ -1090,6 +1096,8 @@ class Waker:
         self.taps, self.last_tap, self.told = 0, 0.0, set()
         self.ticking = False
         self.greeter, self.greeter_session = None, None
+        self.user_sessions, self.user_ended = set(), -1e9   # user sessions seen; when one ended (monotonic)
+        self.greeter_after_logout = False
         self.greeter_cmd = greeter_cmd or [sys.executable, "-I", os.path.abspath(__file__), "greeter"]
 
     def props(self, path):
@@ -1105,6 +1113,7 @@ class Waker:
                 out.append((str(path), self.props(path)))
             except self.dbus.DBusException:
                 self.proxies.pop(str(path), None)
+        self.user_sessions |= {p for p, s in out if s["Class"] == "user"}
         return out
 
     # logind's signals
@@ -1129,7 +1138,11 @@ class Waker:
             self.check_greeter()
 
     def on_sessions(self, _sid, path):
-        self.proxies.pop(str(path), None)
+        path = str(path)
+        self.proxies.pop(path, None)
+        if path in self.user_sessions:          # SessionRemoved of a user's session: a logout (or a crash)
+            self.user_sessions.discard(path)
+            self.user_ended = time.monotonic()
         self.check_greeter()
 
     # the lock screen after a wake
@@ -1191,9 +1204,13 @@ class Waker:
             self.greeter_session = active[0]
             if not valid_user(user):
                 return
-            log(f"wake: login screen up: face unlock for {user} without Enter{' (dry run)' if self.dry else ''}")
+            after_logout = time.monotonic() - self.user_ended < 60
+            log(f"wake: login screen up: face unlock for {user}"
+                f"{' on Enter (just logged out)' if after_logout else ' without Enter'}{' (dry run)' if self.dry else ''}")
+            self.greeter_after_logout = after_logout
             if not self.dry:
-                self.greeter = subprocess.Popen(self.greeter_cmd + [user], stdin=subprocess.DEVNULL,
+                self.greeter = subprocess.Popen(self.greeter_cmd + [user] + (["after-logout"] if after_logout else []),
+                                                stdin=subprocess.DEVNULL,
                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                                 preexec_fn=lambda: set_pdeathsig(signal.SIGTERM))
                 from gi.repository import GLib
@@ -1369,7 +1386,7 @@ def main():
             sys.exit("s15-face-run wake: run as root")
         cmd_wake(dry_run="--dry-run" in sys.argv, simulate_resume="--simulate-resume" in sys.argv)
     elif cmd == "greeter" and len(sys.argv) > 2:
-        cmd_greeter(sys.argv[2])
+        cmd_greeter(sys.argv[2], after_logout="after-logout" in sys.argv[3:])
     elif cmd == "lockout":
         sys.exit(cmd_lockout(sys.argv[2:]))
     elif cmd == "state":
