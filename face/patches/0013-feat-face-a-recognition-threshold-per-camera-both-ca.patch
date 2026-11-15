@@ -1,0 +1,770 @@
+From e115673fa6328454b19036e3ddf93a5ffd08c5ee Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:10:15 +0000
+Subject: [PATCH] feat(face): a recognition threshold per camera; both cameras
+ must see one face
+
+The colour and the IR camera's pictures score differently against their
+own enrolled faces, but one recognition.threshold served both.
+recognition.ir_threshold (default null: the threshold) is the IR
+camera's wherever it recognises: as the main camera, and with
+anti_spoofing.ir_recognition. Matching compares each face against its
+camera's threshold (FaceAuth::recognitionThreshold) instead of the
+recognizer's single one; the logs name the camera and its threshold
+(also "IR camera" when the IR camera is the main camera).
+
+With ir_recognition the two cameras could recognise two different faces:
+a photo on a phone held next to the user's face matched on the colour
+camera while the IR camera, which sees nothing on a phone, recognised
+the real face beside it. The faces must now be one face: their boxes,
+as fractions of each picture, at most anti_spoofing.pair_max_offset
+face sizes apart (default 0.5, 0 = no check) and their heights at most
+pair_max_size_ratio apart (default 1.5); else the attempt fails like a
+spoof (face/common/face_pair.h, checked before the second camera's
+match). The cameras sit side by side: on the ASUS Vivobook S 15 the same
+face measured 0.95 of its colour width and 0.86 of its colour height in
+IR over 5 enrolment pairs, well inside the tolerance. Out-of-range
+values turn face off, as thresholds do.
+
+The anti-spoofing model's score and threshold are logged when it passes
+too, not only for a spoof.
+Tests: face_pair (new), face_both_cameras, config_validation,
+config_golden.
+---
+ auth/CMakeLists.txt                       |  1 +
+ auth/core/auth_config.cc                  | 18 ++++-
+ auth/core/auth_config.h                   | 23 ++++++-
+ auth/face/CMakeLists.txt                  |  1 +
+ auth/face/antispoofing/antispoof_check.cc |  6 +-
+ auth/face/common/face_pair.cc             | 38 +++++++++++
+ auth/face/common/face_pair.h              | 42 ++++++++++++
+ auth/face/face_auth.cc                    | 49 ++++++++++---
+ auth/face/face_auth.h                     | 12 +++-
+ auth/test/config_golden/main.cpp          |  4 ++
+ auth/test/config_validation/main.cpp      | 61 ++++++++++++++---
+ auth/test/face_both_cameras/main.cpp      | 62 ++++++++++++++++-
+ auth/test/face_pair/CMakeLists.txt        | 14 ++++
+ auth/test/face_pair/main.cpp              | 83 +++++++++++++++++++++++
+ 14 files changed, 384 insertions(+), 30 deletions(-)
+ create mode 100644 auth/face/common/face_pair.cc
+ create mode 100644 auth/face/common/face_pair.h
+ create mode 100644 auth/test/face_pair/CMakeLists.txt
+ create mode 100644 auth/test/face_pair/main.cpp
+
+diff --git a/auth/CMakeLists.txt b/auth/CMakeLists.txt
+index 8388940..a9fb556 100644
+--- a/auth/CMakeLists.txt
++++ b/auth/CMakeLists.txt
+@@ -93,6 +93,7 @@ if(BUILD_TESTS)
+     add_subdirectory(test/keyring_tpm)
+     add_subdirectory(test/runpath)
+     add_subdirectory(test/camera_list)
++    add_subdirectory(test/face_pair)
+ endif()
+ 
+ install(
+diff --git a/auth/core/auth_config.cc b/auth/core/auth_config.cc
+index d9d0a5b..2083887 100644
+--- a/auth/core/auth_config.cc
++++ b/auth/core/auth_config.cc
+@@ -65,10 +65,14 @@ std::vector<std::string> dedupeServices(const std::vector<std::string>& services
+ // anti-spoofing is on. detection.min_face_height likewise: negative or NaN
+ // would silently drop the check, above 1 nothing could pass.
+ bool faceThresholdsValid(const FaceMethodConfig& face) {
++  const AntiSpoofingConfig& a = face.anti_spoofing;
+   return thresholdInRange(face.detection.threshold) &&
+          thresholdInRange(face.detection.min_face_height) &&
+          thresholdInRange(face.recognition.threshold) &&
+-         (!face.anti_spoofing.enable || thresholdInRange(face.anti_spoofing.model.threshold));
++         (!face.recognition.ir_threshold || thresholdInRange(*face.recognition.ir_threshold)) &&
++         (!a.enable || thresholdInRange(a.model.threshold)) && a.pair_max_offset >= 0.0f &&
++         a.pair_max_offset <= kMaxPairOffset && a.pair_max_size_ratio >= 1.0f &&
++         a.pair_max_size_ratio <= kMaxPairSizeRatio;
+ }
+ 
+ }  // namespace
+@@ -80,8 +84,10 @@ void validateConfig(BiopassConfig& config) {
+ 
+   FaceMethodConfig& face = config.methods.face;
+   if (face.enable && !faceThresholdsValid(face)) {
+-    spdlog::warn("Biopass: a face threshold or min_face_height is outside [{}, {}], face is disabled",
+-                 kMinThreshold, kMaxThreshold);
++    spdlog::warn(
++        "Biopass: a face threshold or min_face_height is outside [{}, {}], or a pair limit outside "
++        "its range, face is disabled",
++        kMinThreshold, kMaxThreshold);
+     face.enable = false;
+   }
+   face.retries = std::min(face.retries, kMaxFaceRetries);
+@@ -189,6 +195,8 @@ void parseAntiSpoofing(const YAML::Node& a, AntiSpoofingConfig& out) {
+   readIf(a, "ir_presence_timeout_ms", out.ir_presence_timeout_ms);
+   // Strict: a typo must reject the config, never read as false.
+   readStrictBool(a, "ir_recognition", out.ir_recognition);
++  readIf(a, "pair_max_offset", out.pair_max_offset);
++  readIf(a, "pair_max_size_ratio", out.pair_max_size_ratio);
+ }
+ 
+ // A list of {camera, ir_camera, allow_without_ir} maps; null is no profiles, as in the app.
+@@ -227,6 +235,10 @@ void parseFace(const YAML::Node& f, FaceMethodConfig& out) {
+   if (f["recognition"]) {
+     readIf(f["recognition"], "model_id", out.recognition.model_id);
+     readIf(f["recognition"], "threshold", out.recognition.threshold);
++    // null or absent: the threshold.
++    if (f["recognition"]["ir_threshold"] && !f["recognition"]["ir_threshold"].IsNull()) {
++      out.recognition.ir_threshold = f["recognition"]["ir_threshold"].as<float>();
++    }
+   }
+   readOptionalString(f, "camera", out.camera);
+   if (f["camera_profiles"]) {
+diff --git a/auth/core/auth_config.h b/auth/core/auth_config.h
+index 497258b..72663cf 100644
+--- a/auth/core/auth_config.h
++++ b/auth/core/auth_config.h
+@@ -46,7 +46,13 @@ struct DetectionConfig {
+ 
+ struct RecognitionConfig {
+   std::string model_id;
++  // The colour camera's (and any camera's but the IR camera's): a face matches
++  // when it scores above it against an enrolled face.
+   float threshold = 0.5f;
++  // The IR camera's, whenever it recognises (as the main camera, or with
++  // ir_recognition): the two cameras' pictures score differently. nullopt =
++  // `threshold`.
++  std::optional<float> ir_threshold = std::nullopt;
+ };
+ 
+ struct AntiSpoofingModelConfig {
+@@ -73,6 +79,12 @@ struct AntiSpoofingConfig {
+   // than the main camera; when the IR camera is the main camera it already
+   // recognises and this changes nothing.
+   bool ir_recognition = false;
++  // With ir_recognition: the faces the two cameras recognised must be one face,
++  // in the same place in both pictures (face/common/face_pair.h): centres at
++  // most pair_max_offset face sizes apart (0 = no check), heights at most
++  // pair_max_size_ratio apart. Else the attempt fails like a spoof.
++  float pair_max_offset = 0.5f;
++  float pair_max_size_ratio = 1.5f;
+ };
+ 
+ // One colour + IR camera pair in `camera_profiles` (see camera_profile.h).
+@@ -136,12 +148,17 @@ inline constexpr uint32_t kMaxFingerprintTimeoutMs = 10000;
+ // detection.min_face_height is a fraction of the frame height in [0, 1].
+ inline constexpr float kMinThreshold = 0.0f;
+ inline constexpr float kMaxThreshold = 1.0f;
++// anti_spoofing.pair_max_offset in [0, kMaxPairOffset] face sizes,
++// pair_max_size_ratio in [1, kMaxPairSizeRatio].
++inline constexpr float kMaxPairOffset = 2.0f;
++inline constexpr float kMaxPairSizeRatio = 4.0f;
+ 
+ // Puts a config into the ranges the helper relies on. readConfig() calls it
+ // on every config it returns.
+-// - A face threshold or detection.min_face_height outside [kMinThreshold,
+-//   kMaxThreshold] (or NaN) turns face off: there is no safe value to clamp
+-//   it to. The anti-spoofing
++// - A face threshold (recognition.ir_threshold when set) or
++//   detection.min_face_height outside [kMinThreshold, kMaxThreshold] (or
++//   NaN), or a pair_max_offset / pair_max_size_ratio outside its range, turns
++//   face off: there is no safe value to clamp it to. The anti-spoofing
+ //   threshold only counts while anti-spoofing is on.
+ // - order keeps each method once and appends the missing ones;
+ //   ignore_services drops empty and repeated names.
+diff --git a/auth/face/CMakeLists.txt b/auth/face/CMakeLists.txt
+index 2e63c56..8483a75 100644
+--- a/auth/face/CMakeLists.txt
++++ b/auth/face/CMakeLists.txt
+@@ -51,6 +51,7 @@ add_library(biopass_face_common STATIC
+     common/debug_image_io.cc
+     common/frame_darkness.cc
+     common/face_framing.cc
++    common/face_pair.cc
+     common/v4l2_capture.cc
+ )
+ set_target_properties(biopass_face_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
+diff --git a/auth/face/antispoofing/antispoof_check.cc b/auth/face/antispoofing/antispoof_check.cc
+index f4598c6..4a1668d 100644
+--- a/auth/face/antispoofing/antispoof_check.cc
++++ b/auth/face/antispoofing/antispoof_check.cc
+@@ -63,7 +63,8 @@ bool checkAntiSpoofByAIModel(const FaceMethodConfig& faceCfg, const std::string&
+     }
+     const SpoofResult result = face_as->inference(frame, face_box);
+     if (result.spoof) {
+-      spdlog::warn("FaceAuth: AI anti-spoofing detected spoof, score: {}", result.score);
++      spdlog::warn("FaceAuth: AI anti-spoofing detected spoof | score={:.3f} threshold={:.3f}",
++                   result.score, faceCfg.anti_spoofing.model.threshold);
+       if (authCfg.debug) {
+         saveFailedFace(username, frame.crop(face_box.x1, face_box.y1, face_box.x2, face_box.y2),
+                        "spoof");
+@@ -71,7 +72,8 @@ bool checkAntiSpoofByAIModel(const FaceMethodConfig& faceCfg, const std::string&
+       return false;
+     }
+ 
+-    spdlog::debug("FaceAuth: AI anti-spoofing check passed");
++    spdlog::debug("FaceAuth: AI anti-spoofing check passed | score={:.3f} threshold={:.3f}",
++                  result.score, faceCfg.anti_spoofing.model.threshold);
+     return true;
+   } catch (const std::exception& e) {
+     spdlog::error("FaceAuth: AI anti-spoofing check failed: {}", e.what());
+diff --git a/auth/face/common/face_pair.cc b/auth/face/common/face_pair.cc
+new file mode 100644
+index 0000000..9ea2096
+--- /dev/null
++++ b/auth/face/common/face_pair.cc
+@@ -0,0 +1,38 @@
++#include "face_pair.h"
++
++#include <algorithm>
++#include <cmath>
++
++namespace biopass {
++
++FrameBox frameBox(int x1, int y1, int x2, int y2, int width, int height) {
++  if (width <= 0 || height <= 0) {
++    return {};
++  }
++  const float w = static_cast<float>(width);
++  const float h = static_cast<float>(height);
++  return FrameBox{(x1 + x2) / 2.0f / w, (y1 + y2) / 2.0f / h, std::max(0, x2 - x1) / w,
++                  std::max(0, y2 - y1) / h};
++}
++
++FacePair checkFacePair(const FrameBox& a, const FrameBox& b, float max_offset,
++                       float max_size_ratio) {
++  FacePair pair;
++  const float w = std::max(a.w, b.w);
++  const float h = std::max(a.h, b.h);
++  const float low = std::min(a.h, b.h);
++  // NaN limits fail closed: every comparison with NaN is false.
++  const bool check = !(max_offset <= 0.0f);
++  if (!(w > 0.0f) || !(low > 0.0f)) {
++    pair.same_place = !check;
++    return pair;
++  }
++  pair.dx = std::fabs(a.cx - b.cx) / w;
++  pair.dy = std::fabs(a.cy - b.cy) / h;
++  pair.size_ratio = h / low;
++  pair.same_place = !check || (pair.dx <= max_offset && pair.dy <= max_offset &&
++                               pair.size_ratio <= max_size_ratio);
++  return pair;
++}
++
++}  // namespace biopass
+diff --git a/auth/face/common/face_pair.h b/auth/face/common/face_pair.h
+new file mode 100644
+index 0000000..43d28d3
+--- /dev/null
++++ b/auth/face/common/face_pair.h
+@@ -0,0 +1,42 @@
++#pragma once
++
++// Whether the faces two cameras saw at (nearly) one moment are the same face:
++// in both-cameras mode (anti_spoofing.ir_recognition) the colour and the IR
++// camera must each recognise the user, and without this check they could
++// recognise two different faces, e.g. a photo on a phone held next to the
++// user's real face (a phone shows nothing in infrared, so the IR camera finds
++// the real face beside it). Pure, so it can be tested without a camera.
++//
++// The cameras sit side by side and see nearly the same field, so a face is
++// compared where it lies as fractions of each picture. On the ASUS Vivobook
++// S 15 the same face measured 0.95 of its colour width and 0.86 of its colour
++// height (as fractions of each picture) in IR over 5 enrolment pairs: well
++// inside the tolerance.
++
++namespace biopass {
++
++// A face box as fractions of its frame: centre, width and height.
++struct FrameBox {
++  float cx = 0.0f, cy = 0.0f, w = 0.0f, h = 0.0f;
++};
++
++// The box (x1, y1)-(x2, y2) in pixels of a width x height frame; all zero for
++// an empty frame.
++FrameBox frameBox(int x1, int y1, int x2, int y2, int width, int height);
++
++struct FacePair {
++  // How far apart the centres are: horizontally in widths of the wider box,
++  // vertically in heights of the taller box.
++  float dx = 0.0f, dy = 0.0f;
++  // The taller box's height over the other's (>= 1).
++  float size_ratio = 1.0f;
++  bool same_place = true;
++};
++
++// The same face: centres at most max_offset face sizes apart in each direction
++// and heights at most max_size_ratio apart. max_offset <= 0 checks nothing
++// (always the same place); a NaN limit or an empty box never is.
++FacePair checkFacePair(const FrameBox& a, const FrameBox& b, float max_offset,
++                       float max_size_ratio);
++
++}  // namespace biopass
+diff --git a/auth/face/face_auth.cc b/auth/face/face_auth.cc
+index 4e2c8f2..eaf67ff 100644
+--- a/auth/face/face_auth.cc
++++ b/auth/face/face_auth.cc
+@@ -18,6 +18,7 @@
+ #include "camera_capture.h"
+ #include "debug_image_io.h"
+ #include "face_framing.h"
++#include "face_pair.h"
+ #include "frame_darkness.h"
+ #include "image_io.h"
+ #include "onnx_session.h"
+@@ -81,6 +82,12 @@ bool FaceAuth::bothCameras() const {
+   return face_config_.anti_spoofing.ir_recognition && !irIsMainCamera();
+ }
+ 
++float FaceAuth::recognitionThreshold(FaceSet set) const {
++  const RecognitionConfig& r = face_config_.recognition;
++  const bool ir = set == FaceSet::Ir || irIsMainCamera();
++  return ir && r.ir_threshold ? *r.ir_threshold : r.threshold;
++}
++
+ std::chrono::steady_clock::time_point FaceAuth::now() const {
+   return seams_.now ? seams_.now() : std::chrono::steady_clock::now();
+ }
+@@ -279,7 +286,8 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+     reportInfo("Biopass: looking for your face...");
+   }
+ 
+-  const std::optional<Sighting> seen = lookForFace(camera_session_, cameraName(false, false));
++  const std::optional<Sighting> seen =
++      lookForFace(camera_session_, cameraName(false, irIsMainCamera()));
+   if (!seen) {
+     return AuthResult::NoFace;
+   }
+@@ -440,6 +448,29 @@ AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthC
+   if (cancel_signal && cancel_signal->load()) {
+     return AuthResult::Failure;
+   }
++  // One face, not two: a photo held up for the colour camera next to a real
++  // face that the IR camera recognises fails here (face/common/face_pair.h).
++  const Sighting& colour_seen = first == Camera::Main ? *first_seen : *second_seen;
++  const Sighting& ir_seen = first == Camera::Ir ? *first_seen : *second_seen;
++  const auto boxOf = [](const Sighting& s) {
++    const Box& b = s.face.box;
++    return frameBox(b.x1, b.y1, b.x2, b.y2, s.frame.width, s.frame.height);
++  };
++  const AntiSpoofingConfig& anti = face_config_.anti_spoofing;
++  const FacePair pair = checkFacePair(boxOf(colour_seen), boxOf(ir_seen), anti.pair_max_offset,
++                                      anti.pair_max_size_ratio);
++  if (!pair.same_place) {
++    spdlog::warn(
++        "FaceAuth: The faces on the colour and the IR camera are not one face | offset x={:.2f} "
++        "y={:.2f} size={:.2f} (at most {:.2f}, {:.2f}) — returning Failure",
++        pair.dx, pair.dy, pair.size_ratio, anti.pair_max_offset, anti.pair_max_size_ratio);
++    second_slot.reset();
++    return AuthResult::Failure;
++  }
++  spdlog::debug(
++      "FaceAuth: One face on both cameras | offset x={:.2f} y={:.2f} size={:.2f} (at "
++      "most {:.2f}, {:.2f})",
++      pair.dx, pair.dy, pair.size_ratio, anti.pair_max_offset, anti.pair_max_size_ratio);
+   if (second == Camera::Main && !aiAntiSpoofPasses(username, *second_seen, config, cancel_signal)) {
+     spdlog::warn("FaceAuth: Anti-spoofing failed on the {} — returning Failure", name(second));
+     second_slot.reset();
+@@ -511,7 +542,8 @@ bool FaceAuth::matchFace(const std::string& username, const ImageRGB& face, Face
+     return seams_.match(face, set, enrolled_paths);
+   }
+   return matchAgainstEnrolled(username, face, enrolled_paths,
+-                              cameraName(bothCameras(), set == FaceSet::Ir));
++                              cameraName(bothCameras(), set == FaceSet::Ir || irIsMainCamera()),
++                              recognitionThreshold(set));
+ }
+ 
+ bool FaceAuth::aiAntiSpoofPasses(const std::string& username, const Sighting& seen,
+@@ -528,9 +560,9 @@ bool FaceAuth::aiAntiSpoofPasses(const std::string& username, const Sighting& se
+ // Unreadable enrolled images are skipped, never matched.
+ bool FaceAuth::matchAgainstEnrolled(const std::string& username, const ImageRGB& face,
+                                     const std::vector<std::string>& enrolled_paths,
+-                                    const char* camera_name) {
++                                    const char* camera_name, float threshold) {
+   spdlog::debug("FaceAuth: Recognition on the {} | threshold={:.3f} enrolled_count={}", camera_name,
+-                face_config_.recognition.threshold, enrolled_paths.size());
++                threshold, enrolled_paths.size());
+   float best = -1.0f;
+   for (const auto& facePath : enrolled_paths) {
+     const auto faceBytes = readUserFile(username, facePath, kMaxImageFileBytes);
+@@ -540,18 +572,19 @@ bool FaceAuth::matchAgainstEnrolled(const std::string& username, const ImageRGB&
+       continue;
+     }
+ 
+-    MatchResult match = recognizer_->match(preparedFace, face);
++    const MatchResult match = recognizer_->match(preparedFace, face);
++    const bool similar = isSameFace(match.similarity, threshold);
+     best = std::max(best, match.similarity);
+     spdlog::debug("FaceAuth: Recognition | face='{}' score={:.4f} threshold={:.3f} similar={}",
+-                  facePath, match.similarity, face_config_.recognition.threshold, match.similar);
+-    if (match.similar) {
++                  facePath, match.similarity, threshold, similar);
++    if (similar) {
+       spdlog::debug("FaceAuth: Recognition PASSED on the {} | matched face='{}' score={:.4f}",
+                     camera_name, facePath, match.similarity);
+       return true;
+     }
+   }
+   spdlog::debug("FaceAuth: Recognition FAILED on the {} | best score={:.4f} threshold={:.3f}",
+-                camera_name, best, face_config_.recognition.threshold);
++                camera_name, best, threshold);
+   return false;
+ }
+ 
+diff --git a/auth/face/face_auth.h b/auth/face/face_auth.h
+index d0a0a07..7e74e3b 100644
+--- a/auth/face/face_auth.h
++++ b/auth/face/face_auth.h
+@@ -83,6 +83,11 @@ class FaceAuth : public IAuthMethod {
+   // IR camera other than the main camera, or none: then face fails closed).
+   bool bothCameras() const;
+ 
++  // The recognition threshold of the camera whose faces `set` holds: the IR
++  // camera's (recognition.ir_threshold, else threshold) for faces-ir/ and for
++  // faces/ when the IR camera is the main camera, else recognition.threshold.
++  float recognitionThreshold(FaceSet set) const;
++
+  private:
+   enum class Camera { Main, Ir };
+ 
+@@ -125,10 +130,11 @@ class FaceAuth : public IAuthMethod {
+   // True once `face` matches one of the enrolled images of `set`.
+   bool matchFace(const std::string& username, const ImageRGB& face, FaceSet set,
+                  const std::vector<std::string>& enrolled_paths);
+-  // True once `face` matches one of the user's enrolled images.
++  // True once `face` scores above `threshold` against one of the enrolled
++  // images.
+   bool matchAgainstEnrolled(const std::string& username, const ImageRGB& face,
+-                            const std::vector<std::string>& enrolled_paths,
+-                            const char* camera_name);
++                            const std::vector<std::string>& enrolled_paths, const char* camera_name,
++                            float threshold);
+   // Biopass's AI anti-spoofing model on a colour frame, when it is on; the
+   // IR presence check is not run (ir_recognition replaces it).
+   bool aiAntiSpoofPasses(const std::string& username, const Sighting& seen,
+diff --git a/auth/test/config_golden/main.cpp b/auth/test/config_golden/main.cpp
+index e9f1cde..b629b95 100644
+--- a/auth/test/config_golden/main.cpp
++++ b/auth/test/config_golden/main.cpp
+@@ -59,6 +59,8 @@ void expectSameConfig(const BiopassConfig& a, const BiopassConfig& b, const std:
+         "face.detection.min_face_height");
+   field(fa.recognition.model_id == fb.recognition.model_id, "face.recognition.model_id");
+   field(fa.recognition.threshold == fb.recognition.threshold, "face.recognition.threshold");
++  field(fa.recognition.ir_threshold == fb.recognition.ir_threshold,
++        "face.recognition.ir_threshold");
+ 
+   const auto& aa = fa.anti_spoofing;
+   const auto& ab = fb.anti_spoofing;
+@@ -70,6 +72,8 @@ void expectSameConfig(const BiopassConfig& a, const BiopassConfig& b, const std:
+   field(aa.ir_presence_timeout_ms == ab.ir_presence_timeout_ms,
+         "anti_spoofing.ir_presence_timeout_ms");
+   field(aa.ir_recognition == ab.ir_recognition, "anti_spoofing.ir_recognition");
++  field(aa.pair_max_offset == ab.pair_max_offset, "anti_spoofing.pair_max_offset");
++  field(aa.pair_max_size_ratio == ab.pair_max_size_ratio, "anti_spoofing.pair_max_size_ratio");
+ 
+   const auto& pa = a.methods.fingerprint;
+   const auto& pb = b.methods.fingerprint;
+diff --git a/auth/test/config_validation/main.cpp b/auth/test/config_validation/main.cpp
+index fd318b4..f1ee313 100644
+--- a/auth/test/config_validation/main.cpp
++++ b/auth/test/config_validation/main.cpp
+@@ -8,6 +8,7 @@
+ #include <limits>
+ #include <optional>
+ #include <string>
++#include <tuple>
+ #include <utility>
+ #include <vector>
+ 
+@@ -88,7 +89,7 @@ methods:
+       - {camera: /dev/v4l/by-path/pci-0-usb-0:8:1.0-video-index0, ir_camera: /dev/video2}
+       - {}
+     detection: {model_id: det, threshold: 0.6, min_face_height: 0.3}
+-    recognition: {model_id: rec, threshold: 0.7}
++    recognition: {model_id: rec, threshold: 0.7, ir_threshold: 0.65}
+     anti_spoofing:
+       enable: true
+       model: {model_id: as, threshold: 0.9}
+@@ -96,6 +97,8 @@ methods:
+       ir_warmup_delay_ms: 100
+       ir_presence_timeout_ms: 200
+       ir_recognition: true
++      pair_max_offset: 0.4
++      pair_max_size_ratio: 1.3
+   fingerprint:
+     enable: true
+     retries: 2
+@@ -114,15 +117,16 @@ void checkParse() {
+            "parse: strategy read");
+     expect(f.enable && f.retries == 3 && f.retry_delay == 100 && f.camera == "/dev/video0" &&
+                f.detection.model_id == "det" && f.detection.threshold == 0.6f &&
+-               f.detection.min_face_height == 0.3f &&
+-               f.recognition.model_id == "rec" && f.recognition.threshold == 0.7f,
++               f.detection.min_face_height == 0.3f && f.recognition.model_id == "rec" &&
++               f.recognition.threshold == 0.7f && f.recognition.ir_threshold == 0.65f,
+            "parse: face read");
+-    expect(f.anti_spoofing.enable && f.anti_spoofing.model.model_id == "as" &&
+-               f.anti_spoofing.model.threshold == 0.9f &&
+-               f.anti_spoofing.ir_camera == "/dev/video2" &&
+-               f.anti_spoofing.ir_warmup_delay_ms == 100 &&
+-               f.anti_spoofing.ir_presence_timeout_ms == 200 && f.anti_spoofing.ir_recognition,
+-           "parse: anti_spoofing read");
++    expect(
++        f.anti_spoofing.enable && f.anti_spoofing.model.model_id == "as" &&
++            f.anti_spoofing.model.threshold == 0.9f && f.anti_spoofing.ir_camera == "/dev/video2" &&
++            f.anti_spoofing.ir_warmup_delay_ms == 100 &&
++            f.anti_spoofing.ir_presence_timeout_ms == 200 && f.anti_spoofing.ir_recognition &&
++            f.anti_spoofing.pair_max_offset == 0.4f && f.anti_spoofing.pair_max_size_ratio == 1.3f,
++        "parse: anti_spoofing read");
+     const auto& p = f.camera_profiles;
+     expect(p.size() == 3 && p[0].camera == "/dev/v4l/by-id/usb-Dock-video-index0" &&
+                !p[0].ir_camera && p[0].allow_without_ir && !p[1].allow_without_ir &&
+@@ -205,6 +209,23 @@ void checkParse() {
+     expect(c.methods.face.enable && c.methods.face.detection.min_face_height == 0.0f &&
+                !c.methods.face.anti_spoofing.ir_recognition,
+            "parse: missing min_face_height and ir_recognition -> 0 (no check) and off");
++    expect(!c.methods.face.recognition.ir_threshold &&
++               c.methods.face.anti_spoofing.pair_max_offset == 0.5f &&
++               c.methods.face.anti_spoofing.pair_max_size_ratio == 1.5f,
++           "parse: missing ir_threshold and pair limits -> the threshold, 0.5 and 1.5");
++  }
++
++  {
++    const BiopassConfig c =
++        parseOrDie("schema_version: 2\nmethods:\n  face: {recognition: {ir_threshold: ~}}\n");
++    expect(c.methods.face.enable && !c.methods.face.recognition.ir_threshold,
++           "parse: recognition.ir_threshold null -> the threshold");
++  }
++
++  {
++    const BiopassConfig c =
++        parseOrDie("schema_version: 2\nmethods:\n  face: {recognition: {ir_threshold: 1.5}}\n");
++    expect(!c.methods.face.enable, "parse: recognition.ir_threshold 1.5 -> face off");
+   }
+ 
+   {
+@@ -304,6 +325,28 @@ int main() {
+                  [](BiopassConfig& c, float v) { c.methods.face.recognition.threshold = v; });
+   checkThreshold("detection.min_face_height",
+                  [](BiopassConfig& c, float v) { c.methods.face.detection.min_face_height = v; });
++  checkThreshold("recognition.ir_threshold",
++                 [](BiopassConfig& c, float v) { c.methods.face.recognition.ir_threshold = v; });
++
++  for (const auto& [offset, ratio, keep] : std::vector<std::tuple<float, float, bool>>{
++           {0.5f, 1.5f, true},
++           {0.0f, 1.0f, true},  // no position check; sizes must agree exactly (no effect then)
++           {2.0f, 4.0f, true},
++           {-0.1f, 1.5f, false},
++           {2.1f, 1.5f, false},
++           {kNaN, 1.5f, false},
++           {0.5f, 0.9f, false},
++           {0.5f, 4.1f, false},
++           {0.5f, kNaN, false},
++       }) {
++    BiopassConfig c;
++    c.methods.face.anti_spoofing.pair_max_offset = offset;
++    c.methods.face.anti_spoofing.pair_max_size_ratio = ratio;
++    biopass::validateConfig(c);
++    expect(c.methods.face.enable == keep, "pair_max_offset " + std::to_string(offset) +
++                                              ", pair_max_size_ratio " + std::to_string(ratio) +
++                                              (keep ? " keeps face on" : " turns face off"));
++  }
+   checkThreshold("anti_spoofing.model.threshold (enabled)", [](BiopassConfig& c, float v) {
+     c.methods.face.anti_spoofing.enable = true;
+     c.methods.face.anti_spoofing.model.threshold = v;
+diff --git a/auth/test/face_both_cameras/main.cpp b/auth/test/face_both_cameras/main.cpp
+index 5e95ff5..da65a3e 100644
+--- a/auth/test/face_both_cameras/main.cpp
++++ b/auth/test/face_both_cameras/main.cpp
+@@ -48,8 +48,9 @@ constexpr int kRgbWidth = 640;
+ constexpr int kIrWidth = 560;
+ constexpr int kHeight = 360;
+ 
+-// What the fake detector finds in the next frame of a camera.
+-enum class Seen { Face, NoFace, Small, Edge };
++// What the fake detector finds in the next frame of a camera. Beside: a face
++// one face width to the right of where the other camera sees it.
++enum class Seen { Face, NoFace, Small, Edge, Beside };
+ 
+ struct Rig {
+   // Camera opens and sessions, as in test/face_camera_reuse.
+@@ -117,6 +118,8 @@ FaceAuth::Seams seams(Rig& rig) {
+       box = biopass::Box(300, 150, 340, 200);  // 50 rows: across the room
+     } else if (what == Seen::Edge) {
+       box = biopass::Box(0, 60, 160, 260);  // touches the left edge
++    } else if (what == Seen::Beside) {
++      box = biopass::Box(300, 60, 460, 260);
+     }
+     return {biopass::Detection(0, "face", 0.9f, box, frame.crop(box.x1, box.y1, box.x2, box.y2))};
+   };
+@@ -356,7 +359,62 @@ void checkCancel() {
+ 
+ }  // namespace
+ 
++// A photo on a phone held next to the face: the colour camera recognises the
++// photo, the IR camera the real face beside it. Two faces, not one: the
++// attempt fails like a spoof (a false face), and never reaches the IR match.
++void checkTwoFacesFail() {
++  Rig rig;
++  rig.seen[kIrWidth] = {Seen::Beside};
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.beginAuthenticationSession();
++  const AuthResult result = face.authenticate(kUser, biopass::AuthConfig{});
++  expect(result == AuthResult::Failure, "two faces: failure (counts as a false face)");
++  expect(joined(rig.matched_sets) == "rgb", "two faces: the IR face is not matched");
++  face.endAuthenticationSession();
++
++  // The same with the check off (pair_max_offset 0).
++  Rig off;
++  off.seen[kIrWidth] = {Seen::Beside};
++  biopass::FaceMethodConfig config = bothConfig();
++  config.anti_spoofing.pair_max_offset = 0.0f;
++  FaceAuth unchecked(config, kUser, opener(off), seams(off));
++  unchecked.beginAuthenticationSession();
++  expect(unchecked.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "two faces, check off: success");
++  unchecked.endAuthenticationSession();
++}
++
++// Each camera has its own recognition threshold: the IR camera's
++// (ir_threshold, else threshold) wherever it recognises.
++void checkThresholdPerCamera() {
++  biopass::FaceMethodConfig both = bothConfig();
++  both.recognition.threshold = 0.6f;
++  {
++    FaceAuth face(both, kUser);
++    expect(face.recognitionThreshold(FaceAuth::FaceSet::Main) == 0.6f &&
++               face.recognitionThreshold(FaceAuth::FaceSet::Ir) == 0.6f,
++           "threshold: no ir_threshold -> the threshold on both cameras");
++  }
++  both.recognition.ir_threshold = 0.7f;
++  {
++    FaceAuth face(both, kUser);
++    expect(face.recognitionThreshold(FaceAuth::FaceSet::Main) == 0.6f &&
++               face.recognitionThreshold(FaceAuth::FaceSet::Ir) == 0.7f,
++           "threshold: both -> colour 0.6, IR 0.7");
++  }
++  biopass::FaceMethodConfig ir = both;
++  ir.camera = kIr;
++  ir.anti_spoofing.ir_recognition = false;
++  {
++    FaceAuth face(ir, kUser);
++    expect(face.recognitionThreshold(FaceAuth::FaceSet::Main) == 0.7f,
++           "threshold: IR as the main camera -> the IR camera's");
++  }
++}
++
+ int main() {
++  checkTwoFacesFail();
++  checkThresholdPerCamera();
+   checkBothMatch();
+   checkNoFallbackToIr();
+   checkFraming();
+diff --git a/auth/test/face_pair/CMakeLists.txt b/auth/test/face_pair/CMakeLists.txt
+new file mode 100644
+index 0000000..996fc21
+--- /dev/null
++++ b/auth/test/face_pair/CMakeLists.txt
+@@ -0,0 +1,14 @@
++set(FACE_PAIR_TEST face_pair_test)
++
++# face_pair.cc is plain box maths, built in directly so the test doesn't pull
++# libcamera in through biopass_face_common.
++add_executable(${FACE_PAIR_TEST}
++    main.cpp
++    ${CMAKE_SOURCE_DIR}/face/common/face_pair.cc
++)
++
++target_include_directories(${FACE_PAIR_TEST} PRIVATE
++    ${CMAKE_SOURCE_DIR}/face/common
++)
++
++add_test(NAME face_pair COMMAND ${FACE_PAIR_TEST})
+diff --git a/auth/test/face_pair/main.cpp b/auth/test/face_pair/main.cpp
+new file mode 100644
+index 0000000..d3f6637
+--- /dev/null
++++ b/auth/test/face_pair/main.cpp
+@@ -0,0 +1,83 @@
++// Checks face/common/face_pair.h: whether the faces the colour and the IR
++// camera saw are the same face, by place and size in their pictures. Exits
++// non-zero on any failure.
++
++#include <cmath>
++#include <cstdio>
++#include <limits>
++
++#include "face_pair.h"
++
++namespace {
++
++using biopass::checkFacePair;
++using biopass::FrameBox;
++using biopass::frameBox;
++
++int g_failures = 0;
++
++void expect(bool cond, const char* what) {
++  std::printf("[%s] %s\n", cond ? "PASS" : "FAIL", what);
++  if (!cond) {
++    g_failures++;
++  }
++}
++
++bool near(float a, float b) { return std::fabs(a - b) < 1e-4f; }
++
++// The colour camera's picture (1920x1092) and the IR camera's (560x360).
++FrameBox colour(int x1, int y1, int x2, int y2) { return frameBox(x1, y1, x2, y2, 1920, 1092); }
++FrameBox ir(int x1, int y1, int x2, int y2) { return frameBox(x1, y1, x2, y2, 560, 360); }
++
++}  // namespace
++
++int main() {
++  const FrameBox box = frameBox(100, 60, 260, 260, 640, 360);
++  expect(near(box.cx, 180.0f / 640) && near(box.cy, 160.0f / 360) && near(box.w, 0.25f) &&
++             near(box.h, 200.0f / 360),
++         "frameBox: centre and size as fractions of the frame");
++  const FrameBox none = frameBox(10, 10, 20, 20, 0, 360);
++  expect(none.w == 0.0f && none.h == 0.0f, "frameBox: an empty frame gives an empty box");
++
++  // A pair from the laptop's enrolment: the face at the centre of both
++  // pictures, 0.95 of its colour width and 0.86 of its colour height in IR.
++  const FrameBox c = colour(747, 258, 1173, 833);  // 426x575
++  const FrameBox i = ir(221, 98, 339, 263);        // 118x165
++  auto pair = checkFacePair(c, i, 0.5f, 1.5f);
++  expect(pair.same_place, "a real pair: the same place");
++  expect(pair.dx < 0.05f && pair.dy < 0.05f, "a real pair: the centres nearly agree");
++  expect(pair.size_ratio > 1.1f && pair.size_ratio < 1.25f,
++         "a real pair: the IR face a little smaller (as measured)");
++
++  // The face a little off to one side on the IR camera (the head moved in the
++  // half second between the pictures, or the cameras' small parallax).
++  pair = checkFacePair(c, ir(261, 98, 379, 263), 0.5f, 1.5f);
++  expect(pair.same_place && pair.dx > 0.2f, "a third of a face width apart: the same place");
++
++  // A phone held next to the face: the colour camera recognises the photo on
++  // it, the IR camera the real face one face width beside it.
++  pair = checkFacePair(c, ir(339, 98, 457, 263), 0.5f, 1.5f);
++  expect(!pair.same_place && pair.dx > 0.9f, "a face beside the other: not the same place");
++  pair = checkFacePair(c, ir(221, 0, 339, 165), 0.5f, 1.5f);
++  expect(!pair.same_place && pair.dy > 0.5f, "a face above the other: not the same place");
++
++  // A small photo held up in the middle of the picture against the real face.
++  pair = checkFacePair(colour(860, 400, 1060, 670), i, 0.5f, 1.5f);
++  expect(!pair.same_place && pair.size_ratio > 1.5f, "half the size: not the same face");
++
++  // Limits.
++  expect(checkFacePair(c, ir(339, 98, 457, 263), 0.0f, 1.5f).same_place, "max_offset 0: no check");
++  expect(!checkFacePair(c, i, std::numeric_limits<float>::quiet_NaN(), 1.5f).same_place,
++         "max_offset NaN: fails closed");
++  expect(!checkFacePair(c, i, 0.5f, std::numeric_limits<float>::quiet_NaN()).same_place,
++         "max_size_ratio NaN: fails closed");
++  expect(!checkFacePair(FrameBox{}, i, 0.5f, 1.5f).same_place, "an empty box: never the same face");
++  expect(checkFacePair(FrameBox{}, i, 0.0f, 1.5f).same_place, "an empty box with no check: ok");
++
++  if (g_failures != 0) {
++    std::printf("%d FAILED\n", g_failures);
++    return 1;
++  }
++  std::printf("ALL PASS\n");
++  return 0;
++}
+-- 
+2.43.0
+

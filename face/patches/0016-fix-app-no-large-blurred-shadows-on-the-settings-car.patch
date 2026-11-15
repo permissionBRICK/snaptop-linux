@@ -1,0 +1,93 @@
+From 4a04ffc7c070d881caeabc32f4f07d3c50251779 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:17:43 +0000
+Subject: [PATCH] fix(app): no large blurred shadows on the settings cards: the
+ page scrolled at 17 fps
+
+The settings page's cards had `shadow-lg` and `backdrop-blur-sm`, the
+expanded method card `shadow-md`; the face card is thousands of pixels
+tall, and WebKitGTK paints such shadows again on every scroll step.
+Measured on a Snapdragon X laptop (WebKitGTK 2.50, its GL on Mesa's
+zink, WEBKIT_DISABLE_DMABUF_RENDERER=1 as it needs there) with the page
+in a WebKitGTK view in a nested KWin: 17.5 frames a second while
+scrolling and 16 % of a core at rest with them, 60 (16 ms frames) and
+4 % without. A plain page scrolled at 60 either way, and neither the
+DMA-BUF renderer, compositing nor Skia's CPU rendering changed it. The
+cards keep their border and background; small shadows (buttons,
+inputs) and the rings stay.
+---
+ app/src/app/configuration/-components/KeyringCard.tsx    | 2 +-
+ app/src/app/configuration/-components/LockoutCard.tsx    | 2 +-
+ app/src/app/configuration/-components/MethodCard.tsx     | 2 +-
+ app/src/app/configuration/-components/MethodConfig.tsx   | 2 +-
+ app/src/app/configuration/-components/StrategyConfig.tsx | 2 +-
+ 5 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/app/src/app/configuration/-components/KeyringCard.tsx b/app/src/app/configuration/-components/KeyringCard.tsx
+index 63923a1..0a14ac9 100644
+--- a/app/src/app/configuration/-components/KeyringCard.tsx
++++ b/app/src/app/configuration/-components/KeyringCard.tsx
+@@ -74,7 +74,7 @@ export function KeyringCard() {
+   const lock = status?.saved ? lockText(status.pcr7) : null;
+ 
+   return (
+-    <div className="rounded-xl border border-border/50 bg-card/50 backdrop-blur-sm p-6 shadow-lg">
++    <div className="rounded-xl border border-border/50 bg-card/50 p-6">
+       <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
+         <span className="w-8 h-8 rounded-lg bg-linear-to-br from-amber-500 to-orange-500 flex items-center justify-center">
+           <KeyRound className="w-4 h-4 text-white" />
+diff --git a/app/src/app/configuration/-components/LockoutCard.tsx b/app/src/app/configuration/-components/LockoutCard.tsx
+index 9edcb44..95f7a45 100644
+--- a/app/src/app/configuration/-components/LockoutCard.tsx
++++ b/app/src/app/configuration/-components/LockoutCard.tsx
+@@ -72,7 +72,7 @@ export function LockoutCard() {
+   const allDefault = lockout.settings.every((s) => s.value === s.default);
+ 
+   return (
+-    <div className="rounded-xl border border-border/50 bg-card/50 backdrop-blur-sm p-6 shadow-lg">
++    <div className="rounded-xl border border-border/50 bg-card/50 p-6">
+       <h2 className="text-xl font-semibold mb-1 flex items-center gap-2">
+         <span className="w-8 h-8 rounded-lg bg-linear-to-br from-rose-500 to-red-500 flex items-center justify-center">
+           <ShieldAlert className="w-4 h-4 text-white" />
+diff --git a/app/src/app/configuration/-components/MethodCard.tsx b/app/src/app/configuration/-components/MethodCard.tsx
+index 0979f94..241cb42 100644
+--- a/app/src/app/configuration/-components/MethodCard.tsx
++++ b/app/src/app/configuration/-components/MethodCard.tsx
+@@ -30,7 +30,7 @@ export function MethodCard({
+       className={cn(
+         "group relative overflow-hidden rounded-xl border transition-all duration-200",
+         expanded
+-          ? "border-border bg-muted/30 shadow-md ring-2 ring-primary/20"
++          ? "border-border bg-muted/30 ring-2 ring-primary/20"
+           : "border-border bg-background/50 hover:bg-muted/20 shadow-xs",
+       )}
+     >
+diff --git a/app/src/app/configuration/-components/MethodConfig.tsx b/app/src/app/configuration/-components/MethodConfig.tsx
+index 4c5a92b..416eb69 100644
+--- a/app/src/app/configuration/-components/MethodConfig.tsx
++++ b/app/src/app/configuration/-components/MethodConfig.tsx
+@@ -31,7 +31,7 @@ export function MethodConfig() {
+   };
+ 
+   return (
+-    <div className="rounded-xl border border-border/50 bg-card/50 backdrop-blur-sm p-6 shadow-lg">
++    <div className="rounded-xl border border-border/50 bg-card/50 p-6">
+       <h2 className="text-2xl sm:text-3xl font-bold tracking-tight mb-6 flex items-center gap-3">
+         <span className="w-10 h-10 rounded-xl bg-linear-to-br from-purple-500 to-pink-500 flex items-center justify-center shadow-sm">
+           <ShieldCheck className="w-5 h-5 text-white" />
+diff --git a/app/src/app/configuration/-components/StrategyConfig.tsx b/app/src/app/configuration/-components/StrategyConfig.tsx
+index d9acf8e..f8de59f 100644
+--- a/app/src/app/configuration/-components/StrategyConfig.tsx
++++ b/app/src/app/configuration/-components/StrategyConfig.tsx
+@@ -40,7 +40,7 @@ export function StrategyConfig() {
+   const strategy = useWatch<BiopassConfig, "strategy">({ name: "strategy" });
+ 
+   return (
+-    <div className="rounded-xl border border-border/50 bg-card/50 backdrop-blur-sm p-6 shadow-lg">
++    <div className="rounded-xl border border-border/50 bg-card/50 p-6">
+       <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
+         <span className="w-8 h-8 rounded-lg bg-linear-to-br from-blue-500 to-cyan-500 flex items-center justify-center">
+           <Zap className="w-4 h-4 text-white" />
+-- 
+2.43.0
+

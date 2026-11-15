@@ -1,0 +1,288 @@
+From 83638a1b0b00f228966e9b96912039a9bb12be18 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:17:32 +0000
+Subject: [PATCH] feat(app): unsaved settings are never lost without asking
+
+Moving the threshold slider and closing the app lost the change: the
+page saves only on Save, at the top of a long page. While the form has
+unsaved changes a bar at the bottom offers Save and Reset, and closing
+the window (Tauri's close-requested event; core:window:allow-destroy to
+close afterwards) or leaving the page (the router's blocker) asks to
+save, discard or stay. Save goes through the form's checks and closes
+or leaves only once it saved.
+---
+ app/src-tauri/capabilities/default.json       |   1 +
+ .../-components/UnsavedChangesDialog.tsx      |  72 ++++++++++
+ app/src/app/configuration/page.tsx            | 126 +++++++++++++++++-
+ 3 files changed, 195 insertions(+), 4 deletions(-)
+ create mode 100644 app/src/app/configuration/-components/UnsavedChangesDialog.tsx
+
+diff --git a/app/src-tauri/capabilities/default.json b/app/src-tauri/capabilities/default.json
+index 6859154..56f8827 100644
+--- a/app/src-tauri/capabilities/default.json
++++ b/app/src-tauri/capabilities/default.json
+@@ -5,6 +5,7 @@
+   "windows": ["main"],
+   "permissions": [
+     "core:default",
++    "core:window:allow-destroy",
+     "opener:default",
+     "dialog:allow-open",
+     {
+diff --git a/app/src/app/configuration/-components/UnsavedChangesDialog.tsx b/app/src/app/configuration/-components/UnsavedChangesDialog.tsx
+new file mode 100644
+index 0000000..28b0bcb
+--- /dev/null
++++ b/app/src/app/configuration/-components/UnsavedChangesDialog.tsx
+@@ -0,0 +1,72 @@
++import { Loader2 } from "lucide-react";
++import { Button } from "@/components/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog";
++
++interface Props {
++  open: boolean;
++  /** What happens after Save or Discard: "close" the window or "leave" the page. */
++  then: "close" | "leave";
++  saving: boolean;
++  onSave: () => void;
++  onDiscard: () => void;
++  onStay: () => void;
++}
++
++/** Asked before unsaved settings would be lost: closing the app or leaving the page. */
++export function UnsavedChangesDialog({
++  open,
++  then,
++  saving,
++  onSave,
++  onDiscard,
++  onStay,
++}: Props) {
++  return (
++    <Dialog
++      open={open}
++      onOpenChange={(next) => {
++        if (!next && !saving) onStay();
++      }}
++    >
++      <DialogContent>
++        <DialogHeader>
++          <DialogTitle>Save your changes?</DialogTitle>
++          <DialogDescription>
++            The settings have changes that are not saved yet. Without Save they
++            are lost when you{" "}
++            {then === "close" ? "close Biopass" : "leave this page"}.
++          </DialogDescription>
++        </DialogHeader>
++        <DialogFooter>
++          <Button
++            type="button"
++            variant="outline"
++            onClick={onStay}
++            disabled={saving}
++          >
++            Stay
++          </Button>
++          <Button
++            type="button"
++            variant="destructive"
++            onClick={onDiscard}
++            disabled={saving}
++          >
++            Discard
++          </Button>
++          <Button type="button" onClick={onSave} disabled={saving}>
++            {saving && <Loader2 className="w-4 h-4 animate-spin" />}
++            Save
++          </Button>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/app/src/app/configuration/page.tsx b/app/src/app/configuration/page.tsx
+index 8632447..61b94cc 100644
+--- a/app/src/app/configuration/page.tsx
++++ b/app/src/app/configuration/page.tsx
+@@ -1,8 +1,9 @@
+ import { zodResolver } from "@hookform/resolvers/zod";
+-import { createFileRoute } from "@tanstack/react-router";
++import { createFileRoute, useBlocker } from "@tanstack/react-router";
++import { getCurrentWindow } from "@tauri-apps/api/window";
+ import { RotateCcw, Save } from "lucide-react";
+ import { useTheme } from "next-themes";
+-import { useEffect, useState } from "react";
++import { useEffect, useRef, useState } from "react";
+ import { FormProvider, useForm } from "react-hook-form";
+ import { toast } from "sonner";
+ import { cmd } from "@/commands";
+@@ -19,6 +20,7 @@ import { KeyringCard } from "./-components/KeyringCard";
+ import { LockoutCard } from "./-components/LockoutCard";
+ import { MethodConfig } from "./-components/MethodConfig";
+ import { StrategyConfig } from "./-components/StrategyConfig";
++import { UnsavedChangesDialog } from "./-components/UnsavedChangesDialog";
+ import { biopassConfigSchema, validateConfig } from "./-components/validation";
+ 
+ function ConfigurationRouteComponent() {
+@@ -104,7 +106,72 @@ function ConfigurationForm({
+   const { isSubmitting, isDirty } = form.formState;
+   const { theme } = useTheme();
+ 
+-  async function onSave(values: BiopassConfig) {
++  // Unsaved changes are never lost without asking: leaving the page or closing
++  // the window with them asks to save, discard or stay.
++  const dirty = useRef(false);
++  dirty.current = isDirty;
++  const closing = useRef(false);
++  const [closeAsked, setCloseAsked] = useState(false);
++  const [saving, setSaving] = useState(false);
++  const blocker = useBlocker({
++    shouldBlockFn: () => dirty.current,
++    enableBeforeUnload: false,
++    withResolver: true,
++  });
++
++  useEffect(() => {
++    let unlisten: (() => void) | undefined;
++    let gone = false;
++    getCurrentWindow()
++      .onCloseRequested((event) => {
++        if (!dirty.current || closing.current) return;
++        event.preventDefault();
++        setCloseAsked(true);
++      })
++      .then((u) => {
++        if (gone) u();
++        else unlisten = u;
++      })
++      .catch((err) =>
++        console.error("Failed to watch the window closing:", err),
++      );
++    return () => {
++      gone = true;
++      unlisten?.();
++    };
++  }, []);
++
++  function closeWindow() {
++    closing.current = true;
++    getCurrentWindow()
++      .destroy()
++      .catch((err) => {
++        closing.current = false;
++        toast.error(`Failed to close: ${err}`);
++      });
++  }
++
++  // Saves with the form's checks; true when it saved.
++  function saveNow(): Promise<boolean> {
++    return new Promise((resolve) => {
++      void form.handleSubmit(
++        async (values) => resolve(await onSave(values)),
++        () => {
++          toast.error("Please fix validation errors before saving");
++          resolve(false);
++        },
++      )();
++    });
++  }
++
++  async function saveThen(next: () => void) {
++    setSaving(true);
++    const saved = await saveNow();
++    setSaving(false);
++    if (saved) next();
++  }
++
++  async function onSave(values: BiopassConfig): Promise<boolean> {
+     let configToSave = withCurrentAppearance(values, theme);
+ 
+     try {
+@@ -123,7 +190,7 @@ function ConfigurationForm({
+         configToSave,
+         faceModeOf(saved.config.methods.face),
+       );
+-      if (!isValid) return;
++      if (!isValid) return false;
+ 
+       const outcome = await cmd.config.save(configToSave);
+       form.reset(configToSave);
+@@ -136,9 +203,11 @@ function ConfigurationForm({
+       if (outcome.faces_moved) {
+         toast.info(facesMovedText(outcome.faces_moved));
+       }
++      return true;
+     } catch (err) {
+       console.error("Failed to save config:", err);
+       toast.error(`Failed to save config: ${err}`);
++      return false;
+     }
+   }
+ 
+@@ -215,7 +284,56 @@ function ConfigurationForm({
+             <LockoutCard />
+             <KeyringCard />
+           </div>
++
++          {isDirty && (
++            <div className="sticky bottom-4 z-40 flex items-center justify-between gap-4 rounded-lg border-2 border-primary/50 bg-background p-3">
++              <p className="text-sm">Unsaved changes: they apply once saved.</p>
++              <div className="flex gap-2">
++                <Button
++                  type="button"
++                  variant="outline"
++                  onClick={handleReset}
++                  disabled={isSubmitting}
++                >
++                  <RotateCcw className="w-4 h-4" />
++                  Reset
++                </Button>
++                <Button type="submit" disabled={isSubmitting}>
++                  <Save className="w-4 h-4" />
++                  {isSubmitting ? "Saving..." : "Save"}
++                </Button>
++              </div>
++            </div>
++          )}
+         </form>
++        <UnsavedChangesDialog
++          open={closeAsked || blocker.status === "blocked"}
++          then={closeAsked ? "close" : "leave"}
++          saving={saving}
++          onStay={() => {
++            setCloseAsked(false);
++            if (blocker.status === "blocked") blocker.reset();
++          }}
++          onDiscard={() => {
++            if (closeAsked) {
++              setCloseAsked(false);
++              closeWindow();
++            } else if (blocker.status === "blocked") {
++              form.reset();
++              blocker.proceed();
++            }
++          }}
++          onSave={() =>
++            void saveThen(() => {
++              if (closeAsked) {
++                setCloseAsked(false);
++                closeWindow();
++              } else if (blocker.status === "blocked") {
++                blocker.proceed();
++              }
++            })
++          }
++        />
+       </FormProvider>
+     </SavedSettingsContext.Provider>
+   );
+-- 
+2.43.0
+

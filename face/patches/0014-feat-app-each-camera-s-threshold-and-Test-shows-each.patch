@@ -1,0 +1,1271 @@
+From b52e21a1500499713ac384d66b7877f1ffb6e4ad Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:17:32 +0000
+Subject: [PATCH] feat(app): each camera's threshold, and Test shows each
+ camera's score, anti-spoofing's and the one-face check
+
+The settings know recognition.ir_threshold (the IR camera's; null: the
+threshold) and anti_spoofing.pair_max_offset / pair_max_size_ratio
+(both cameras must see one face), with the helper's defaults in
+defaults.yaml. A Thresholds block puts the colour camera's and the IR
+camera's recognition thresholds and the anti-spoofing model's side by
+side (finer steps, 0.01), each marked as used or not in the mode, the
+IR one "same as colour" until it is moved; it warns below 0.6. Choosing
+a mode raises an IR threshold of its own below 0.6, as it does the
+colour one. The model sections keep only the model choices.
+
+Test reads more of the helper's log: each camera's last result (best
+score, its threshold, matched), the anti-spoofing score against its
+threshold, whether both cameras saw one face, and each face's score
+with the threshold it was compared against, so a face's badge is red
+against its own camera's threshold.
+Tests: scan (per face, per camera, spoof and pair lines), faceMode.test.ts.
+---
+ app/src-tauri/src/config.rs                   |  17 +
+ app/src-tauri/src/scan.rs                     | 321 +++++++++++++++---
+ .../-components/face/AntiSpoofingSection.tsx  |  20 --
+ .../-components/face/FaceModelsSection.tsx    |  26 --
+ .../-components/face/FaceSets.tsx             |  11 +-
+ .../-components/face/FaceSetting.tsx          |  12 +-
+ .../-components/face/TestScan.tsx             |  60 +++-
+ .../-components/face/ThresholdsSection.tsx    | 119 +++++++
+ .../-components/face/faceMode.test.ts         |  35 +-
+ .../-components/face/faceMode.ts              |  24 +-
+ .../-components/methods/shared/Threshold.tsx  |  15 +-
+ .../configuration/-components/validation.ts   |   3 +
+ app/src/bindings.ts                           | 130 ++++++-
+ app/src/lib/models.test.ts                    |   3 +
+ auth/test/config/defaults.yaml                |   3 +
+ 15 files changed, 685 insertions(+), 114 deletions(-)
+ create mode 100644 app/src/app/configuration/-components/face/ThresholdsSection.tsx
+
+diff --git a/app/src-tauri/src/config.rs b/app/src-tauri/src/config.rs
+index 7813862..4f4a66e 100644
+--- a/app/src-tauri/src/config.rs
++++ b/app/src-tauri/src/config.rs
+@@ -102,8 +102,14 @@ pub struct DetectionConfig {
+ #[serde(default)]
+ pub struct RecognitionConfig {
+     pub model_id: String,
++    /// The colour camera's (any camera's but the IR camera's): a face matches
++    /// when it scores above it against an enrolled face.
+     #[specta(type = specta_typescript::Number)]
+     pub threshold: f32,
++    /// The IR camera's, wherever it recognises (as the main camera, or with
++    /// `anti_spoofing.ir_recognition`); None: `threshold`.
++    #[specta(type = Option<specta_typescript::Number>)]
++    pub ir_threshold: Option<f32>,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Type)]
+@@ -126,6 +132,14 @@ pub struct AntiSpoofingConfig {
+     /// instead of only checking that it sees a face. Needs an IR camera other
+     /// than the main camera.
+     pub ir_recognition: bool,
++    /// With `ir_recognition`: the faces both cameras recognised must be one
++    /// face, centres at most this many face sizes apart in their pictures
++    /// (0: no check).
++    #[specta(type = specta_typescript::Number)]
++    pub pair_max_offset: f32,
++    /// ... and their heights at most this ratio apart.
++    #[specta(type = specta_typescript::Number)]
++    pub pair_max_size_ratio: f32,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Type)]
+@@ -168,6 +182,7 @@ fn get_default_config() -> BiopassConfig {
+                 recognition: RecognitionConfig {
+                     model_id: "edgeface-s-gamma-05".to_string(),
+                     threshold: 0.5,
++                    ir_threshold: None,
+                 },
+                 anti_spoofing: AntiSpoofingConfig {
+                     // Off: the bundled checkpoints reject real faces (#76). Keep in sync
+@@ -181,6 +196,8 @@ fn get_default_config() -> BiopassConfig {
+                     ir_warmup_delay_ms: DEFAULT_IR_WARMUP_DELAY_MS,
+                     ir_presence_timeout_ms: DEFAULT_IR_PRESENCE_TIMEOUT_MS,
+                     ir_recognition: false,
++                    pair_max_offset: 0.5,
++                    pair_max_size_ratio: 1.5,
+                 },
+             },
+             fingerprint: FingerprintMethodConfig {
+diff --git a/app/src-tauri/src/scan.rs b/app/src-tauri/src/scan.rs
+index 7c41334..cab1e2a 100644
+--- a/app/src-tauri/src/scan.rs
++++ b/app/src-tauri/src/scan.rs
+@@ -46,9 +46,13 @@ pub struct ScanResult {
+     /// same), its best over the scan's attempts, in the order first compared.
+     /// A face compared after a match is not listed: matching stops there.
+     pub scores: Vec<FaceScore>,
+-    /// The recognition threshold the scan used: a face matches above it.
+-    #[specta(type = Option<specta_typescript::Number>)]
+-    pub threshold: Option<f64>,
++    /// Each camera's last recognition: its best score, its threshold, and
++    /// whether it matched ("camera", "IR camera" or "colour camera").
++    pub cameras: Vec<CameraResult>,
++    /// The AI anti-spoofing model's last verdict on the colour picture.
++    pub anti_spoofing: Option<SpoofResult>,
++    /// Both cameras: whether their faces were one face (in the same place).
++    pub pair: Option<PairResult>,
+     #[specta(type = specta_typescript::Number)]
+     pub duration_ms: u64,
+ }
+@@ -59,40 +63,202 @@ pub struct FaceScore {
+     pub path: String,
+     #[specta(type = specta_typescript::Number)]
+     pub score: f64,
++    /// The threshold it was compared against (its camera's): it matches above.
++    #[specta(type = Option<specta_typescript::Number>)]
++    pub threshold: Option<f64>,
++}
++
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct CameraResult {
++    pub camera: String,
++    #[specta(type = specta_typescript::Number)]
++    pub best: f64,
++    #[specta(type = Option<specta_typescript::Number>)]
++    pub threshold: Option<f64>,
++    pub matched: bool,
++}
++
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct SpoofResult {
++    /// The model's spoof score: a spoof at or above the threshold.
++    #[specta(type = specta_typescript::Number)]
++    pub score: f64,
++    #[specta(type = Option<specta_typescript::Number>)]
++    pub threshold: Option<f64>,
++    pub spoof: bool,
+ }
+ 
+-/// The per-face lines of the helper's debug log:
+-/// "FaceAuth: Recognition | face='<path>' score=0.4813 threshold=0.600 similar=0".
+-fn scores_from_log(log: &str) -> (Vec<FaceScore>, Option<f64>) {
+-    let mut scores: Vec<FaceScore> = Vec::new();
+-    let mut threshold = None;
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct PairResult {
++    /// How far apart the faces' centres were, in face widths and heights.
++    #[specta(type = specta_typescript::Number)]
++    pub dx: f64,
++    #[specta(type = specta_typescript::Number)]
++    pub dy: f64,
++    /// The taller face's height over the other's.
++    #[specta(type = specta_typescript::Number)]
++    pub size_ratio: f64,
++    #[specta(type = Option<specta_typescript::Number>)]
++    pub max_offset: Option<f64>,
++    #[specta(type = Option<specta_typescript::Number>)]
++    pub max_size_ratio: Option<f64>,
++    pub same_place: bool,
++}
++
++/// The number after `name` among the whitespace-separated words of `text`
++/// ("score=0.4813", "x=0.12").
++fn field(text: &str, name: &str) -> Option<f64> {
++    text.split_whitespace()
++        .find_map(|kv| {
++            kv.trim_end_matches([',', ')'])
++                .strip_prefix(name)?
++                .parse::<f64>()
++                .ok()
++        })
++        .filter(|v| v.is_finite())
++}
++
++/// The two limits of "(at most 0.50, 1.50)".
++fn at_most(text: &str) -> (Option<f64>, Option<f64>) {
++    let Some(rest) = text.split("(at most ").nth(1) else {
++        return (None, None);
++    };
++    let mut nums = rest
++        .split([',', ')'])
++        .map(|n| n.trim().parse::<f64>().ok().filter(|v| v.is_finite()));
++    (nums.next().flatten(), nums.next().flatten())
++}
++
++#[derive(Debug, Default, PartialEq)]
++struct ScanDetails {
++    scores: Vec<FaceScore>,
++    cameras: Vec<CameraResult>,
++    anti_spoofing: Option<SpoofResult>,
++    pair: Option<PairResult>,
++}
++
++/// What the helper's debug log says about the faces it compared, per face, per
++/// camera, the anti-spoofing model and the two cameras' faces. With several
++/// attempts (auth --keep-looking) a camera's, the model's and the pair's last
++/// verdicts count: the last attempt decided.
++/// A camera's latest result replaces its earlier one.
++fn set_camera(d: &mut ScanDetails, result: CameraResult) {
++    match d.cameras.iter_mut().find(|c| c.camera == result.camera) {
++        Some(known) => *known = result,
++        None => d.cameras.push(result),
++    }
++}
++
++fn details_from_log(log: &str) -> ScanDetails {
++    let mut d = ScanDetails::default();
++    let mut thresholds: Vec<(String, f64)> = Vec::new();
+     for line in log.lines() {
+         let Some((_, message)) = split_log_line(line) else {
+             continue;
+         };
+-        let Some(rest) = message.strip_prefix("FaceAuth: Recognition | face='") else {
+-            continue;
+-        };
+-        let Some((path, rest)) = rest.split_once('\'') else {
++        let Some(m) = message.strip_prefix("FaceAuth: ") else {
+             continue;
+         };
+-        let field = |name: &str| {
+-            rest.split_whitespace()
+-                .find_map(|kv| kv.strip_prefix(name)?.parse::<f64>().ok())
+-        };
+-        let Some(score) = field("score=").filter(|s| s.is_finite()) else {
+-            continue;
+-        };
+-        threshold = field("threshold=").or(threshold);
+-        match scores.iter_mut().find(|s| s.path == path) {
+-            Some(known) => known.score = known.score.max(score),
+-            None => scores.push(FaceScore {
+-                path: path.to_string(),
+-                score,
+-            }),
++        if let Some(rest) = m.strip_prefix("Recognition | face='") {
++            let Some((path, rest)) = rest.split_once('\'') else {
++                continue;
++            };
++            let Some(score) = field(rest, "score=") else {
++                continue;
++            };
++            let threshold = field(rest, "threshold=");
++            match d.scores.iter_mut().find(|s| s.path == path) {
++                Some(known) => {
++                    known.score = known.score.max(score);
++                    known.threshold = threshold.or(known.threshold);
++                }
++                None => d.scores.push(FaceScore {
++                    path: path.to_string(),
++                    score,
++                    threshold,
++                }),
++            }
++        } else if let Some(rest) = m.strip_prefix("Recognition on the ") {
++            if let Some((camera, rest)) = rest.split_once(" | ") {
++                if let Some(t) = field(rest, "threshold=") {
++                    thresholds.retain(|(c, _)| c != camera);
++                    thresholds.push((camera.to_string(), t));
++                }
++            }
++        } else if let Some(rest) = m.strip_prefix("Recognition PASSED on the ") {
++            if let Some((camera, rest)) = rest.split_once(" | ") {
++                let threshold = thresholds
++                    .iter()
++                    .find(|(c, _)| c == camera)
++                    .map(|(_, t)| *t);
++                if let Some(best) = field(rest, "score=") {
++                    set_camera(
++                        &mut d,
++                        CameraResult {
++                            camera: camera.to_string(),
++                            best,
++                            threshold,
++                            matched: true,
++                        },
++                    );
++                }
++            }
++        } else if let Some(rest) = m.strip_prefix("Recognition FAILED on the ") {
++            if let Some((camera, rest)) = rest.split_once(" | ") {
++                if let Some(best) = field(rest, "score=") {
++                    let threshold = field(rest, "threshold=");
++                    set_camera(
++                        &mut d,
++                        CameraResult {
++                            camera: camera.to_string(),
++                            best,
++                            threshold,
++                            matched: false,
++                        },
++                    );
++                }
++            }
++        } else if let Some(rest) = m
++            .strip_prefix("AI anti-spoofing detected spoof")
++            .map(|r| (r, true))
++            .or_else(|| {
++                m.strip_prefix("AI anti-spoofing check passed")
++                    .map(|r| (r, false))
++            })
++            .map(|(r, spoof)| (r.to_string(), spoof))
++        {
++            let (rest, spoof) = rest;
++            if let Some(score) = field(&rest, "score=") {
++                d.anti_spoofing = Some(SpoofResult {
++                    score,
++                    threshold: field(&rest, "threshold="),
++                    spoof,
++                });
++            }
++        } else if let Some((rest, same_place)) = m
++            .strip_prefix("One face on both cameras")
++            .map(|r| (r, true))
++            .or_else(|| {
++                m.strip_prefix("The faces on the colour and the IR camera are not one face")
++                    .map(|r| (r, false))
++            })
++        {
++            let (max_offset, max_size_ratio) = at_most(rest);
++            if let (Some(dx), Some(dy), Some(size_ratio)) =
++                (field(rest, "x="), field(rest, "y="), field(rest, "size="))
++            {
++                d.pair = Some(PairResult {
++                    dx,
++                    dy,
++                    size_ratio,
++                    max_offset,
++                    max_size_ratio,
++                    same_place,
++                });
++            }
+         }
+     }
+-    (scores, threshold)
++    d
+ }
+ 
+ fn outcome_for(code: Option<i32>) -> ScanOutcome {
+@@ -109,7 +275,7 @@ fn outcome_for(code: Option<i32>) -> ScanOutcome {
+ /// "[2026-11-15 14:00:01.234] [biopass] [debug] FaceAuth: Face on ..." ->
+ /// "14:00:01.234 Face on ...". Enrolled faces show as faces*/<name>.
+ fn steps_from_log(log: &str) -> Vec<String> {
+-    const STEPS: [&str; 11] = [
++    const STEPS: [&str; 13] = [
+         "Face on",
+         "No face",
+         "Recognition PASSED",
+@@ -121,6 +287,8 @@ fn steps_from_log(log: &str) -> Vec<String> {
+         "AI anti-spoofing detected spoof",
+         "AI anti-spoofing check passed",
+         "IR presence check",
++        "One face on both cameras",
++        "The faces on the colour and the IR camera are not one face",
+     ];
+     log.lines()
+         .filter_map(|line| {
+@@ -223,12 +391,14 @@ fn scan(helper: &str, user: &str) -> Result<ScanResult, String> {
+         std::thread::sleep(Duration::from_millis(50));
+     };
+     let log = reader.join().unwrap_or_default();
+-    let (scores, threshold) = scores_from_log(&log);
++    let details = details_from_log(&log);
+     Ok(ScanResult {
+         outcome: outcome_for(status.and_then(|s| s.code())),
+         steps: steps_from_log(&log),
+-        scores,
+-        threshold,
++        scores: details.scores,
++        cameras: details.cameras,
++        anti_spoofing: details.anti_spoofing,
++        pair: details.pair,
+         duration_ms: started.elapsed().as_millis() as u64,
+     })
+ }
+@@ -281,30 +451,95 @@ libcamera noise without brackets
+     }
+ 
+     #[test]
+-    fn scores_per_face_keep_the_best() {
++    fn scores_per_face_keep_the_best_with_their_threshold() {
+         let log = "\
+ [2026-11-15 14:00:01.300] [biopass] [debug] FaceAuth: Recognition | face='/h/faces/a.jpg' score=0.4813 threshold=0.600 similar=0
+ [2026-11-15 14:00:01.310] [biopass] [debug] FaceAuth: Recognition | face='/h/faces/b.jpg' score=0.5120 threshold=0.600 similar=0
+ [2026-11-15 14:00:02.300] [biopass] [debug] FaceAuth: Recognition | face='/h/faces/a.jpg' score=0.6512 threshold=0.600 similar=1
+ [2026-11-15 14:00:02.300] [biopass] [debug] FaceAuth: Recognition | face='/h/faces/c.jpg' score=nan threshold=0.600 similar=0
+-[2026-11-15 14:00:02.310] [biopass] [debug] FaceAuth: Recognition PASSED on the colour camera | matched face='/h/faces/a.jpg' score=0.6512
++[2026-11-15 14:00:02.400] [biopass] [debug] FaceAuth: Recognition | face='/h/faces-ir/a.jpg' score=0.7000 threshold=0.700 similar=0
++";
++        let d = details_from_log(log);
++        let face = |path: &str, score, threshold| FaceScore {
++            path: path.into(),
++            score,
++            threshold: Some(threshold),
++        };
++        assert_eq!(
++            d.scores,
++            vec![
++                face("/h/faces/a.jpg", 0.6512, 0.6),
++                face("/h/faces/b.jpg", 0.512, 0.6),
++                face("/h/faces-ir/a.jpg", 0.7, 0.7),
++            ]
++        );
++        assert_eq!(details_from_log("nothing\n"), ScanDetails::default());
++    }
++
++    #[test]
++    fn per_camera_spoof_and_pair_results() {
++        let log = "\
++[2026-11-15 14:00:01.100] [biopass] [debug] FaceAuth: Recognition on the colour camera | threshold=0.600 enrolled_count=6
++[2026-11-15 14:00:01.200] [biopass] [debug] FaceAuth: Recognition FAILED on the colour camera | best score=0.5120 threshold=0.600
++[2026-11-15 14:00:02.100] [biopass] [debug] FaceAuth: AI anti-spoofing check passed | score=0.120 threshold=0.800
++[2026-11-15 14:00:02.150] [biopass] [debug] FaceAuth: Recognition on the colour camera | threshold=0.600 enrolled_count=6
++[2026-11-15 14:00:02.200] [biopass] [debug] FaceAuth: Recognition PASSED on the colour camera | matched face='/h/faces/a.jpg' score=0.6512
++[2026-11-15 14:00:02.700] [biopass] [debug] FaceAuth: One face on both cameras | offset x=0.12 y=0.05 size=1.16 (at most 0.50, 1.50)
++[2026-11-15 14:00:02.800] [biopass] [debug] FaceAuth: Recognition on the IR camera | threshold=0.700 enrolled_count=12
++[2026-11-15 14:00:02.900] [biopass] [debug] FaceAuth: Recognition FAILED on the IR camera | best score=0.6400 threshold=0.700
+ ";
+-        let (scores, threshold) = scores_from_log(log);
++        let d = details_from_log(log);
+         assert_eq!(
+-            scores,
++            d.cameras,
+             vec![
+-                FaceScore {
+-                    path: "/h/faces/a.jpg".into(),
+-                    score: 0.6512
++                CameraResult {
++                    camera: "colour camera".into(),
++                    best: 0.6512,
++                    threshold: Some(0.6),
++                    matched: true
+                 },
+-                FaceScore {
+-                    path: "/h/faces/b.jpg".into(),
+-                    score: 0.512
++                CameraResult {
++                    camera: "IR camera".into(),
++                    best: 0.64,
++                    threshold: Some(0.7),
++                    matched: false
+                 },
+             ]
+         );
+-        assert_eq!(threshold, Some(0.6));
+-        assert_eq!(scores_from_log("nothing\n"), (vec![], None));
++        assert_eq!(
++            d.anti_spoofing,
++            Some(SpoofResult {
++                score: 0.12,
++                threshold: Some(0.8),
++                spoof: false
++            })
++        );
++        assert_eq!(
++            d.pair,
++            Some(PairResult {
++                dx: 0.12,
++                dy: 0.05,
++                size_ratio: 1.16,
++                max_offset: Some(0.5),
++                max_size_ratio: Some(1.5),
++                same_place: true
++            })
++        );
++
++        let spoof = "[2026-11-15 14:00:02.100] [biopass] [warn] FaceAuth: AI anti-spoofing detected spoof | score=0.980 threshold=0.800\n\
++[2026-11-15 14:00:02.700] [biopass] [warn] FaceAuth: The faces on the colour and the IR camera are not one face | offset x=1.39 y=0.00 size=1.00 (at most 0.50, 1.50) — returning Failure\n";
++        let d = details_from_log(spoof);
++        assert_eq!(
++            d.anti_spoofing.map(|a| (a.score, a.spoof)),
++            Some((0.98, true))
++        );
++        let pair = d.pair.unwrap();
++        assert!(!pair.same_place && pair.dx == 1.39 && pair.max_offset == Some(0.5));
++        assert!(
++            steps_from_log(spoof).len() == 2,
++            "{:?}",
++            steps_from_log(spoof)
++        );
+     }
+ 
+     #[test]
+diff --git a/app/src/app/configuration/-components/face/AntiSpoofingSection.tsx b/app/src/app/configuration/-components/face/AntiSpoofingSection.tsx
+index 6e88e7c..346ee4c 100644
+--- a/app/src/app/configuration/-components/face/AntiSpoofingSection.tsx
++++ b/app/src/app/configuration/-components/face/AntiSpoofingSection.tsx
+@@ -10,7 +10,6 @@ import {
+ } from "@/components/ui/select";
+ import { useModelFileStatus } from "@/hooks/useModelFileStatus";
+ import type { BiopassConfig, Model } from "@/types/config";
+-import { Threshold } from "../methods/shared/Threshold";
+ import { faceModeOf } from "./faceMode";
+ import { DISABLED_OPTION, selectValueFor } from "./selectValue";
+ 
+@@ -121,25 +120,6 @@ export function AntiSpoofingSection({ antiSpoofModels }: Props) {
+             </p>
+           )}
+         </div>
+-
+-        {antiSpoofing.enable && (
+-          <div className="w-48 shrink-0">
+-            <Threshold
+-              label="Threshold"
+-              value={antiSpoofing.model.threshold}
+-              onChange={(threshold) =>
+-                setValue(
+-                  "methods.face.anti_spoofing.model.threshold",
+-                  threshold,
+-                  {
+-                    shouldDirty: true,
+-                    shouldValidate: true,
+-                  },
+-                )
+-              }
+-            />
+-          </div>
+-        )}
+       </div>
+     </>
+   );
+diff --git a/app/src/app/configuration/-components/face/FaceModelsSection.tsx b/app/src/app/configuration/-components/face/FaceModelsSection.tsx
+index 769adfd..86c3090 100644
+--- a/app/src/app/configuration/-components/face/FaceModelsSection.tsx
++++ b/app/src/app/configuration/-components/face/FaceModelsSection.tsx
+@@ -3,7 +3,6 @@ import type { BiopassConfig, Model } from "@/types/config";
+ import { ModelSelect } from "../methods/shared/ModelSelect";
+ import { Threshold } from "../methods/shared/Threshold";
+ import { AntiSpoofingSection } from "./AntiSpoofingSection";
+-import { RECOMMENDED_THRESHOLD } from "./faceMode";
+ 
+ interface Props {
+   detectionModels: Model[];
+@@ -77,32 +76,7 @@ export function FaceModelsSection({
+             }
+           />
+         </div>
+-        <div className="w-48 shrink-0">
+-          <Threshold
+-            label="Threshold"
+-            value={config.recognition.threshold}
+-            onChange={(threshold) =>
+-              setValue("methods.face.recognition.threshold", threshold, {
+-                shouldDirty: true,
+-                shouldValidate: true,
+-              })
+-            }
+-          />
+-        </div>
+       </div>
+-      <p
+-        className={`mt-2 text-xs ${
+-          config.recognition.threshold < RECOMMENDED_THRESHOLD
+-            ? "text-amber-600 dark:text-amber-400"
+-            : "text-muted-foreground"
+-        }`}
+-      >
+-        A face matches when it scores above the threshold against one enrolled
+-        face (1 = the same picture).{" "}
+-        {config.recognition.threshold < RECOMMENDED_THRESHOLD
+-          ? `Below ${RECOMMENDED_THRESHOLD * 100}% a stranger matches far more often (about 4% of strangers over 5 scans at 50%, 0.3% at 60%).`
+-          : `If your own face scores close to it, add more faces rather than lowering it: Test shows the scores.`}
+-      </p>
+       <AntiSpoofingSection antiSpoofModels={antiSpoofModels} />
+     </div>
+   );
+diff --git a/app/src/app/configuration/-components/face/FaceSets.tsx b/app/src/app/configuration/-components/face/FaceSets.tsx
+index 8fcc270..46e11b0 100644
+--- a/app/src/app/configuration/-components/face/FaceSets.tsx
++++ b/app/src/app/configuration/-components/face/FaceSets.tsx
+@@ -20,9 +20,8 @@ interface Props {
+   sets: readonly FaceSet[];
+   /** The saved mode: the directories follow it. */
+   mode: FaceMode | null;
+-  /** The last test scan's score per face, and its threshold. */
+-  scores: ReadonlyMap<string, number>;
+-  threshold: number | null;
++  /** The last test scan's score per face, with the threshold it was compared against. */
++  scores: ReadonlyMap<string, { score: number; threshold: number | null }>;
+   onChanged: () => void;
+ }
+ 
+@@ -35,7 +34,7 @@ export function faceName(path: string): string {
+  * The enrolled faces of every camera, labelled by camera and whether face
+  * unlock uses them now, each with its score in the last test scan.
+  */
+-export function FaceSets({ sets, mode, scores, threshold, onChanged }: Props) {
++export function FaceSets({ sets, mode, scores, onChanged }: Props) {
+   const [confirmDir, setConfirmDir] = useState<FaceDir | null>(null);
+   const shown = sets.filter((s) => s.dir === "faces" || s.paths.length > 0);
+ 
+@@ -90,8 +89,8 @@ export function FaceSets({ sets, mode, scores, threshold, onChanged }: Props) {
+                   <FaceThumb
+                     key={path}
+                     path={path}
+-                    score={scores.get(path)}
+-                    threshold={threshold}
++                    score={scores.get(path)?.score}
++                    threshold={scores.get(path)?.threshold ?? null}
+                     onDelete={() => remove([path])}
+                   />
+                 ))}
+diff --git a/app/src/app/configuration/-components/face/FaceSetting.tsx b/app/src/app/configuration/-components/face/FaceSetting.tsx
+index 99211e1..8270385 100644
+--- a/app/src/app/configuration/-components/face/FaceSetting.tsx
++++ b/app/src/app/configuration/-components/face/FaceSetting.tsx
+@@ -11,6 +11,7 @@ import { FaceSets } from "./FaceSets";
+ import { enrolledPerCamera, faceModeOf, missingFaces } from "./faceMode";
+ import { useSavedSettings } from "./savedSettings";
+ import { TestScan } from "./TestScan";
++import { ThresholdsSection } from "./ThresholdsSection";
+ import { useCameras } from "./useCameras";
+ import { useFaceSets } from "./useFaceSets";
+ import { useModels } from "./useModels";
+@@ -63,7 +64,13 @@ export function FaceSetting() {
+   const unsaved = JSON.stringify(config) !== JSON.stringify(saved.config);
+ 
+   const scores = useMemo(
+-    () => new Map((scan?.scores ?? []).map((s) => [s.path, s.score])),
++    () =>
++      new Map(
++        (scan?.scores ?? []).map((s) => [
++          s.path,
++          { score: s.score, threshold: s.threshold },
++        ]),
++      ),
+     [scan],
+   );
+ 
+@@ -75,6 +82,8 @@ export function FaceSetting() {
+         camerasError={error}
+       />
+ 
++      <ThresholdsSection />
++
+       <div className="grid gap-4 p-4 rounded-lg bg-muted/50 border border-border/50">
+         <div>
+           <h4 className="font-medium text-sm">Enrolled faces</h4>
+@@ -93,7 +102,6 @@ export function FaceSetting() {
+           sets={sets}
+           mode={savedMode}
+           scores={scores}
+-          threshold={scan?.threshold ?? null}
+           onChanged={() => {
+             void reload();
+           }}
+diff --git a/app/src/app/configuration/-components/face/TestScan.tsx b/app/src/app/configuration/-components/face/TestScan.tsx
+index 44b9503..da6a7d1 100644
+--- a/app/src/app/configuration/-components/face/TestScan.tsx
++++ b/app/src/app/configuration/-components/face/TestScan.tsx
+@@ -16,6 +16,57 @@ const OUTCOME_TEXT: Record<ScanOutcome, string> = {
+   failed: "The scan failed.",
+ };
+ 
++const fmt = (v: number | null | undefined) =>
++  v === null || v === undefined ? "?" : v.toFixed(2);
++
++/** Each camera's verdict, the anti-spoofing score and the two cameras' faces. */
++function ScanDetails({ result }: { result: ScanResult }) {
++  const rows: { label: string; text: string; ok: boolean }[] = [
++    ...result.cameras.map((c) => ({
++      label: c.camera.charAt(0).toUpperCase() + c.camera.slice(1),
++      text: `best ${fmt(c.best)}, matches above ${fmt(c.threshold)}`,
++      ok: c.matched,
++    })),
++  ];
++  if (result.anti_spoofing) {
++    const a = result.anti_spoofing;
++    rows.push({
++      label: "Anti-spoofing",
++      text: `score ${fmt(a.score)}, a spoof from ${fmt(a.threshold)}`,
++      ok: !a.spoof,
++    });
++  }
++  if (result.pair) {
++    const p = result.pair;
++    rows.push({
++      label: "One face on both cameras",
++      text: `${fmt(Math.max(p.dx, p.dy))} face sizes apart (at most ${fmt(p.max_offset)}), size ratio ${fmt(p.size_ratio)} (at most ${fmt(p.max_size_ratio)})`,
++      ok: p.same_place,
++    });
++  }
++  if (rows.length === 0) return null;
++  return (
++    <ul className="grid gap-1 text-xs">
++      {rows.map((r) => (
++        <li key={r.label} className="flex gap-2">
++          <span
++            className={cn(
++              "w-4 shrink-0 font-bold",
++              r.ok
++                ? "text-emerald-600 dark:text-emerald-400"
++                : "text-destructive",
++            )}
++          >
++            {r.ok ? "✓" : "✗"}
++          </span>
++          <span className="font-medium">{r.label}:</span>
++          <span className="text-muted-foreground">{r.text}</span>
++        </li>
++      ))}
++    </ul>
++  );
++}
++
+ interface Props {
+   /** Why the scan may differ from the form (unsaved changes), or null. */
+   unsaved: boolean;
+@@ -77,11 +128,12 @@ export function TestScan({ unsaved, result, onResult }: Props) {
+               ({(result.duration_ms / 1000).toFixed(1)} s)
+             </span>
+           </p>
+-          {result.threshold !== null && result.scores.length > 0 && (
++          <ScanDetails result={result} />
++          {result.scores.length > 0 && (
+             <p className="text-xs text-muted-foreground">
+-              Each compared face shows its best score above (it matches above{" "}
+-              {result.threshold.toFixed(2)}; red: not above). Faces that stay
+-              red when you test are worth deleting and adding again.
++              Each compared face shows its best score above, red when it is not
++              above its camera's threshold. Faces that stay red when you test
++              are worth deleting and adding again.
+             </p>
+           )}
+           {result.steps.length > 0 && (
+diff --git a/app/src/app/configuration/-components/face/ThresholdsSection.tsx b/app/src/app/configuration/-components/face/ThresholdsSection.tsx
+new file mode 100644
+index 0000000..3d5a4cc
+--- /dev/null
++++ b/app/src/app/configuration/-components/face/ThresholdsSection.tsx
+@@ -0,0 +1,119 @@
++import { useFormContext, useWatch } from "react-hook-form";
++import type { BiopassConfig } from "@/types/config";
++import { Threshold } from "../methods/shared/Threshold";
++import {
++  faceModeOf,
++  irThresholdOf,
++  RECOMMENDED_THRESHOLD,
++  thresholdsUsed,
++} from "./faceMode";
++
++const OPTIONS = { shouldDirty: true, shouldValidate: true } as const;
++
++/**
++ * The thresholds that decide a scan, side by side: each camera's recognition
++ * threshold (recognition.threshold for the colour camera,
++ * recognition.ir_threshold for the IR camera: their pictures score
++ * differently) and the AI anti-spoofing model's. Test shows the scores they
++ * are compared with.
++ */
++export function ThresholdsSection() {
++  const { setValue } = useFormContext<BiopassConfig>();
++  const face = useWatch<BiopassConfig, "methods.face">({
++    name: "methods.face",
++  });
++  const mode = faceModeOf(face);
++  const used = thresholdsUsed(mode);
++  const ownIr = face.recognition.ir_threshold !== null;
++  const antiSpoofing = face.anti_spoofing.enable && mode !== "ir";
++  const low = [
++    used.colour && face.recognition.threshold < RECOMMENDED_THRESHOLD,
++    used.ir && irThresholdOf(face) < RECOMMENDED_THRESHOLD,
++  ].some(Boolean);
++  const note = (on: boolean) =>
++    on ? "used in this mode" : "not used in this mode";
++
++  return (
++    <div className="p-4 rounded-lg bg-muted/50 border border-border/50 space-y-3">
++      <div>
++        <h4 className="font-medium text-sm">Thresholds</h4>
++        <p className="text-xs text-muted-foreground">
++          A face matches when it scores above its camera's threshold against one
++          enrolled face (1 = the same picture); the two cameras' pictures score
++          differently. Test shows each score.
++        </p>
++      </div>
++      <div className="grid grid-cols-3 gap-6">
++        <div className="grid gap-1">
++          <Threshold
++            label="Colour camera"
++            step={0.01}
++            value={face.recognition.threshold}
++            onChange={(v) =>
++              setValue("methods.face.recognition.threshold", v, OPTIONS)
++            }
++          />
++          <p className="text-[11px] text-muted-foreground">
++            {note(used.colour)}
++          </p>
++        </div>
++        <div className="grid gap-1">
++          <Threshold
++            label="IR camera"
++            step={0.01}
++            value={irThresholdOf(face)}
++            onChange={(v) =>
++              setValue("methods.face.recognition.ir_threshold", v, OPTIONS)
++            }
++          />
++          <p className="text-[11px] text-muted-foreground">
++            {note(used.ir)}
++            {ownIr ? (
++              <>
++                {" · "}
++                <button
++                  type="button"
++                  className="underline cursor-pointer"
++                  onClick={() =>
++                    setValue(
++                      "methods.face.recognition.ir_threshold",
++                      null,
++                      OPTIONS,
++                    )
++                  }
++                >
++                  same as colour
++                </button>
++              </>
++            ) : (
++              " · same as colour"
++            )}
++          </p>
++        </div>
++        <div className="grid gap-1">
++          <Threshold
++            label="Anti-spoofing"
++            step={0.01}
++            disabled={!antiSpoofing}
++            value={face.anti_spoofing.model.threshold}
++            onChange={(v) =>
++              setValue("methods.face.anti_spoofing.model.threshold", v, OPTIONS)
++            }
++          />
++          <p className="text-[11px] text-muted-foreground">
++            {antiSpoofing
++              ? "a spoof when the model's score reaches it"
++              : "anti-spoofing is off"}
++          </p>
++        </div>
++      </div>
++      <p
++        className={`text-xs ${low ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground"}`}
++      >
++        {low
++          ? `Below ${RECOMMENDED_THRESHOLD} a stranger matches far more often (about 4% of strangers over 5 scans at 0.5, 0.3% at 0.6).`
++          : "If your own face scores close to a threshold, replace the faces that score low rather than lowering it. If anti-spoofing flags you, Test shows its score: raise its threshold above it."}
++      </p>
++    </div>
++  );
++}
+diff --git a/app/src/app/configuration/-components/face/faceMode.test.ts b/app/src/app/configuration/-components/face/faceMode.test.ts
+index 5965358..3f52653 100644
+--- a/app/src/app/configuration/-components/face/faceMode.test.ts
++++ b/app/src/app/configuration/-components/face/faceMode.test.ts
+@@ -7,10 +7,12 @@ import {
+   enrolmentCameras,
+   faceDirRole,
+   faceModeOf,
++  irThresholdOf,
+   mainIsIr,
+   missingFaces,
+   RECOMMENDED_MIN_FACE_HEIGHT,
+   RECOMMENDED_THRESHOLD,
++  thresholdsUsed,
+   withFaceMode,
+   withoutCameraProfiles,
+ } from "./faceMode";
+@@ -39,7 +41,11 @@ function config(): BiopassConfig {
+           threshold: 0.5,
+           min_face_height: 0,
+         },
+-        recognition: { model_id: "edgeface-s-gamma-05", threshold: 0.5 },
++        recognition: {
++          model_id: "edgeface-s-gamma-05",
++          threshold: 0.5,
++          ir_threshold: null,
++        },
+         anti_spoofing: {
+           enable: false,
+           model: { model_id: "mobilenetv3-antispoof", threshold: 0.8 },
+@@ -47,6 +53,8 @@ function config(): BiopassConfig {
+           ir_warmup_delay_ms: 300,
+           ir_presence_timeout_ms: 1500,
+           ir_recognition: false,
++          pair_max_offset: 0.5,
++          pair_max_size_ratio: 1.5,
+         },
+       },
+       fingerprint: { enable: false, retries: 1, timeout: 5000 },
+@@ -101,6 +109,31 @@ describe("withFaceMode", () => {
+     expect(f.camera_profiles).toEqual([]);
+   });
+ 
++  test("the IR camera's own threshold: raised when looser, else kept", () => {
++    expect(
++      withFaceMode(face(), "ir", { ir: IR, colour: RGB }).recognition
++        .ir_threshold,
++    ).toBeNull();
++    const own = face();
++    own.recognition.ir_threshold = 0.4;
++    expect(
++      withFaceMode(own, "both", { ir: IR, colour: RGB }).recognition
++        .ir_threshold,
++    ).toBe(RECOMMENDED_THRESHOLD);
++    own.recognition.ir_threshold = 0.72;
++    const out = withFaceMode(own, "both", { ir: IR, colour: RGB });
++    expect(out.recognition.ir_threshold).toBe(0.72);
++    expect(irThresholdOf(out)).toBe(0.72);
++    expect(irThresholdOf(face())).toBe(0.5);
++  });
++
++  test("each mode uses its cameras' thresholds", () => {
++    expect(thresholdsUsed("ir")).toEqual({ colour: false, ir: true });
++    expect(thresholdsUsed("rgb")).toEqual({ colour: true, ir: false });
++    expect(thresholdsUsed("both")).toEqual({ colour: true, ir: true });
++    expect(thresholdsUsed(null)).toEqual({ colour: false, ir: false });
++  });
++
+   test("keeps stricter values the user chose", () => {
+     const strict = face();
+     strict.detection.min_face_height = 0.3;
+diff --git a/app/src/app/configuration/-components/face/faceMode.ts b/app/src/app/configuration/-components/face/faceMode.ts
+index 77b83f7..547d071 100644
+--- a/app/src/app/configuration/-components/face/faceMode.ts
++++ b/app/src/app/configuration/-components/face/faceMode.ts
+@@ -42,11 +42,27 @@ export function mainIsIr(face: FaceConfig): boolean {
+   return faceModeOf(face) === "ir";
+ }
+ 
++/** The IR camera's recognition threshold: its own, else the colour camera's. */
++export function irThresholdOf(face: FaceConfig): number {
++  return face.recognition.ir_threshold ?? face.recognition.threshold;
++}
++
++/** Which cameras' recognition thresholds `mode` uses. */
++export function thresholdsUsed(mode: FaceMode | null): {
++  colour: boolean;
++  ir: boolean;
++} {
++  return {
++    colour: mode === "rgb" || mode === "both",
++    ir: mode === "ir" || mode === "both",
++  };
++}
++
+ /**
+  * `face` set to `mode` with these cameras: `camera`, `anti_spoofing.ir_camera`
+  * and `ir_recognition`; no camera profiles; anti-spoofing off in ir; the
+- * recommended minimum face height and threshold where the settings have none
+- * or a looser one.
++ * recommended minimum face height and thresholds (each camera's) where the
++ * settings have none or a looser one.
+  */
+ export function withFaceMode(
+   face: FaceConfig,
+@@ -69,6 +85,10 @@ export function withFaceMode(
+     recognition: {
+       ...face.recognition,
+       threshold: Math.max(face.recognition.threshold, RECOMMENDED_THRESHOLD),
++      ir_threshold:
++        face.recognition.ir_threshold === null
++          ? null
++          : Math.max(face.recognition.ir_threshold, RECOMMENDED_THRESHOLD),
+     },
+     anti_spoofing: {
+       ...face.anti_spoofing,
+diff --git a/app/src/app/configuration/-components/methods/shared/Threshold.tsx b/app/src/app/configuration/-components/methods/shared/Threshold.tsx
+index 8eed497..69ab403 100644
+--- a/app/src/app/configuration/-components/methods/shared/Threshold.tsx
++++ b/app/src/app/configuration/-components/methods/shared/Threshold.tsx
+@@ -5,22 +5,31 @@ interface Props {
+   label: string;
+   value: number;
+   onChange: (value: number) => void;
++  step?: number;
++  disabled?: boolean;
+ }
+ 
+-export function Threshold({ label, value, onChange }: Props) {
++export function Threshold({
++  label,
++  value,
++  onChange,
++  step = 0.05,
++  disabled,
++}: Props) {
+   return (
+     <div className="grid gap-2">
+       <div className="flex items-center justify-between">
+         <Label className="text-xs text-muted-foreground">{label}</Label>
+         <span className="text-xs font-mono font-medium">
+-          {(value * 100).toFixed(0)}%
++          {step < 0.05 ? value.toFixed(2) : `${(value * 100).toFixed(0)}%`}
+         </span>
+       </div>
+       <div className="h-9 flex items-center">
+         <Slider
+           value={[value]}
+           max={1}
+-          step={0.05}
++          step={step}
++          disabled={disabled}
+           onValueChange={([v]) => onChange(v)}
+           className="cursor-pointer"
+         />
+diff --git a/app/src/app/configuration/-components/validation.ts b/app/src/app/configuration/-components/validation.ts
+index 9bf2d0b..6cdff5f 100644
+--- a/app/src/app/configuration/-components/validation.ts
++++ b/app/src/app/configuration/-components/validation.ts
+@@ -74,6 +74,7 @@ export const biopassConfigSchema = z.object({
+         recognition: z.object({
+           model_id: z.string(),
+           threshold: thresholdSchema,
++          ir_threshold: thresholdSchema.nullable(),
+         }),
+         anti_spoofing: z.object({
+           enable: z.boolean(),
+@@ -93,6 +94,8 @@ export const biopassConfigSchema = z.object({
+             " ms",
+           ),
+           ir_recognition: z.boolean(),
++          pair_max_offset: z.number().min(0).max(2),
++          pair_max_size_ratio: z.number().min(1).max(4),
+         }),
+       })
+       // The camera UI sets a mode (camera, IR camera), never profiles.
+diff --git a/app/src/bindings.ts b/app/src/bindings.ts
+index 8c7b4cc..ce07753 100644
+--- a/app/src/bindings.ts
++++ b/app/src/bindings.ts
+@@ -80,6 +80,14 @@ export type AntiSpoofingConfig_Deserialize = {
+ 	 *  than the main camera.
+ 	 */
+ 	ir_recognition?: boolean,
++	/**
++	 *  With `ir_recognition`: the faces both cameras recognised must be one
++	 *  face, centres at most this many face sizes apart in their pictures
++	 *  (0: no check).
++	 */
++	pair_max_offset?: number,
++	/**  ... and their heights at most this ratio apart. */
++	pair_max_size_ratio?: number,
+ };
+ 
+ export type AntiSpoofingConfig_Serialize = {
+@@ -94,6 +102,14 @@ export type AntiSpoofingConfig_Serialize = {
+ 	 *  than the main camera.
+ 	 */
+ 	ir_recognition: boolean,
++	/**
++	 *  With `ir_recognition`: the faces both cameras recognised must be one
++	 *  face, centres at most this many face sizes apart in their pictures
++	 *  (0: no check).
++	 */
++	pair_max_offset: number,
++	/**  ... and their heights at most this ratio apart. */
++	pair_max_size_ratio: number,
+ };
+ 
+ export type AntiSpoofingModelConfig = AntiSpoofingModelConfig_Serialize | AntiSpoofingModelConfig_Deserialize;
+@@ -166,6 +182,22 @@ export type CameraProfile_Serialize = {
+ 	allow_without_ir: boolean,
+ };
+ 
++export type CameraResult = CameraResult_Serialize | CameraResult_Deserialize;
++
++export type CameraResult_Deserialize = {
++	camera: string,
++	best: number,
++	threshold?: number | null,
++	matched: boolean,
++};
++
++export type CameraResult_Serialize = {
++	camera: string,
++	best: number,
++	threshold: number | null,
++	matched: boolean,
++};
++
+ export type DetectionConfig = DetectionConfig_Serialize | DetectionConfig_Deserialize;
+ 
+ export type DetectionConfig_Deserialize = {
+@@ -275,10 +307,22 @@ export type FaceMethodConfig_Serialize = {
+ 	anti_spoofing: AntiSpoofingConfig_Serialize,
+ };
+ 
+-export type FaceScore = {
++export type FaceScore = FaceScore_Serialize | FaceScore_Deserialize;
++
++export type FaceScore_Deserialize = {
++	/**  The enrolled face image (in faces/ or faces-ir/). */
++	path: string,
++	score: number,
++	/**  The threshold it was compared against (its camera's): it matches above. */
++	threshold?: number | null,
++};
++
++export type FaceScore_Serialize = {
+ 	/**  The enrolled face image (in faces/ or faces-ir/). */
+ 	path: string,
+ 	score: number,
++	/**  The threshold it was compared against (its camera's): it matches above. */
++	threshold: number | null,
+ };
+ 
+ /**  The face images in one face directory. */
+@@ -412,16 +456,58 @@ export type Model_Serialize = {
+ 	installed_at: number,
+ };
+ 
++export type PairResult = PairResult_Serialize | PairResult_Deserialize;
++
++export type PairResult_Deserialize = {
++	/**  How far apart the faces' centres were, in face widths and heights. */
++	dx: number,
++	dy: number,
++	/**  The taller face's height over the other's. */
++	size_ratio: number,
++	max_offset?: number | null,
++	max_size_ratio?: number | null,
++	same_place: boolean,
++};
++
++export type PairResult_Serialize = {
++	/**  How far apart the faces' centres were, in face widths and heights. */
++	dx: number,
++	dy: number,
++	/**  The taller face's height over the other's. */
++	size_ratio: number,
++	max_offset: number | null,
++	max_size_ratio: number | null,
++	same_place: boolean,
++};
++
+ export type RecognitionConfig = RecognitionConfig_Serialize | RecognitionConfig_Deserialize;
+ 
+ export type RecognitionConfig_Deserialize = {
+ 	model_id?: string,
++	/**
++	 *  The colour camera's (any camera's but the IR camera's): a face matches
++	 *  when it scores above it against an enrolled face.
++	 */
+ 	threshold?: number,
++	/**
++	 *  The IR camera's, wherever it recognises (as the main camera, or with
++	 *  `anti_spoofing.ir_recognition`); None: `threshold`.
++	 */
++	ir_threshold?: number | null,
+ };
+ 
+ export type RecognitionConfig_Serialize = {
+ 	model_id: string,
++	/**
++	 *  The colour camera's (any camera's but the IR camera's): a face matches
++	 *  when it scores above it against an enrolled face.
++	 */
+ 	threshold: number,
++	/**
++	 *  The IR camera's, wherever it recognises (as the main camera, or with
++	 *  `anti_spoofing.ir_recognition`); None: `threshold`.
++	 */
++	ir_threshold: number | null,
+ };
+ 
+ /**  What save_config did besides writing config.yaml. */
+@@ -468,9 +554,16 @@ export type ScanResult_Deserialize = {
+ 	 *  same), its best over the scan's attempts, in the order first compared.
+ 	 *  A face compared after a match is not listed: matching stops there.
+ 	 */
+-	scores: FaceScore[],
+-	/**  The recognition threshold the scan used: a face matches above it. */
+-	threshold?: number | null,
++	scores: FaceScore_Deserialize[],
++	/**
++	 *  Each camera's last recognition: its best score, its threshold, and
++	 *  whether it matched ("camera", "IR camera" or "colour camera").
++	 */
++	cameras: CameraResult_Deserialize[],
++	/**  The AI anti-spoofing model's last verdict on the colour picture. */
++	anti_spoofing?: SpoofResult_Deserialize | null,
++	/**  Both cameras: whether their faces were one face (in the same place). */
++	pair?: PairResult_Deserialize | null,
+ 	duration_ms: number,
+ };
+ 
+@@ -483,12 +576,35 @@ export type ScanResult_Serialize = {
+ 	 *  same), its best over the scan's attempts, in the order first compared.
+ 	 *  A face compared after a match is not listed: matching stops there.
+ 	 */
+-	scores: FaceScore[],
+-	/**  The recognition threshold the scan used: a face matches above it. */
+-	threshold: number | null,
++	scores: FaceScore_Serialize[],
++	/**
++	 *  Each camera's last recognition: its best score, its threshold, and
++	 *  whether it matched ("camera", "IR camera" or "colour camera").
++	 */
++	cameras: CameraResult_Serialize[],
++	/**  The AI anti-spoofing model's last verdict on the colour picture. */
++	anti_spoofing: SpoofResult_Serialize | null,
++	/**  Both cameras: whether their faces were one face (in the same place). */
++	pair: PairResult_Serialize | null,
+ 	duration_ms: number,
+ };
+ 
++export type SpoofResult = SpoofResult_Serialize | SpoofResult_Deserialize;
++
++export type SpoofResult_Deserialize = {
++	/**  The model's spoof score: a spoof at or above the threshold. */
++	score: number,
++	threshold?: number | null,
++	spoof: boolean,
++};
++
++export type SpoofResult_Serialize = {
++	/**  The model's spoof score: a spoof at or above the threshold. */
++	score: number,
++	threshold: number | null,
++	spoof: boolean,
++};
++
+ export type StrategyConfig = StrategyConfig_Serialize | StrategyConfig_Deserialize;
+ 
+ export type StrategyConfig_Deserialize = {
+diff --git a/app/src/lib/models.test.ts b/app/src/lib/models.test.ts
+index b525309..719436b 100644
+--- a/app/src/lib/models.test.ts
++++ b/app/src/lib/models.test.ts
+@@ -30,6 +30,7 @@ function makeConfig(
+         recognition: {
+           model_id: ids.recognition ?? "edgeface-s-gamma-05",
+           threshold: 0.5,
++          ir_threshold: null,
+         },
+         anti_spoofing: {
+           enable: face.antiSpoofing ?? false,
+@@ -41,6 +42,8 @@ function makeConfig(
+           ir_warmup_delay_ms: 300,
+           ir_presence_timeout_ms: 1500,
+           ir_recognition: false,
++          pair_max_offset: 0.5,
++          pair_max_size_ratio: 1.5,
+         },
+       },
+       fingerprint: { enable: false, retries: 1, timeout: 5000 },
+diff --git a/auth/test/config/defaults.yaml b/auth/test/config/defaults.yaml
+index 522d969..b4fbf58 100644
+--- a/auth/test/config/defaults.yaml
++++ b/auth/test/config/defaults.yaml
+@@ -23,6 +23,7 @@ methods:
+     recognition:
+       model_id: edgeface-s-gamma-05
+       threshold: 0.5
++      ir_threshold: null
+     anti_spoofing:
+       enable: false
+       model:
+@@ -32,6 +33,8 @@ methods:
+       ir_warmup_delay_ms: 300
+       ir_presence_timeout_ms: 1500
+       ir_recognition: false
++      pair_max_offset: 0.5
++      pair_max_size_ratio: 1.5
+   fingerprint:
+     enable: false
+     retries: 1
+-- 
+2.43.0
+
