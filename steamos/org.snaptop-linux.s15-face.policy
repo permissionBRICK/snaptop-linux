@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Face unlock (docs/login.md#face-unlock): the Biopass app changes the lockout (/etc/s15-face.conf, root's) through
+  pkexec /usr/lib/s15-face/s15-face-lockout. An administrator's password each time, as `sudo s15-face lockout set`.
+-->
+<policyconfig>
+  <vendor>snaptop-linux</vendor>
+
+  <action id="org.snaptop-linux.s15-face.lockout">
+    <description>Change the face unlock lockout</description>
+    <message>Authentication is required to change after how many false faces face unlock waits or turns off</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/s15-face/s15-face-lockout</annotate>
+  </action>
+</policyconfig>

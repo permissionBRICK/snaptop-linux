@@ -37,7 +37,7 @@ Rules for every run:
                            USER": a user's process only for itself (SO_PEERCRED); answers "fails=N until=T"
   s15-face-run wake        (s15-face-wake.service, root) starts face unlock on the lock screen by itself
   s15-face-run state [user]  display, lid and the user's face state (for s15-face status)
-  s15-face-run lockout [keys | set KEY VALUE | reset-defaults]   the lockout numbers (s15-face lockout)
+  s15-face-run lockout [keys | set KEY VALUE [KEY VALUE ...] | reset-defaults]   the lockout numbers (s15-face lockout)
 """
 import ctypes
 import fcntl
@@ -856,8 +856,9 @@ def write_lockout(conf, path=LOCKOUT_CONF):
 
 def cmd_lockout(args, path=LOCKOUT_CONF):
     """s15-face lockout: key=value lines (in effect); keys: KEY DEFAULT MIN MAX UNIT MEANING lines; set KEY VALUE
-    and reset-defaults (root): the new values as key=value lines. Exit 0; 2 for a bad key, value or usage; 1 not
-    root or not written."""
+    [KEY VALUE ...] (all checked first, then written at once; the Biopass app sends its changes so) and
+    reset-defaults (root): the new values as key=value lines. Exit 0; 2 for a bad key, value or usage (nothing
+    written); 1 not root or not written."""
     def show(conf):
         for k in LOCKOUT_KEYS:
             print(f"{k}={conf[k]}")
@@ -868,21 +869,22 @@ def cmd_lockout(args, path=LOCKOUT_CONF):
         for k, (default, lo, hi, unit, what) in LOCKOUT_KEYS.items():
             print(f"{k} {default} {lo} {hi} {unit} {what}")
         return 0
-    if args[0] not in ("set", "reset-defaults") or (args[0] == "set" and len(args) != 3) or \
+    if args[0] not in ("set", "reset-defaults") or \
+            (args[0] == "set" and (len(args) < 3 or len(args) % 2 == 0)) or \
             (args[0] == "reset-defaults" and len(args) != 1):
-        print("usage: s15-face lockout [keys | set KEY VALUE | reset-defaults]", file=sys.stderr)
+        print("usage: s15-face lockout [keys | set KEY VALUE [KEY VALUE ...] | reset-defaults]", file=sys.stderr)
         return 2
     conf = lockout_conf(path)
     if args[0] == "set":
-        k, v = args[1], args[2]
-        if k not in LOCKOUT_KEYS:
-            print(f"s15-face lockout: unknown key {k} (s15-face lockout keys)", file=sys.stderr)
-            return 2
-        lo, hi = LOCKOUT_KEYS[k][1:3]
-        if not (v.isdigit() and lo <= int(v) <= hi):
-            print(f"s15-face lockout: {k} must be a whole number from {lo} to {hi}", file=sys.stderr)
-            return 2
-        conf[k] = int(v)
+        for k, v in zip(args[1::2], args[2::2]):
+            if k not in LOCKOUT_KEYS:
+                print(f"s15-face lockout: unknown key {k} (s15-face lockout keys)", file=sys.stderr)
+                return 2
+            lo, hi = LOCKOUT_KEYS[k][1:3]
+            if not (v.isdigit() and lo <= int(v) <= hi):
+                print(f"s15-face lockout: {k} must be a whole number from {lo} to {hi}", file=sys.stderr)
+                return 2
+            conf[k] = int(v)
     else:
         conf = {k: d[0] for k, d in LOCKOUT_KEYS.items()}
     if os.geteuid() != 0:

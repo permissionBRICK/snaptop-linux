@@ -26,7 +26,9 @@
 #   s15-face reset [user]               (root) clear the count of false faces and the wait
 #   s15-face lockout                    the lockout numbers in effect, as KEY=VALUE lines (/etc/s15-face.conf, else
 #                                       the defaults); s15-face lockout keys: KEY DEFAULT MIN MAX UNIT MEANING
-#   s15-face lockout set KEY VALUE      (root) set one (whole numbers within MIN..MAX); prints the new values
+#   s15-face lockout set KEY VALUE [KEY VALUE ...]  (root) set them (whole numbers within MIN..MAX; all or none);
+#                                       prints the new values. The Biopass app's lockout settings use this through
+#                                       pkexec s15-face-lockout (administrator password)
 #   s15-face lockout reset-defaults     (root) all back to the defaults
 #   s15-face camera ir|rgb|both [user]  set the cameras in the user's Biopass configuration (Biopass app closed;
 #                                       without one yet, Biopass's defaults are written first), with the minimum

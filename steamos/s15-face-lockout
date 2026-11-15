@@ -1,0 +1,14 @@
+#!/bin/bash
+# What the Biopass app runs through pkexec to change the face unlock lockout (polkit action
+# org.snaptop-linux.s15-face.lockout, administrator password; docs/login.md#face-unlock): `s15-face lockout set KEY
+# VALUE [KEY VALUE ...]` or `s15-face lockout reset-defaults`, nothing else. Exit codes as s15-face lockout's: 2 a bad
+# key, value or usage (nothing written), 1 not root or not written.
+set -u
+export PATH=/usr/local/sbin:/usr/bin
+[ "$(id -u)" = 0 ] || exit 1
+case "${1:-}" in
+  set) [ $# -ge 3 ] && [ $((($# - 1) % 2)) = 0 ] || exit 2 ;;
+  reset-defaults) [ $# = 1 ] || exit 2 ;;
+  *) exit 2 ;;
+esac
+exec /usr/local/sbin/s15-face lockout "$@" >/dev/null

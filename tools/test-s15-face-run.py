@@ -201,6 +201,12 @@ def check_lockout_conf():
     expect(cli("set", "nope", "1")[0] == 2, "lockout CLI: unknown key -> exit 2")
     expect(cli("set", "off_after")[0] == 2 and cli("bogus")[0] == 2, "lockout CLI: usage -> exit 2")
     expect(m.lockout_conf(path)["first_wait"] == 120, "lockout CLI: bad input changes nothing")
+    rc, out, _ = cli("set", "off_after", "10", "max_wait", "600")
+    expect(rc == 0 and "off_after=10" in out and "max_wait=600" in out and "first_wait=120" in out,
+           "lockout CLI: set several at once -> all written, the others kept")
+    expect(cli("set", "off_after", "11", "max_wait", "86401")[0] == 2 and
+           m.lockout_conf(path)["off_after"] == 10, "lockout CLI: one bad pair -> exit 2, nothing written")
+    expect(cli("set", "off_after", "11", "max_wait")[0] == 2, "lockout CLI: a key without a value -> exit 2")
     rc, out, _ = cli("reset-defaults")
     expect(rc == 0 and not os.path.exists(path) and "first_wait=60" in out, "lockout CLI: reset-defaults")
     sys.stdout.flush()

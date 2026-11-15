@@ -1,7 +1,8 @@
 #!/bin/bash
 # Face unlock with Biopass (docs/login.md#face-unlock): Biopass built on the laptop with our patches (face/build.sh):
 # its auth part (helper, libraries, libcamera) for the IR camera and its app, which sets face unlock up (cameras,
-# faces, test scans); s15-face and s15-face-run (gate and runs), s15-face.socket (root's count of false faces, for the lock screen's runs
+# faces, test scans, the lockout through pkexec s15-face-lockout and its polkit action); s15-face and s15-face-run
+# (gate and runs), s15-face.socket (root's count of false faces, for the lock screen's runs
 # that run as the user), s15-face-wake.service (starts face on the lock screen by itself), and the PAM lines
 # through login-lock.sh. The count (/var/lib/s15-face/lockout) and the lockout numbers (root's /etc/s15-face.conf,
 # s15-face lockout) stay across restarts and SteamOS updates. Run as root in the installed SteamOS, from a checkout of this repository:
@@ -65,7 +66,8 @@ remove_files() {  # $1: root
   rm -f "$R$STATE/files"
 }
 
-# Biopass into root $1, all from our build (the app with its menu entry, icons and polkit policy, the auth part).
+# Biopass into root $1, all from our build (the app with its menu entry, icons and polkit policy, the auth part), with
+# the lockout tool the app runs through pkexec and its polkit action.
 put() {
   local R=$1 pkg s pol
   pkg=$(build "${R:-/}")
@@ -75,6 +77,9 @@ put() {
   # WebKitGTK's DMA-BUF renderer ends the app at once on this GPU under Wayland ("Error 71 (Protocol error)").
   grep -q '^Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass$' "$s/root/usr/share/applications/biopass.desktop" ||
     die "biopass.desktop: unexpected Exec line"
+  install -D -m0755 "$HERE/s15-face-lockout" "$s/root/usr/lib/s15-face/s15-face-lockout"
+  install -D -m0644 "$HERE/org.snaptop-linux.s15-face.policy" \
+    "$s/root/usr/share/polkit-1/actions/org.snaptop-linux.s15-face.policy"
   remove_files "$R"
   (cd "$s/root" && find . \( -type f -o -type l \) | sed 's#^\.##') > "$s/files"
   # polkit re-reads all its actions as soon as a .policy file appears; reading one that tar was still writing left it
