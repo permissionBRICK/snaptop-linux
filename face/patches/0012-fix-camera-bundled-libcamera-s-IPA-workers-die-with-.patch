@@ -1,0 +1,85 @@
+From 93d7aaa6f0306a4bdc7ea7d3d4833f7539bf56e2 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 16:30:00 +0000
+Subject: [PATCH] fix(camera): bundled libcamera's IPA workers die with their
+ parent
+
+libcamera starts each isolated IPA in a worker process (softisp_ipa_proxy
+for the software ISP) with clone3() and only kills it itself when the
+camera is released. A biopass-helper that is killed (a PAM caller's
+timeout, a lock screen that stops a scan) left its workers running, in
+process groups of their own, each holding camera buffers; a session's
+shutdown then waited 90 s for them.
+
+A third patch step (PatchLibcameraParentDeath.cmake) sets
+PR_SET_PDEATHSIG (SIGKILL) in the worker before exec, and exits if the
+parent is already gone. The worker dies with the camera manager's thread
+that started it, which outlives the camera; libcamera kills it on
+release anyway.
+---
+ auth/BundleLibcamera.cmake           |  3 +++
+ auth/PatchLibcameraParentDeath.cmake | 38 ++++++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+ create mode 100644 auth/PatchLibcameraParentDeath.cmake
+
+diff --git a/auth/BundleLibcamera.cmake b/auth/BundleLibcamera.cmake
+index 9715e53..1c72894 100644
+--- a/auth/BundleLibcamera.cmake
++++ b/auth/BundleLibcamera.cmake
+@@ -61,6 +61,9 @@ ExternalProject_Add(libcamera_ext
+     # Its RUNPATH would make it look for IPA proxy workers in a build tree.
+     COMMAND        ${CMAKE_COMMAND} -DLIBCAMERA_SOURCE_DIR=<SOURCE_DIR>
+         -P ${CMAKE_CURRENT_LIST_DIR}/PatchLibcameraInstalled.cmake
++    # Its IPA workers would outlive a helper that is killed.
++    COMMAND        ${CMAKE_COMMAND} -DLIBCAMERA_SOURCE_DIR=<SOURCE_DIR>
++        -P ${CMAKE_CURRENT_LIST_DIR}/PatchLibcameraParentDeath.cmake
+     CONFIGURE_COMMAND meson setup --buildtype=release
+         --prefix=${LIBCAMERA_PREFIX} --libdir=${LIBCAMERA_LIBDIR}
+         --libexecdir=${LIBCAMERA_LIBDIR} --datadir=${LIBCAMERA_DATADIR}
+diff --git a/auth/PatchLibcameraParentDeath.cmake b/auth/PatchLibcameraParentDeath.cmake
+new file mode 100644
+index 0000000..fc0a690
+--- /dev/null
++++ b/auth/PatchLibcameraParentDeath.cmake
+@@ -0,0 +1,38 @@
++# Patch step for the bundled libcamera (see BundleLibcamera.cmake).
++#
++# libcamera starts each isolated IPA in a worker process (softisp_ipa_proxy
++# for the software ISP) with clone3() and nothing that ties it to the
++# process that started it. It is only killed by libcamera itself when the
++# camera is released; a helper that is killed (a PAM caller's timeout, a
++# lock screen that stops a scan) leaves its workers running for good, each
++# holding a camera buffer, and a session's shutdown waits for them. Give the
++# worker a parent-death signal, set in the child before exec: it dies with
++# the thread that started it (the camera manager's, which outlives the
++# camera; libcamera SIGKILLs the worker on release anyway).
++#
++# Usage: cmake -DLIBCAMERA_SOURCE_DIR=<dir> -P PatchLibcameraParentDeath.cmake
++# Idempotent; fails loudly if a libcamera bump changes the patched lines.
++
++set(_file "${LIBCAMERA_SOURCE_DIR}/src/libcamera/process.cpp")
++set(_marker "biopass: workers die with their parent")
++file(READ "${_file}" _content)
++if(_content MATCHES "${_marker}")
++    return()
++endif()
++# Each (old, new) pair once; quoted arguments keep the semicolons of C++.
++function(_replace _old _new)
++    string(FIND "${_content}" "${_old}" _pos)
++    if(_pos EQUAL -1)
++        message(FATAL_ERROR "libcamera patch: '${_old}' not found in ${_file}; "
++                            "update auth/PatchLibcameraParentDeath.cmake for the new libcamera version")
++    endif()
++    string(REPLACE "${_old}" "${_new}" _content "${_content}")
++    set(_content "${_content}" PARENT_SCOPE)
++endfunction()
++_replace("#include <sys/socket.h>" "#include <sys/prctl.h>\n#include <sys/socket.h>")
++_replace("\tlong childPid = syscall(SYS_clone3,"
++         "\tconst pid_t parentPid = getpid(); /* ${_marker} */\n\tlong childPid = syscall(SYS_clone3,")
++_replace("\t} else {\n\t\tstd::vector<int> v(fds.begin(), fds.end());"
++         "\t} else {\n\t\t/* ${_marker}, also when it is killed */\n\t\tif (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parentPid)\n\t\t\t_exit(EXIT_FAILURE);\n\n\t\tstd::vector<int> v(fds.begin(), fds.end());")
++file(WRITE "${_file}" "${_content}")
++message(STATUS "libcamera patch: IPA workers die with their parent")
+-- 
+2.43.0
+
