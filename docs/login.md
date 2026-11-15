@@ -126,8 +126,10 @@ does.
 > **State 2026-11-15:** in use on the laptop in `both` mode. Checked on the laptop without a person at the keyboard:
 > the PAM stacks end to end (lock screen and login screen, with the user's face), the display-off stop (with the
 > real camera, the display simulated), the lockout service, pam_setcred for PIN, password and face on every stack.
-> Not yet tried by hand: the lock screen starting by itself (the F24 tap), Escape and the lid on the real lock
-> screen, across the room, in a dark room, with a photo on a phone.
+> Tried by hand: the lock screen (Meta+L, Enter, no face then a face, a false face, Escape, the lid). Changed after
+> that and not yet tried by hand: the lock screen starting by itself only after a wake from sleep, the login screen
+> without Enter (checked with copies of the PAM stacks and a fake SDDM socket, not with the real greeter), across
+> the room, in a dark room, with a photo on a phone.
 > The app built from source (patches 0008-0011) is installed and checked on the laptop: the build with all its tests,
 > the camera list (`hm1092` mono, `ov02c10` colour), the lockout through pkexec, a scan, and the app's page with the
 > real settings and faces (on a virtual display). Not yet done by hand in the app: Add 5, Test, saving a mode change,
@@ -153,8 +155,8 @@ Models page). On the Configuration page, under Face Recognition:
 3. **Test**: one scan as the lock screen runs it, with each step (the face's size, scores) and each compared face's
    score on its picture, red when it is not above the threshold. A face that stays red when you test is worth
    deleting (its bin) and adding again; **Delete all** and **Add 5** enrol a camera anew.
-4. Lock the screen (Meta+L): face unlock starts by itself after a moment; at the login screen press Enter on the
-   empty password field.
+4. Lock the screen (Meta+L) and press a key: face unlock looks for you. After a wake from sleep, and at the login
+   screen, it starts by itself.
 
 The same from a terminal, as yourself (camera and antispoof need sudo; close the app first):
 
@@ -193,8 +195,8 @@ Our build of Biopass's app (patches 0009-0011) knows this laptop's setup:
 
 | Where | With face unlock |
 |---|---|
-| Login screen (also the first login after a boot) | Press Enter on the **empty** password field: one run looks for your face for up to 6 s (the camera light is on), with up to 3 false faces. A typed password or PIN goes straight to its check, never waits for the camera. SDDM cannot start a scan by itself: it runs PAM only when a login is submitted and has no second, background service as the lock screen has. |
-| Desktop Mode lock screen | Face unlock starts by itself when the lock screen is up with the display on (after Meta+L, after a wake from sleep), as Windows Hello does, or at the first key press or mouse move. It keeps looking while it sees no face, stops when the display goes off, the lid closes or the laptop sleeps, and starts again by itself when the display is on again. A run ends after 3 false faces (about a second apart) or 60 s without a face; then Enter on the empty password field starts the next one (the lock screen shows "Unlocking failed": it treats every Enter as a password attempt, but an empty field is never checked as a password and never counts for `pam_faillock`). The password field works at the same time. While face unlock runs, the hint under the field says "(or scan your fingerprint on the reader)": Plasma has no face wording for this service. |
+| Login screen (also the first login after a boot) | Face unlock looks by itself while the login screen is up with the display on, as on the lock screen (runs of up to 60 s without a face, 3 false faces, the same lockout), and logs you in when it recognises you: no key needed. Enter on the **empty** password field starts a new run when one ended. A typed password or PIN works at the same time and goes straight to its check; logging in another way stops the scan. |
+| Desktop Mode lock screen | Face unlock starts by itself when the lock screen shows after a wake from sleep or hibernation, as Windows Hello does; after Meta+L or an automatic lock (you are usually still in front then) at the first key press or mouse move. It keeps looking while it sees no face, stops when the display goes off, the lid closes or the laptop sleeps, and starts again by itself when the display is on again. A run ends after 3 false faces (about a second apart) or 60 s without a face; then Enter on the empty password field starts the next one (the lock screen shows "Unlocking failed": it treats every Enter as a password attempt, but an empty field is never checked as a password and never counts for `pam_faillock`). The password field works at the same time. While face unlock runs, the hint under the field says "(or scan your fingerprint on the reader)": Plasma has no face wording for this service. |
 | Display off (Escape on the lock screen, the screen timeout), lid closed, asleep | Never looks, never unlocks: a run that is looking stops within 0.2 s, and a match counts only if the display is still on and the lid open 0.4 s after it (Escape turns the display off a moment after the key, so a match from just before is dropped). |
 | `sudo`, administrator dialogs (polkit) | Password only. Opt-in: `install-face.sh admin on` (read the security notes first): one run as at the login screen, then the password. |
 | Game Mode | Steam's own PIN; no face. |
@@ -299,7 +301,10 @@ streams at a time, and the camera light is on while either does.
 - The display rule: "on" is a DRM connector that is connected, enabled and has DPMS on
   (`/sys/class/drm/card0-eDP-1/{status,enabled,dpms}`; a disconnected port also says "On"), the lid is logind's
   `LidClosed` (closed when it cannot be read), a sleep is CLOCK_BOOTTIME running ahead of CLOCK_MONOTONIC. While a
-  helper looks, the runner checks every 0.2 s and kills it; after a match it waits 0.4 s and checks again.
+  helper looks, the runner checks every 0.2 s and kills it; after a match it waits 0.4 s and checks again. A stopped
+  helper is killed with everything it started: libcamera's IPA workers (`softisp_ipa_proxy`) run in process groups
+  of their own and outlived a killed helper (four held a shutdown up for 90 s); the runner stops the helper, kills
+  its descendants and the helper, and Biopass patch 0012 gives the workers a parent-death signal as well.
 - The lock screen (kscreenlocker 6.6.2, read from its source): it runs two PAM services side by side, `kde` (the
   password field, interactive) and `kde-fingerprint` (non-interactive; also `kde-smartcard`). Both start only in
   `startAuthenticating()`, which Plasma's `LockScreenUi.qml` calls whenever its UI is shown **or hidden**
@@ -315,12 +320,28 @@ streams at a time, and the camera light is on while either does.
     ends with `_exit` after an unlock and would otherwise leave it running).
   - `kde` gets `s15-face pam-rescan` in front of the PIN and the password: an empty field asks the watch for a new
     run and fails without a password check. kscreenlocker then starts its round again 3 s later, which is harmless.
-  - `s15-face-wake.service` (root) taps F24, a key nothing uses, on a short-lived virtual keyboard (`/dev/uinput`)
-    once when the lock screen is up, the display on, the lid open and no watch runs: the first key press, which
-    starts the round. Never in kscreenlocker's grace time: after an automatic lock any input unlocks without a
-    password for `LockGrace` seconds (the greeter then runs with `--graceTime <ms>` and without `--immediateLock`;
-    it waits that long plus 3 s), never when the lock needs no password (`--nolock`). Meta+L, the lock before sleep
-    and `loginctl lock-session` are immediate (no grace): it taps after 1 s.
+  - `s15-face-wake.service` (root, `s15-face-run wake`, on logind's signals: `PrepareForSleep`,
+    `PropertiesChanged`, `SessionNew`/`SessionRemoved`; no polling) taps F24, a key nothing uses, on a short-lived
+    virtual keyboard (`/dev/uinput`) once after a wake from sleep or hibernation (`PrepareForSleep` false), when the
+    lock screen shows within 60 s with the display on, the lid open and no watch running: the first key press,
+    which starts the round. Not after Meta+L or an automatic lock. Never in kscreenlocker's grace time: after an
+    automatic lock any input unlocks without a password for `LockGrace` seconds (the greeter then runs with
+    `--graceTime <ms>` and without `--immediateLock`; it waits that long plus 3 s after the lock), never when the
+    lock needs no password (`--nolock`). Until 2026-11-15 it never tapped: it runs with `ProtectSystem=strict`, and
+    reading the count opened its file for writing, which failed there, so every lock screen was skipped silently.
+- The login screen (SDDM 0.21, read from its source): SDDM runs PAM only when its greeter sends `Login` over the
+  daemon's greeter socket (`/tmp/sddm-<display>-<random>`, `src/daemon/SocketServer.cpp`; QDataStream: quint32 1,
+  QString user, QString password, the session as quint32 type and QString desktop file). While SDDM's greeter
+  session is active on seat0, `s15-face-wake` runs `s15-face-run greeter <user>` (the last user from
+  `/var/lib/sddm/state.conf`): the lock screen's loop as root, with the same display rule and lockout. A match
+  leaves a token in `/run/s15-face/token` (root's, single use, 15 s, bound to the user) and sends SDDM the same
+  `Login(user, empty password, last session)` its greeter would; SDDM runs its PAM stack, where `pam-scan` takes
+  the token instead of looking: the face path, whose `pam_setcred` was checked. SDDM takes `Login` from any
+  connection to that socket, but `Display::login` keeps the sender for its answer before it checks for a login in
+  progress, and deletes the connection when it closes: so `Login` is sent only while no login is being checked (no
+  `sddm-helper` without `--greeter`), and the connection stays open until SDDM answers. Enter on the empty field
+  (the greeter's own `Login`) makes `pam-scan` ask the background scan for a run and take its token: one user of
+  the camera. The scan stops when the greeter session ends (any login) or the wake service stops.
 - The count of false faces: `/var/lib/s15-face/lockout/<user>` (root's, 0600; `fails`, `until` in wall-clock
   seconds). The lock screen's runs run as you and reach it only through `s15-face.socket` (`s15-face-run serve`,
   one request per connection, the caller identified by `SO_PEERCRED`): read it, count one false face (the service
@@ -415,8 +436,10 @@ Same camera, same IR light, much less behind it:
   booted on it that can read the sealed file (`/var/lib/biopass`; on an encrypted install only with the disk
   passphrase) can unseal your password. The TPM is also Windows' ([tpm.md](tpm.md)). Do not save your password in
   the app.
-- The first login after a boot takes a face too (Enter on the empty field), as it takes the PIN: the count of false
-  faces survives restarts, so a restart gives no new tries. The disk encryption and its TPM unlock are not involved:
+- At the login screen and after a wake, face starts by itself: whoever sits in front of the screen is scanned
+  without pressing a key, and a match logs in. Their false faces count as any others (the same lockout).
+- The first login after a boot takes a face too, as it takes the PIN: the count of false faces survives restarts,
+  so a restart gives no new tries. The disk encryption and its TPM unlock are not involved:
   the login screen only appears after the disk is open (with the TPM on an encrypted install), and face, like the
   PIN, guards the session, not the disk. Someone who boots another system, or changes the boot to get a shell, is
   stopped by the disk passphrase, not by the login screen ([encryption.md](encryption.md)).
