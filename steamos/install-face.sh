@@ -74,8 +74,10 @@ put() {
   s=$(mktemp -d /var/tmp/s15-face-stage.XXXXXX)
   mkdir -p "$s/root"
   zstd -dc "$pkg" | tar -xf - -C "$s/root"
-  # WebKitGTK's DMA-BUF renderer ends the app at once on this GPU under Wayland ("Error 71 (Protocol error)").
-  grep -q '^Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass$' "$s/root/usr/share/applications/biopass.desktop" ||
+  # WebKitGTK's DMA-BUF renderer ends the app at once on this GPU under Wayland ("Error 71 (Protocol error)");
+  # without its compositing mode the app idles at a tenth of the CPU (face/build-in-chroot.sh).
+  grep -q '^Exec=env WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass$' \
+    "$s/root/usr/share/applications/biopass.desktop" ||
     die "biopass.desktop: unexpected Exec line"
   install -D -m0755 "$HERE/s15-face-lockout" "$s/root/usr/lib/s15-face/s15-face-lockout"
   install -D -m0644 "$HERE/org.snaptop-linux.s15-face.policy" \

@@ -399,13 +399,17 @@ streams at a time, and the camera light is on while either does.
   `/var/lib/s15-face/cache/src`.
 - The app's menu entry starts it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`: WebKitGTK's DMA-BUF renderer ends it at
   once on this GPU under Wayland ("Error 71 (Protocol error) dispatching to Wayland display"; still so with
-  WebKitGTK 2.50.5, its GL runs on Mesa's zink here). From a terminal: `WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass`.
+  WebKitGTK 2.50.5, its GL runs on Mesa's zink here), and with `WEBKIT_DISABLE_COMPOSITING_MODE=1` (no GL in the
+  page at all), which in the Plasma session keeps the app's own process at 3 % of a core at rest instead of 30 % and
+  scrolls as fast. From a terminal: `WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass`.
 - The app lagged (about 17 frames a second while scrolling, a CPU core busy): Biopass's settings cards had large
   blurred shadows (`shadow-lg`, the expanded method card `shadow-md`) and a backdrop blur, which WebKitGTK paints
   again on every scroll step; the face card is thousands of pixels tall. Measured with the app's page in a
   WebKitGTK view in a nested KWin on the laptop (patch 0016): 17.5 frames a second with them, 60 without (16 ms
   frames), and 4 % instead of 16 % CPU at rest. The DMA-BUF renderer, compositing and Skia settings made no
-  difference.
+  difference there. In the user's Plasma session (scale 1.75): fewer than 6 frames a second with the shadows, 39
+  without, 41 also without compositing mode (the setting the menu entry uses; the app's own process then idles at
+  3 % instead of 30 %); X11 through Xwayland scrolled at 53, but blurry (drawn at scale 1).
 - polkit re-reads all its actions as soon as a policy file appears. When the install unpacked the app's policy file
   with everything else, polkit read it half-written and was left with no actions at all, every time: Plasma then
   hid shutdown and sleep and ignored the lid. `install-face.sh` now puts the policy files (Biopass's and the

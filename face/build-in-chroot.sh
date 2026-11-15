@@ -110,13 +110,14 @@ for i in 32x32:32x32 128x128:128x128 256x256:128x128@2x; do
   install -D -m0644 "$A/src-tauri/icons/${i#*:}.png" "$STAGE/usr/share/icons/hicolor/${i%%:*}/apps/biopass.png"
 done
 # Biopass's own menu entry (its .deb's), started without WebKitGTK's DMA-BUF renderer, which ends the app at once on
-# this GPU under Wayland ("Error 71 (Protocol error)").
+# this GPU under Wayland ("Error 71 (Protocol error)"), and without its compositing mode: in the user's Plasma session
+# that keeps the app's own process at 3 % of a core at rest instead of 30 %, and scrolls as fast (docs/login.md).
 install -d "$STAGE/usr/share/applications"
 cat > "$STAGE/usr/share/applications/biopass.desktop" <<'EOF'
 [Desktop Entry]
 Categories=System;
 Comment=Biometric Authentication System
-Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass
+Exec=env WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass
 StartupWMClass=biopass
 Icon=biopass
 Name=Biopass
