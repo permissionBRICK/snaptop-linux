@@ -117,12 +117,15 @@ sudo s15-pin set       # 6-12 digits, typed twice; s15-pin clear removes it, s15
 Optional: the login screen and Desktop Mode's lock screen also recognise your face with the IR camera (or with both
 cameras), as Windows Hello does. It uses [Biopass](https://github.com/phucvinh57/biopass) 1.5.1 (face and
 fingerprint unlock for Linux PAM, MIT license): the app from Biopass's arm64 release, its authentication part built
-on the laptop with our patches for this IR camera, a minimum face size and a mode that needs both cameras
-(`face/patches/`, to be offered upstream).
+on the laptop with our patches for this IR camera, a minimum face size, a mode that needs both cameras and a helper
+that keeps looking while it sees no face (`face/patches/`, to be offered upstream). When to look, what counts and
+when a match unlocks is ours: `s15-face` and `s15-face-run`.
 
-> **State 2026-11-15:** in use on the laptop with the IR camera (enrolment, lock screen). The minimum face size and
-> the `both` mode were measured and checked on the laptop with Biopass's helper; not yet tried by hand: unlocking in
-> `both` mode, across the room, in a dark room, with a photo on a phone.
+> **State 2026-11-15:** in use on the laptop in `both` mode. Checked on the laptop without a person at the keyboard:
+> the PAM stacks end to end (lock screen and login screen, with the user's face), the display-off stop (with the
+> real camera, the display simulated), the lockout service, pam_setcred for PIN, password and face on every stack.
+> Not yet tried by hand: the lock screen starting by itself (the F24 tap), Escape and the lid on the real lock
+> screen, across the room, in a dark room, with a photo on a phone.
 
 ### Setting it up
 
@@ -145,25 +148,52 @@ sudo /opt/snaptop-linux/steamos/install-face.sh install    # about 15 minutes th
    `/dev/video` nodes, which both cameras share, and would take the colour camera. Saving the app's settings page
    turns the camera settings into a camera profile and drops the settings it does not know (the minimum face size,
    `both`); face unlock then refuses until `sudo s15-face camera ir` (or `both`) again.
-3. Log out or restart once: the first login after a boot always takes the password or the PIN.
+3. Lock the screen (Meta+L): face unlock starts by itself after a moment; at the login screen press Enter on the
+   empty password field.
 
-`sudo s15-face snapshot ir` saves one frame as Biopass sees it (`/tmp/s15-face-ir.png`); `sudo s15-face status`
-shows the state; `sudo /opt/snaptop-linux/steamos/install-face.sh status` the installation.
+`sudo s15-face snapshot ir` saves one frame as Biopass sees it (`/tmp/s15-face-ir.png`); `s15-face status`
+shows the state (display, lid, the count of false faces, whether face is allowed now); `sudo
+/opt/snaptop-linux/steamos/install-face.sh status` the installation.
 
 ### What it does
 
 | Where | With face unlock |
 |---|---|
-| Login screen, first login after a boot | Password or PIN only. |
-| Login screen later (logout, a session that ended) | Press Enter on the **empty** password field: Biopass looks for your face, the camera light is on for a few seconds. A typed password or PIN goes straight to its check, never waits for the camera. |
-| Desktop Mode lock screen | Biopass starts when the lock screen appears (a key press or mouse move) and again after a wrong password; the password field works at the same time. The lock screen's hint says "(or scan your fingerprint on the reader)" meanwhile: Plasma has no face wording for this service. |
-| `sudo`, administrator dialogs (polkit) | Password only. Opt-in: `install-face.sh admin on` (read the security notes first). |
+| Login screen (also the first login after a boot) | Press Enter on the **empty** password field: one run looks for your face for up to 6 s (the camera light is on), with up to 3 false faces. A typed password or PIN goes straight to its check, never waits for the camera. SDDM cannot start a scan by itself: it runs PAM only when a login is submitted and has no second, background service as the lock screen has. |
+| Desktop Mode lock screen | Face unlock starts by itself when the lock screen is up with the display on (after Meta+L, after a wake from sleep), as Windows Hello does, or at the first key press or mouse move. It keeps looking while it sees no face, stops when the display goes off, the lid closes or the laptop sleeps, and starts again by itself when the display is on again. A run ends after 3 false faces (about a second apart) or 60 s without a face; then Enter on the empty password field starts the next one (the lock screen shows "Unlocking failed": it treats every Enter as a password attempt, but an empty field is never checked as a password and never counts for `pam_faillock`). The password field works at the same time. While face unlock runs, the hint under the field says "(or scan your fingerprint on the reader)": Plasma has no face wording for this service. |
+| Display off (Escape on the lock screen, the screen timeout), lid closed, asleep | Never looks, never unlocks: a run that is looking stops within 0.2 s, and a match counts only if the display is still on and the lid open 0.4 s after it (Escape turns the display off a moment after the key, so a match from just before is dropped). |
+| `sudo`, administrator dialogs (polkit) | Password only. Opt-in: `install-face.sh admin on` (read the security notes first): one run as at the login screen, then the password. |
 | Game Mode | Steam's own PIN; no face. |
-| 5 face scans in a row without success | Face is refused until a login with the password or PIN, or a password unlock of the lock screen (`sudo s15-face reset` clears it). |
-| Account locked by wrong passwords (`pam_faillock`) | Face is refused too. Face failures do not count towards that lockout. |
-| A face across the room, or cut off at the edge of the picture | Not matched: the face must fill at least a fifth of the picture's height (sitting in front of the screen, within about 1 m) and lie wholly inside it. |
+| False faces (a face that did not match, or that anti-spoofing flagged) | Counted since the last success, as the PIN counts wrong PINs: the first 6 are free, then face waits 1 minute, after each further one twice as long (up to 60 minutes); after 15 it is off until a login or unlock with the password or PIN. Any success (face, password, PIN, login) starts the count again. The count is kept across restarts and SteamOS updates, so restarting gives no new tries. No face (nobody there, too small, cut off) never counts. The numbers are settings: [below](#lockout-settings). `sudo s15-face reset` clears the count. |
+| Account locked by wrong passwords (`pam_faillock`) | Face is refused too (checked before each run). Face failures do not count towards that lockout. |
+| A face across the room, or cut off at the edge of the picture | Not matched (and not counted): the face must fill at least a fifth of the picture's height (sitting in front of the screen, within about 1 m) and lie wholly inside it. |
 | `both`: too little light for the colour camera, or one lens covered | Not matched, never the IR camera alone: the password or PIN. |
 | No IR camera or no minimum face size in your Biopass settings | Face is refused (`sudo s15-face camera ir`, `rgb` or `both` sets them). |
+
+#### Lockout settings
+
+The lockout's numbers are root's, in `/etc/s15-face.conf` (not in Biopass's `config.yaml`: any program running as
+you can rewrite that). Missing file, a missing, invalid or out-of-range value, or a file that is not root's or is
+writable by others: the defaults. The file is kept across SteamOS updates.
+
+| Key | Default | Range | Meaning |
+|---|---|---|---|
+| `run_false_faces` | 3 | 1-10 | false faces after which a run ends (on the lock screen the next starts on Enter or when the display comes on again) |
+| `free_false_faces` | 6 | 0-100 | false faces since the last success before the first wait |
+| `first_wait` | 60 | 0-86400 s | the first wait; doubled with every further false face; 0: no waits |
+| `max_wait` | 3600 | 0-86400 s | the longest wait |
+| `off_after` | 15 | 1-100 | false faces since the last success after which face is off until a password or PIN login or unlock |
+
+```sh
+s15-face lockout                          # the values in effect, KEY=VALUE per line
+s15-face lockout keys                     # KEY DEFAULT MIN MAX UNIT MEANING per line
+sudo s15-face lockout set first_wait 120  # one value (a whole number within its range); prints the new values
+sudo s15-face lockout reset-defaults      # all back to the defaults
+```
+
+`set` and `reset-defaults` need root (sudo, or pkexec for an app's settings page) and exit 2 for an unknown key, a
+value out of range or bad usage, 1 when not root or the file could not be written. Only values that differ from
+the defaults are written, so a default changed in a later version applies then.
 
 #### Cameras
 
@@ -194,9 +224,13 @@ streams at a time, and the camera light is on while either does.
 
 ### How it works
 
-- Biopass's PAM module (`libbiopass_pam.so`) starts `biopass-helper` as the PAM caller (root on the login screen,
-  you on the lock screen); it reads your settings and faces as you, captures, detects (YOLOv8 face) and compares
-  (EdgeFace) on the CPU, 5 attempts within a few seconds.
+- `s15-face-run` (through `s15-face`'s PAM entry points) starts `biopass-helper auth --keep-looking <ms>` as the
+  PAM caller (root on the login screen, you on the lock screen), with only `PATH` in its environment, as Biopass's
+  own PAM module does (that module is not used); the helper reads your settings and faces as you, captures, detects
+  (YOLOv8 face) and compares (EdgeFace) on the CPU. With `--keep-looking` (patch 0007) attempts that compare no
+  face use up no try: it keeps looking, `retry_delay` apart, and the first face it compares decides (exit 0 match,
+  1 a false face, 3 no face within the time, 2 nothing to try). Biopass's own `retries` are not used then. Each
+  decision takes about 0.8 s from the helper's start; between false faces the helper starts again (about 1 s).
 - One attempt: one picture (the IR camera: the brightest lit one of 4), the largest face in it, cropped as detected
   (not aligned) and scaled to 112x112; its EdgeFace embedding is compared with each enrolled face of that camera
   (cosine similarity, 1 = identical). It matches when one enrolled face scores **above** `recognition.threshold`:
@@ -212,9 +246,9 @@ streams at a time, and the camera light is on while either does.
   compared; a match there too, on a picture at most 2.5 s after the first, unlocks. A miss on the second camera
   leaves it open, and the next attempt starts there. Measured: a scan that matches at once takes 1.3 s, the two
   pictures 0.5 s apart.
-- `s15-face check` runs one scan as the lock screen does (`biopass-helper auth --verbose`, patch 0006), with each
+- `s15-face check` runs one scan (`biopass-helper auth --verbose`, patch 0006: Biopass's own 5 attempts), with each
   step on the terminal: the face's size and how it compares with the minimum, the best score and the threshold. It
-  does not count towards the 5 failed scans.
+  is not counted and does not check the display.
 - Our patches: the IR camera delivers only raw 10-bit frames (`R10_CSI2P`, 560x360, far below full scale); they are
   unpacked and stretched to 8-bit grey from their own black level and brightest pixels, turned upright (the camera
   is mounted upside down and cannot flip), and the dark frames of the IR light (it flashes 50 ms every 100 ms on
@@ -222,22 +256,59 @@ streams at a time, and the camera light is on while either does.
   libcamera 0.8.0 is built with its CPU software ISP (no GPU access needed), and marked as installed: Biopass's
   bundled copy otherwise takes its own RUNPATH for a build tree, looks for its IPA helper process there, and the
   colour camera's software ISP does not start (patch 0003, a bug in Biopass 1.5.1 found from the code).
-- `s15-face` (pam_exec) gates Biopass: `pam-empty` (login screen: empty field only) and `pam-gate` (lock screen,
-  sudo/polkit), each counting a scan, and both refusing unless your Biopass settings name an IR camera (without
-  one, a photo on a phone could pass) and a minimum face size; `pam-ok` and the login screen's account phase
-  (`pam-account`) reset the count; the account phase also records the first login since boot in
-  `/run/s15-face/<user>` (gone at the next boot).
+- The gate (`s15-face-run gate`, and before every helper start) refuses unless your Biopass settings name an IR
+  camera (without one, a photo on a phone could pass) and a minimum face size, while `pam_faillock` locks the
+  account (read from its tally file), during a wait and once face is off (the lockout above).
+- The display rule: "on" is a DRM connector that is connected, enabled and has DPMS on
+  (`/sys/class/drm/card0-eDP-1/{status,enabled,dpms}`; a disconnected port also says "On"), the lid is logind's
+  `LidClosed` (closed when it cannot be read), a sleep is CLOCK_BOOTTIME running ahead of CLOCK_MONOTONIC. While a
+  helper looks, the runner checks every 0.2 s and kills it; after a match it waits 0.4 s and checks again.
+- The lock screen (kscreenlocker 6.6.2, read from its source): it runs two PAM services side by side, `kde` (the
+  password field, interactive) and `kde-fingerprint` (non-interactive; also `kde-smartcard`). Both start only in
+  `startAuthenticating()`, which Plasma's `LockScreenUi.qml` calls whenever its UI is shown **or hidden**
+  (`onUiVisibleChanged`: a key, a mouse move or click, Escape, the 10 s fade-out, the mouse leaving) and 3 s after a
+  failed password (`graceLockTimer`); it does nothing while a round is running, and a non-interactive failure does
+  not end the round (only a failed password does). So: nothing starts on its own when the lock screen appears or
+  after a wake; Escape hides the UI, which may start a round, and turns the display off on the key's release
+  (`greeterapp.cpp`), so a scan could start, and match, while the screen goes dark: the bug that the display rule
+  fixes; and a face scan that ended can only be started again by a failed password. Hence:
+  - `kde-fingerprint` runs `s15-face pam-watch`: one long conversation (as fprintd's is), from the first round
+    until a match (or face is off): it looks while the display is on, waits with the camera off while it is off,
+    and starts a new run when it comes on again. It ends when the greeter does (it watches its parent; the greeter
+    ends with `_exit` after an unlock and would otherwise leave it running).
+  - `kde` gets `s15-face pam-rescan` in front of the PIN and the password: an empty field asks the watch for a new
+    run and fails without a password check. kscreenlocker then starts its round again 3 s later, which is harmless.
+  - `s15-face-wake.service` (root) taps F24, a key nothing uses, on a short-lived virtual keyboard (`/dev/uinput`)
+    once when the lock screen is up, the display on, the lid open and no watch runs: the first key press, which
+    starts the round. Never in kscreenlocker's grace time: after an automatic lock any input unlocks without a
+    password for `LockGrace` seconds (the greeter then runs with `--graceTime <ms>` and without `--immediateLock`;
+    it waits that long plus 3 s), never when the lock needs no password (`--nolock`). Meta+L, the lock before sleep
+    and `loginctl lock-session` are immediate (no grace): it taps after 1 s.
+- The count of false faces: `/var/lib/s15-face/lockout/<user>` (root's, 0600; `fails`, `until` in wall-clock
+  seconds). The lock screen's runs run as you and reach it only through `s15-face.socket` (`s15-face-run serve`,
+  one request per connection, the caller identified by `SO_PEERCRED`): read it, count one false face (the service
+  applies root's lockout numbers), reset it after a success, each only for the caller's own user. Root's paths (the
+  login screen, the wake service, `s15-face reset`) use the file directly. A program running as you can reset its
+  own count (as it can change your Biopass settings, see the security notes); the count protects against people at
+  the keyboard, and a restart no longer resets it. `/run/s15-face/<user>` (yours) only holds the lock screen's
+  watch and Enter presses.
 - PAM lines (`login-lock.sh face-pam`, only while face unlock is installed and the login password is on):
-  `/etc/pam.d/sddm` gets four auth lines after the PIN line (gate, `pam_faillock preauth`, Biopass, `pam_deny`: a
-  failed or impossible scan fails the attempt) and one account line; `/etc/pam.d/kde-fingerprint` (kscreenlocker's
-  service next to the password) is Valve's file with Biopass in place of fprintd, followed by `pam_deny` (Biopass
-  answers "nothing to try" with `PAM_IGNORE`, which must not unlock); `/etc/pam.d/kde` gets the reset line after a
-  password unlock. Never `/etc/pam.d/sddm-autologin`. `admin on` adds lines to `/etc/pam.d/sudo`, an
-  `/etc/pam.d/polkit-1`, and a drop-in that opens polkit's sandboxed password helper to the cameras, udev and
-  `/home` (read-only).
-- Logs: `journalctl -t s15-face` (refusals), Biopass's own in `~/.local/share/com.ticklab.biopass/logs/` when debug
-  logging is on in the app (it also keeps pictures of failed faces in `debugs/` then); `s15-face check` shows the
-  same steps without it.
+  `/etc/pam.d/sddm` gets four auth lines **in front of** the PIN line (`pam-empty`: an empty field and the gate;
+  `pam_faillock preauth`; `pam-scan`; `pam_deny`: a failed or impossible scan fails the attempt) and one account
+  line (`pam-account`: a login resets the count). In front of the PIN line, not after it: `pam_setcred` replays
+  the auth chain, and modules that did not run in it (after the PIN's `sufficient` success all of them) decide by
+  their setcred result, which is `PAM_IGNORE` for `pam_exec`; `pam-empty`'s `default=3` jump then made the whole
+  `pam_setcred` `PAM_IGNORE` and SDDM went back to the login screen after every PIN login (checked with copies of
+  the stacks through `pam_start_confdir`: PIN, password and face now all give `PAM_SUCCESS` in sddm, kde,
+  kde-fingerprint, sudo and polkit-1). `/etc/pam.d/kde-fingerprint` is Valve's file with `pam-watch` in place of
+  fprintd, `pam_deny` after it and `pam-ok`; `/etc/pam.d/kde` gets `pam-rescan` and `pam_deny` in front of the PIN
+  line and `pam-ok` after a password unlock. Never `/etc/pam.d/sddm-autologin`. `admin on` adds the gate,
+  `pam_faillock preauth` and `pam-scan` to `/etc/pam.d/sudo` and an `/etc/pam.d/polkit-1`, and a drop-in that opens
+  polkit's sandboxed password helper to the cameras, udev, `/home` (read-only) and the count.
+- Logs: `journalctl -t s15-face` (refusals, false faces, run ends, matches, the wake service's taps), Biopass's own
+  in `~/.local/share/com.ticklab.biopass/logs/` when debug logging is on in the app (it also keeps pictures of
+  failed faces in `debugs/` then); `s15-face check` shows the same steps without it. `tools/test-s15-face-run.py`
+  tests the runner without a camera (a fake helper and display).
 - The app's menu entry starts it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`: WebKitGTK's DMA-BUF renderer ends it at
   once on this GPU under Wayland ("Error 71 (Protocol error) dispatching to Wayland display"). From a terminal:
   `WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass`.
@@ -253,11 +324,12 @@ releases.
 
 Updates: `s15-os-update` installs face unlock into each new SteamOS version (webkit2gtk-4.1 from the new image's
 repository, the build kept in `/var/lib/s15-face/cache`, rebuilt only when `face/` changes) and applies the PAM lines
-again. If Valve changed one of the PAM files the lines were checked against (`steamos/face-pam.sha256`), the update
+again; the count of false faces (`/var/lib`) and the lockout settings (`/etc/s15-face.conf`, on the update's keep
+list through `/etc/atomic-update.conf.d/s15-face.conf`) stay. If Valve changed one of the PAM files the lines were checked against (`steamos/face-pam.sha256`), the update
 stops with an error naming the file: review the lines for it, or uninstall face unlock, update, and install again.
 
-Removing it: `sudo /opt/snaptop-linux/steamos/install-face.sh uninstall` removes Biopass and the PAM lines; the PAM
-files are byte for byte as before (`login-lock.sh status` and `sha256sum /etc/pam.d/*` to compare). Your faces and
+Removing it: `sudo /opt/snaptop-linux/steamos/install-face.sh uninstall` removes Biopass, the PAM lines, the
+services, the count of false faces and the lockout settings; the PAM files are byte for byte as before (`login-lock.sh status` and `sha256sum /etc/pam.d/*` to compare). Your faces and
 settings stay in your home until you delete the two `com.ticklab.biopass` directories; webkit2gtk-4.1 stays installed
 until the next SteamOS update (or `pacman -Rs webkit2gtk-4.1`).
 
@@ -272,11 +344,12 @@ Same camera, same IR light, much less behind it:
 - How often a stranger matches, measured with Biopass's own pipeline (the crop as detected, not aligned, and
   EdgeFace) on 1200 colour photos of 600 people from the public LFW set: two photos of different people scored above
   0.5 in 3 of 10,000 pairs, above 0.6 in 2 of 100,000 (the highest of 720,000 pairs: 0.76); a tiny face (a person
-  across a room) scored no higher. One scan compares up to 5 pictures with each of 5 enrolled faces, and 5 scans
-  are allowed before the password is needed: at most 125 tries, so a random stranger gets in with a chance of up to
-  about 4 % at Biopass's default 0.5 and 0.3 % at 0.6, which `s15-face camera` sets (Windows Hello: 0.001 %). A relative or a
-  look-alike scores higher than a random stranger. IR pictures have no such public set; `both` makes a stranger
-  match on both cameras at once.
+  across a room) scored no higher. Each false face is compared with each of 5 enrolled faces, and 15 false faces
+  are allowed (with waits after the 6th) before the password or PIN is needed, also across restarts: at most 75
+  tries, so a random stranger gets in with a chance of up to about 2 % at Biopass's default 0.5 and 0.15 % at 0.6,
+  which `s15-face camera` sets (Windows Hello: 0.001 %); before 2026-11-15 it was 125 tries per boot, and every
+  restart gave new ones. A relative or a look-alike scores higher than a random stranger. IR pictures have no such
+  public set; `both` makes a stranger match on both cameras at once.
 - Any program running as you can read your enrolled faces, add a face or lower the threshold. On the login and lock
   screen that only matters to someone who already has your session; for `sudo` and polkit (opt-in) it means such a
   program gets administrator rights as easily as with a `sudo` without password. Keep `admin` off unless that is
@@ -284,17 +357,20 @@ Same camera, same IR light, much less behind it:
 - Spoofs: a phone or monitor shows nothing in IR (to be confirmed on the laptop). With `rgb`, a printed photo that
   the colour camera recognises also passes the IR presence check. With `ir`, a photo has to look like you in
   infrared; an IR photo, a good mask, a twin or a look-alike can pass. With `both`, a fake must pass as you in colour
-  and in infrared within the same 2.5 seconds; a twin or a look-alike still can. Face unlock is a convenience, weaker than your
-  password: the password (or PIN) stays required after every boot, for `sudo` and polkit by default, and after 5
-  failed scans.
+  and in infrared within the same 2.5 seconds; a twin or a look-alike still can. Face unlock is a convenience, weaker
+  than your password: the password (or PIN) stays required for `sudo` and polkit by default, and after 15 false
+  faces.
 - Keyring: Biopass can store your login password sealed by the TPM, to unlock a keyring after a face login. Not used
   here: SteamOS has no keyring PAM module, and our lines do not hand a password on (no `authtok`). Its seal is bound
   at most to PCR 7 (the Secure Boot state), which says little with Secure Boot off as on this laptop: any system
   booted on it that can read the sealed file (`/var/lib/biopass`; on an encrypted install only with the disk
   passphrase) can unseal your password. The TPM is also Windows' ([tpm.md](tpm.md)). Do not save your password in
   the app.
-- The disk encryption and its TPM unlock are not involved: face unlock never runs before the first password or PIN
-  login after a boot.
+- The first login after a boot takes a face too (Enter on the empty field), as it takes the PIN: the count of false
+  faces survives restarts, so a restart gives no new tries. The disk encryption and its TPM unlock are not involved:
+  the login screen only appears after the disk is open (with the TPM on an encrypted install), and face, like the
+  PIN, guards the session, not the disk. Someone who boots another system, or changes the boot to get a shell, is
+  stopped by the disk passphrase, not by the login screen ([encryption.md](encryption.md)).
 
 ## Boot hardening (encrypted install)
 
