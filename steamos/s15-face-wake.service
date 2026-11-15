@@ -1,20 +1,32 @@
 [Unit]
-Description=Face unlock starts by itself on the lock screen (docs/login.md#face-unlock)
+Description=Face unlock by itself: the lock screen after a wake, the login screen (docs/login.md#face-unlock)
 After=systemd-logind.service dbus.service
 
 [Service]
-# s15-face-run wake: one F24 key tap on a virtual keyboard when the lock screen is up with the display on and no
-# face run going, never in kscreenlocker's grace time
+# s15-face-run wake: on logind's signals. After a wake from sleep one F24 key tap on a virtual keyboard when the lock
+# screen shows with the display on and no face run going (never in kscreenlocker's grace time); while SDDM's login
+# screen is up, `s15-face-run greeter` scans in the background (Biopass's helper with the cameras) and on a match asks
+# SDDM to log in.
 ExecStart=/usr/local/sbin/s15-face-run wake
 Restart=on-failure
 RestartSec=10
 Nice=5
 ProtectSystem=strict
 ProtectHome=read-only
-PrivateTmp=yes
 NoNewPrivileges=yes
+# the count of false faces, the login screen's token and state
+StateDirectory=s15-face/lockout
+StateDirectoryMode=0700
+RuntimeDirectory=s15-face
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+# uinput for the tap; the cameras, libcamera's buffers and udev (netlink) for the helper
 DeviceAllow=/dev/uinput rw
-RestrictAddressFamilies=AF_UNIX
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-media rw
+DeviceAllow=char-dma_heap rw
+DeviceAllow=/dev/udmabuf rw
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

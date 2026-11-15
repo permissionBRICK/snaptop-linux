@@ -35,7 +35,10 @@ Rules for every run:
   s15-face-run reset USER  (root) reset the count (s15-face reset)
   s15-face-run serve       (s15-face@.service, root, one request per connection from s15-face.socket) "get|false|ok
                            USER": a user's process only for itself (SO_PEERCRED); answers "fails=N until=T"
-  s15-face-run wake        (s15-face-wake.service, root) starts face unlock on the lock screen by itself
+  s15-face-run wake [--dry-run] [--simulate-resume]   (s15-face-wake.service, root) face unlock by itself: the
+                           lock screen after a wake from sleep (one F24 tap), the login screen while it is up
+  s15-face-run greeter USER  (root, the wake service's child) the login screen's background scan: on a match a
+                           token for SDDM's PAM stack and SDDM's own Login message
   s15-face-run state [user]  display, lid and the user's face state (for s15-face status)
   s15-face-run lockout [keys | set KEY VALUE [KEY VALUE ...] | reset-defaults]   the lockout numbers (s15-face lockout)
 """
@@ -78,6 +81,11 @@ SETTLE_S = 0.5          # the display must be on this long before a run starts
 POLL_S = 0.2            # while the helper looks
 IDLE_S = 0.5            # while waiting
 HELPER_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
+GREETER = "greeter"     # /run/s15-face/greeter (root's): the login screen's scan (its pid, Enter presses)
+TOKEN = "token"         # /run/s15-face/token (root's): a face recognised at the login screen, for SDDM's PAM stack
+TOKEN_LIFE_MS = 15000
+SDDM_STATE = "/var/lib/sddm/state.conf"
+RESUME_WINDOW_S = 60    # after a wake from sleep: how long the lock screen may take to show with the display on
 
 # Exit codes of biopass-helper auth (face/patches/0007)
 MATCH, FALSE_FACE, NOTHING, NO_FACE = 0, 1, 2, 3
@@ -120,21 +128,21 @@ def display_on(drm=DRM):
     return False
 
 
-_bus = None
+_lid = None
 
 
 def lid_closed():
-    """logind's LidClosed; closed when it cannot be read (fail closed)."""
-    global _bus
+    """logind's LidClosed; closed when it cannot be read (fail closed). One proxy, made once without introspection:
+    each call is a single Get."""
+    global _lid
     try:
         import dbus
-        if _bus is None:
-            _bus = dbus.SystemBus()
-        obj = _bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1")
-        return bool(obj.Get("org.freedesktop.login1.Manager", "LidClosed",
-                            dbus_interface="org.freedesktop.DBus.Properties", timeout=2))
+        if _lid is None:
+            _lid = dbus.Interface(dbus.SystemBus().get_object("org.freedesktop.login1", "/org/freedesktop/login1",
+                                                              introspect=False), "org.freedesktop.DBus.Properties")
+        return bool(_lid.Get("org.freedesktop.login1.Manager", "LidClosed", timeout=2))
     except Exception:   # no dbus module or no answer
-        _bus = None
+        _lid = None
     try:
         out = subprocess.run(["busctl", "get-property", "org.freedesktop.login1", "/org/freedesktop/login1",
                               "org.freedesktop.login1.Manager", "LidClosed"], capture_output=True, text=True,
@@ -174,14 +182,17 @@ class Runtime:
     """/run/s15-face/<user>: watch = the lock screen's watch, rescan = Enter presses on the lock screen's empty field.
     The file is the user's (created by root: at a login, or by the service); the directory is root's, so a user can
     change it but not create, replace or link it. Nothing in it counts for the lockout."""
-    def __init__(self, user, state_dir=STATE_DIR):
-        self.user, self.path = user, f"{state_dir}/{user}"
+    def __init__(self, user, state_dir=STATE_DIR, name=None, owner=None):
+        """name, owner: another file of the directory and its owner's uid (the login screen's scan: "greeter",
+        root's)."""
+        self.user, self.path, self.owner = user, f"{state_dir}/{name or user}", owner
 
     def _open(self):
         fd = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW)
         st = os.fstat(fd)
         import stat as st_
-        if not st_.S_ISREG(st.st_mode) or st.st_uid != pwd.getpwnam(self.user).pw_uid:
+        owner = self.owner if self.owner is not None else pwd.getpwnam(self.user).pw_uid
+        if not st_.S_ISREG(st.st_mode) or st.st_uid != owner:
             os.close(fd)
             raise OSError("not the user's runtime file")
         return fd
@@ -576,6 +587,22 @@ def cmd_scan():
     u = pam_user()
     service = os.environ.get("PAM_SERVICE", "")
     set_pdeathsig(signal.SIGTERM)
+    if service == "sddm":
+        # The login screen's background scan (s15-face-wake) recognised the face and asked SDDM to log in, or it is
+        # running: it owns the camera, so Enter asks it for a run and waits for its answer.
+        if take_token(u):
+            log(f"{u}: face recognised at the login screen ({service})")
+            sys.exit(0)
+        g = Runtime(u, name=GREETER, owner=0)
+        if watch_alive(g, "greeter"):
+            g.update(lambda d: d.__setitem__("rescan", d.get("rescan", 0) + 1))
+            end = time.monotonic() + SCAN_LOOK_MS / 1000 + 6
+            while time.monotonic() < end:
+                time.sleep(0.1)
+                if take_token(u):
+                    log(f"{u}: face recognised at the login screen, Enter ({service})")
+                    sys.exit(0)
+            sys.exit(1)
     r = Runner(u, service, Lockout(u), lockout_conf())
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     try:
@@ -617,7 +644,7 @@ def cmd_watch():
         runtime.update(lambda d: d.pop("watch", None) if d.get("watch") == me else None)
 
 
-def watch_loop(r, runtime):
+def watch_loop(r, runtime, on_match=None):
     """0: a match (unlock); 1: face off until a password or PIN, or the lock screen ended. Ending makes kscreenlocker
     hide its face hint; it starts the watch again only after a failed password (then it is checked again). Refused
     for a while (a wait, pam_faillock, the settings): the watch stays and tries at the next start of a run."""
@@ -644,7 +671,9 @@ def watch_loop(r, runtime):
         result, detail = r.run(WATCH_LOOK_MS, WATCH_NO_FACE_S)
         if result == "match":
             log(f"{u}: face recognised ({service})")
-            return 0
+            if on_match is None or on_match():
+                return 0
+            seen, waiting = (runtime.read() or {}).get("rescan", 0), True
         if result == "refused":
             log(f"{u}: face refused: {detail[1]} ({service})")
             if detail[0]:
@@ -798,73 +827,439 @@ def grace_s(args):
     return 0.0
 
 
-def watch_alive(runtime):
+def watch_alive(runtime, mode="watch"):
     pid = (runtime.read() or {}).get("watch")
     if not pid:
         return False
     try:
-        return b"s15-face-run\0watch" in open(f"/proc/{pid}/cmdline", "rb").read()
+        return f"s15-face-run\0{mode}".encode() in open(f"/proc/{pid}/cmdline", "rb").read()
     except OSError:
         return False
 
 
-def locked_sessions():
-    import dbus
-    bus = dbus.SystemBus()
-    mgr = dbus.Interface(bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1"),
-                         "org.freedesktop.login1.Manager")
+# --- the login screen (SDDM) without Enter ------------------------------------------------------------------------
+# SDDM runs PAM only when a login is submitted. While its greeter is up, s15-face-wake runs `s15-face-run greeter`:
+# the lock screen's watch loop, as root, for the login screen's user. A match leaves a token (root's, single use, 15 s,
+# bound to the user) and sends SDDM's own greeter message Login(user, empty password, last session) to its greeter
+# socket, as the greeter does when Enter is pressed: SDDM runs its PAM stack, where `pam-scan` takes the token
+# instead of looking (the face path whose pam_setcred is checked). SDDM 0.21 (src/daemon/SocketServer.cpp,
+# Display.cpp) takes Login from any connection to that socket, answers LoginSucceeded/LoginFailed on it and deletes
+# it when it closes; Display::login keeps the sender before it checks for a running login. So Login is sent only
+# while no login is being checked (no sddm-helper without --greeter), and the connection stays open until SDDM
+# answered.
+
+def boottime_ms():
+    return int(time.clock_gettime(time.CLOCK_BOOTTIME) * 1000)
+
+
+def make_token(user, state_dir=STATE_DIR):
+    uid = pwd.getpwnam(user).pw_uid
+    tmp = f"{state_dir}/.{TOKEN}.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, f"uid={uid}\nat={boottime_ms()}\n".encode())
+    finally:
+        os.close(fd)
+    os.rename(tmp, f"{state_dir}/{TOKEN}")
+
+
+def take_token(user, state_dir=STATE_DIR, life_ms=TOKEN_LIFE_MS):
+    """True, once, if a fresh token for user is there. Any token found is used up (renamed first: only one taker)."""
+    import stat as st_
+    path = f"{state_dir}/{TOKEN}"
+    claim = f"{path}.{os.getpid()}"
+    try:
+        os.rename(path, claim)
+    except OSError:
+        return False
+    try:
+        fd = os.open(claim, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            st = os.fstat(fd)
+            ours = st_.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o077
+            d = parse_kv(os.read(fd, 256).decode(errors="replace"))
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    finally:
+        try:
+            os.unlink(claim)
+        except OSError:
+            pass
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return False
+    return ours and d.get("uid") == uid and "at" in d and 0 <= boottime_ms() - d["at"] <= life_ms
+
+
+def proc_procs(comm):
+    """(pid, uid, argv) of the processes named comm (as /proc/*/comm shows it, at most 15 characters)."""
     out = []
-    for sid, uid, user, _seat, path in mgr.ListSessions():
-        p = dbus.Interface(bus.get_object("org.freedesktop.login1", path), "org.freedesktop.DBus.Properties")
-        s = p.GetAll("org.freedesktop.login1.Session")
-        if s["Class"] == "user" and s["Type"] in ("wayland", "x11") and s["Active"] and not s["Remote"] \
-                and s["LockedHint"]:
-            out.append((str(sid), int(uid), str(user)))
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            if open(f"/proc/{p}/comm").read().strip() != comm:
+                continue
+            argv = open(f"/proc/{p}/cmdline", "rb").read().decode(errors="replace").split("\0")
+            out.append((int(p), os.stat(f"/proc/{p}").st_uid, argv))
+        except OSError:
+            continue
     return out
 
 
-def cmd_wake(dry_run=False):
-    episodes = {}   # session -> since (first seen locked, monotonic), taps in this display-on episode, last tap
-    while True:
+def sddm_login_running():
+    """SDDM checks a login or runs a session: an sddm-helper that is not the greeter's."""
+    return any("--greeter" not in argv for _, uid, argv in proc_procs("sddm-helper") if uid == 0)
+
+
+def sddm_greeter_socket(net_unix="/proc/net/unix"):
+    """The socket the SDDM daemon listens on for its greeter (/tmp/sddm-<display>-<random>, not sddm-auth-*), as a
+    path root can connect to, or None."""
+    for pid, uid, argv in proc_procs("sddm"):
+        if uid != 0:
+            continue
+        inodes = set()
         try:
-            locked = locked_sessions()
-        except Exception as e:   # logind restarting
-            log(f"wake: logind: {e}")
-            time.sleep(5)
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                link = os.readlink(f"/proc/{pid}/fd/{fd}")
+                if link.startswith("socket:["):
+                    inodes.add(link[8:-1])
+        except OSError:
             continue
-        ids = {s[0] for s in locked}
-        for sid in list(episodes):
-            if sid not in ids:
-                del episodes[sid]
-        if not locked:
-            time.sleep(2)
-            continue
-        screen = display_on() and not lid_closed()
+        try:
+            path = greeter_socket_path(inodes, open(net_unix).read().splitlines()[1:])
+        except OSError:
+            return None
+        if path:
+            return f"/proc/{pid}/root{path}"
+    return None
+
+
+def greeter_socket_path(inodes, lines):
+    """From /proc/net/unix lines (Num RefCount Protocol Flags Type St Inode Path): the listening socket (flag
+    __SO_ACCEPTCON, 0x10000) among inodes named /tmp/sddm-*, not /tmp/sddm-auth-* (sddm-helper's)."""
+    for line in lines:
+        f = line.split()
+        if len(f) >= 8 and f[6] in inodes and int(f[3], 16) & 0x10000 and f[7].startswith("/tmp/sddm-") \
+                and not f[7].startswith("/tmp/sddm-auth-"):
+            return f[7]
+    return None
+
+
+def sddm_last(key, path=SDDM_STATE):
+    """[Last] User or Session from SDDM's state file (the user and session the greeter preselects)."""
+    try:
+        section = ""
+        for line in open(path):
+            line = line.strip()
+            if line.startswith("["):
+                section = line
+            elif section == "[Last]" and line.startswith(key + "="):
+                return line.split("=", 1)[1].strip() or None
+    except OSError:
+        pass
+    return None
+
+
+def qstring(text):
+    b = text.encode("utf-16-be")
+    return struct.pack(">I", len(b)) + b
+
+
+def sddm_login_message(user, session):
+    """SDDM's GreeterMessages::Login (src/common/Messages.h) as its greeter sends it (QDataStream): quint32 1,
+    QString user, QString password (empty), Session (quint32 type: 1 X11, 2 Wayland; QString its desktop file)."""
+    kind = 2 if "/wayland-sessions/" in session else 1
+    return struct.pack(">I", 1) + qstring(user) + qstring("") + struct.pack(">I", kind) + qstring(session)
+
+
+def sddm_login(user, session, sock_path, timeout=30):
+    """Sends Login and waits for SDDM's answer: True LoginSucceeded, False LoginFailed (or no answer)."""
+    import socket
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(timeout)
+    try:
+        c.connect(sock_path)
+        c.sendall(sddm_login_message(user, session))
+        f = c.makefile("rb")
+
+        def u32():
+            b = f.read(4)
+            if len(b) < 4:
+                raise EOFError
+            return struct.unpack(">I", b)[0]
+
+        while True:
+            msg = u32()
+            if msg in (2, 3):              # DaemonMessages::LoginSucceeded, LoginFailed
+                return msg == 2
+            if msg in (0, 4):              # HostName, InformationMessage: a QString
+                n = u32()
+                if n != 0xFFFFFFFF:
+                    f.read(n)
+            elif msg == 1:                 # Capabilities: a quint32
+                u32()
+            else:
+                return False
+    except (OSError, EOFError):
+        return False
+    finally:
+        c.close()
+
+
+def cmd_greeter(user):
+    """(root, s15-face-wake's child while SDDM's greeter is up) the login screen's background scan."""
+    if os.geteuid() != 0 or not valid_user(user):
+        sys.exit(2)
+    parent = os.getppid()
+    set_pdeathsig(signal.SIGTERM)
+    if parent == 1 or os.getppid() != parent:
+        sys.exit(1)
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    fd = os.open(f"{STATE_DIR}/{GREETER}", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.close(fd)
+    rt = Runtime(user, name=GREETER, owner=0)
+    r = Runner(user, "sddm", Lockout(user), lockout_conf(), parent=parent)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    me = os.getpid()
+    rt.update(lambda d: d.__setitem__("watch", me))
+
+    def on_match():
+        make_token(user)
+        if sddm_login_running():
+            log(f"{user}: login screen: a login is being checked; the face is there for it for "
+                f"{TOKEN_LIFE_MS // 1000} s (Enter on the empty field)")
+            return False
+        sock, session = sddm_greeter_socket(), sddm_last("Session")
+        if not sock or not session:
+            log(f"{user}: login screen: SDDM's greeter socket or last session not found; Enter logs in for "
+                f"{TOKEN_LIFE_MS // 1000} s")
+            return False
+        ok = sddm_login(user, session, sock)
+        log(f"{user}: login screen: SDDM {'logs in' if ok else 'refused the login'} ({session})")
+        return ok
+
+    try:
+        sys.exit(watch_loop(r, rt, on_match))
+    finally:
+        r.kill()
+        rt.update(lambda d: d.pop("watch", None) if d.get("watch") == me else None)
+
+
+# --- s15-face-wake: face unlock by itself (root) ---------------------------------------------------------------
+# On logind's signals, no polling:
+# - after a wake from sleep or hibernation (PrepareForSleep false), the lock screen gets one F24 tap if it shows with
+#   the display on within RESUME_WINDOW_S; never after Meta+L or an idle lock (the user is usually in front then);
+# - while SDDM's greeter session is active, `s15-face-run greeter` runs (above).
+
+def tap_reason(args, locked_for, watch_running, refused):
+    """Why the lock screen gets no tap now, or None. args: the kscreenlocker greeter's command line (None: none
+    runs); locked_for: seconds (monotonic) since the session's LockedHint turned on."""
+    if args is None:
+        return "no lock screen"
+    if watch_running:
+        return "face unlock runs already"
+    grace = grace_s(args)
+    if grace is None:
+        return "the lock needs no password"
+    if locked_for < (grace + 3 if grace else 1):
+        return "grace time"
+    if refused:
+        return f"face refused: {refused[1]}"
+    return None
+
+
+LOGIN1, LOGIN1_PATH = "org.freedesktop.login1", "/org/freedesktop/login1"
+MANAGER, SESSION, PROPS = "org.freedesktop.login1.Manager", "org.freedesktop.login1.Session", \
+    "org.freedesktop.DBus.Properties"
+
+
+class Waker:
+    def __init__(self, bus, dry_run=False, greeter_cmd=None):
+        import dbus
+        self.dbus, self.bus, self.dry = dbus, bus, dry_run
+        # no introspection: a proxy is made once and calls go straight out
+        self.mgr = dbus.Interface(bus.get_object(LOGIN1, LOGIN1_PATH, introspect=False), MANAGER)
+        self.proxies = {}
+        self.started = time.monotonic()
+        self.locked_since = {}      # session path -> monotonic time LockedHint turned on
+        self.resume_until = 0.0
+        self.taps, self.last_tap, self.told = 0, 0.0, set()
+        self.ticking = False
+        self.greeter, self.greeter_session = None, None
+        self.greeter_cmd = greeter_cmd or [sys.executable, "-I", os.path.abspath(__file__), "greeter"]
+
+    def props(self, path):
+        p = self.proxies.get(path)
+        if p is None:
+            p = self.proxies[path] = self.dbus.Interface(self.bus.get_object(LOGIN1, path, introspect=False), PROPS)
+        return p.GetAll(SESSION)
+
+    def sessions(self):
+        out = []
+        for _sid, _uid, _user, _seat, path in self.mgr.ListSessions():
+            try:
+                out.append((str(path), self.props(path)))
+            except self.dbus.DBusException:
+                self.proxies.pop(str(path), None)
+        return out
+
+    # logind's signals
+    def on_sleep(self, going):
+        if going:
+            self.resume_until = 0.0
+            return
+        self.resume_until = time.monotonic() + RESUME_WINDOW_S
+        self.taps, self.told = 0, set()
+        log(f"wake: woke from sleep: face unlock on the lock screen once it shows{' (dry run)' if self.dry else ''}")
+        self.tick_start()
+
+    def on_props(self, iface, changed, _invalidated, path=None):
+        if iface != SESSION or path is None:
+            return
+        if "LockedHint" in changed:
+            if changed["LockedHint"]:
+                self.locked_since.setdefault(path, time.monotonic())
+            else:
+                self.locked_since.pop(path, None)
+        if "Active" in changed or "State" in changed:
+            self.check_greeter()
+
+    def on_sessions(self, _sid, path):
+        self.proxies.pop(str(path), None)
+        self.check_greeter()
+
+    # the lock screen after a wake
+    def tick_start(self):
+        if not self.ticking:
+            from gi.repository import GLib
+            self.ticking = True
+            GLib.timeout_add(500, self.tick)
+
+    def tick(self):
         now = time.monotonic()
-        for sid, uid, user in locked:
-            ep = episodes.setdefault(sid, {"since": now, "taps": 0, "last": 0.0})
-            if not screen:
-                ep["taps"] = 0
+        if now > self.resume_until or self.taps >= 2:
+            self.ticking = False
+            return False
+        if now - self.last_tap < 5 or not display_on() or lid_closed():
+            return True
+        try:
+            sessions = self.sessions()
+        except self.dbus.DBusException as e:
+            log(f"wake: logind: {e}")
+            return True
+        for path, s in sessions:
+            user = str(s["Name"])
+            if not (s["Class"] == "user" and s["Type"] in ("wayland", "x11") and s["Active"] and not s["Remote"]
+                    and s["LockedHint"] and valid_user(user)):
                 continue
-            if ep["taps"] >= 2 or now - ep["last"] < 5 or not valid_user(user):
+            since = self.locked_since.setdefault(path, self.started)
+            why = tap_reason(greeter_args(int(s["User"][0])), now - since,
+                             watch_alive(Runtime(user)), refusal(user, Lockout(user), lockout_conf()))
+            if why:
+                if why not in self.told:
+                    self.told.add(why)
+                    log(f"wake: {user}: no tap: {why}")
+                if why == "face unlock runs already":
+                    self.taps = 2
                 continue
-            args = greeter_args(uid)
-            if args is None or watch_alive(Runtime(user)):
-                continue
-            grace = grace_s(args)
-            if grace is None or now - ep["since"] < (grace + 3 if grace else 1):
-                continue
-            if refusal(user, Lockout(user), lockout_conf()):
-                continue
-            ep["taps"] += 1
-            ep["last"] = now
-            log(f"wake: {user}: lock screen on, no face unlock running: F24 to start it{' (dry run)' if dry_run else ''}")
-            if not dry_run:
+            self.taps += 1
+            self.last_tap = now
+            log(f"wake: {user}: lock screen after a wake, no face unlock running: F24 to start it"
+                f"{' (dry run)' if self.dry else ''}")
+            if not self.dry:
                 try:
                     tap_f24()
                 except OSError as e:
                     log(f"wake: /dev/uinput: {e}")
-        time.sleep(IDLE_S)
+        return True
+
+    # the login screen
+    def check_greeter(self):
+        try:
+            sessions = self.sessions()
+        except self.dbus.DBusException as e:
+            log(f"wake: logind: {e}")
+            return
+        active = [path for path, s in sessions
+                  if s["Class"] == "greeter" and s["Active"] and str(s["Seat"][0]) == "seat0"]
+        if active and self.greeter is None and active[0] != self.greeter_session:
+            user = sddm_last("User") or default_user()
+            self.greeter_session = active[0]
+            if not valid_user(user):
+                return
+            log(f"wake: login screen up: face unlock for {user} without Enter{' (dry run)' if self.dry else ''}")
+            if not self.dry:
+                self.greeter = subprocess.Popen(self.greeter_cmd + [user], stdin=subprocess.DEVNULL,
+                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                preexec_fn=lambda: set_pdeathsig(signal.SIGTERM))
+                from gi.repository import GLib
+                GLib.timeout_add(2000, self.greeter_poll)
+        elif not active:
+            self.greeter_session = None
+            self.stop_greeter()
+
+    def greeter_poll(self):
+        if self.greeter is None:
+            return False
+        if self.greeter.poll() is not None:
+            self.greeter = None
+            return False
+        return True
+
+    def stop_greeter(self):
+        g, self.greeter = self.greeter, None
+        if g is None or g.poll() is not None:
+            return
+        log("wake: login screen gone: its face unlock stops")
+        g.terminate()
+        try:
+            g.wait(3)
+        except subprocess.TimeoutExpired:
+            kill_tree(g)
+
+
+def default_user():
+    for d in ("/etc/sddm.conf.d", "/usr/lib/sddm/sddm.conf.d"):
+        try:
+            for f in sorted(os.listdir(d), reverse=True):
+                for line in open(os.path.join(d, f), errors="replace"):
+                    if line.startswith("User=") and line.strip()[5:]:
+                        return line.strip()[5:]
+        except OSError:
+            continue
+    return "steamos"
+
+
+def cmd_wake(dry_run=False, simulate_resume=False):
+    import dbus
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    w = Waker(bus, dry_run)
+    bus.add_signal_receiver(w.on_sleep, "PrepareForSleep", MANAGER, LOGIN1, LOGIN1_PATH)
+    bus.add_signal_receiver(w.on_props, "PropertiesChanged", PROPS, LOGIN1, path_keyword="path")
+    bus.add_signal_receiver(w.on_sessions, "SessionNew", MANAGER, LOGIN1, LOGIN1_PATH)
+    bus.add_signal_receiver(w.on_sessions, "SessionRemoved", MANAGER, LOGIN1, LOGIN1_PATH)
+    for path, s in w.sessions():
+        if s["LockedHint"]:
+            w.locked_since[path] = w.started
+    w.check_greeter()
+    if simulate_resume:
+        w.on_sleep(False)
+    loop = GLib.MainLoop()
+
+    def stop():
+        w.stop_greeter()
+        loop.quit()
+        return False
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, stop)
+    loop.run()
 
 
 def cmd_state(user):
@@ -972,7 +1367,9 @@ def main():
     elif cmd == "wake":
         if os.getuid() != 0:
             sys.exit("s15-face-run wake: run as root")
-        cmd_wake(dry_run="--dry-run" in sys.argv)
+        cmd_wake(dry_run="--dry-run" in sys.argv, simulate_resume="--simulate-resume" in sys.argv)
+    elif cmd == "greeter" and len(sys.argv) > 2:
+        cmd_greeter(sys.argv[2])
     elif cmd == "lockout":
         sys.exit(cmd_lockout(sys.argv[2:]))
     elif cmd == "state":

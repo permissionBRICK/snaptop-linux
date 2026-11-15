@@ -453,6 +453,214 @@ sleep 300
            "lockout: reading a missing count creates nothing")
 
 
+def check_token():
+    d = tempfile.mkdtemp(dir=T)
+    m.make_token(USER, d)
+    st = os.stat(f"{d}/{m.TOKEN}")
+    expect(st.st_uid == 0 and st.st_mode & 0o777 == 0o600, "token: root's, 0600")
+    expect(m.take_token(USER, d) and not os.path.exists(f"{d}/{m.TOKEN}"), "token: taken once")
+    expect(not m.take_token(USER, d), "token: single use")
+    m.make_token(USER, d)
+    expect(not m.take_token("nobody", d) and not os.path.exists(f"{d}/{m.TOKEN}"),
+           "token: another user's -> refused and used up")
+    m.make_token(USER, d)
+    expect(not m.take_token(USER, d, life_ms=-1), "token: too old -> refused")
+    m.make_token(USER, d)
+    os.chmod(f"{d}/{m.TOKEN}", 0o644)
+    expect(not m.take_token(USER, d), "token: readable by others -> refused")
+    os.symlink(f"{T}/elsewhere", f"{d}/{m.TOKEN}")
+    expect(not m.take_token(USER, d), "token: a link -> refused")
+    open(f"{d}/{m.TOKEN}", "w").write(f"uid=0\nat={m.boottime_ms()}\n")
+    os.chown(f"{d}/{m.TOKEN}", 65534, 65534)
+    os.chmod(f"{d}/{m.TOKEN}", 0o600)
+    expect(not m.take_token(USER, d), "token: not root's -> refused")
+
+
+def qread(b, i):
+    n = struct.unpack(">I", b[i:i + 4])[0]
+    if n == 0xFFFFFFFF:
+        return None, i + 4
+    return b[i + 4:i + 4 + n].decode("utf-16-be"), i + 4 + n
+
+
+class FakeSddm(threading.Thread):
+    """SDDM's greeter socket: reads one Login (QDataStream, as SocketServer::readyRead) and answers."""
+    def __init__(self, path, answers):
+        import socket
+        super().__init__(daemon=True)
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(path)
+        self.srv.listen(1)
+        self.answers, self.got = answers, None
+
+    def run(self):
+        c, _ = self.srv.accept()
+        data = b""
+        while True:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            try:
+                msg = struct.unpack(">I", data[:4])[0]
+                user, i = qread(data, 4)
+                password, i = qread(data, i)
+                kind = struct.unpack(">I", data[i:i + 4])[0]
+                session, i = qread(data, i + 4)
+                if i == len(data):
+                    break
+            except (struct.error, UnicodeDecodeError):
+                continue
+        self.got = (msg, user, password, kind, session)
+        c.sendall(self.answers)
+        time.sleep(0.2)
+        c.close()
+
+
+def check_sddm():
+    d = tempfile.mkdtemp(dir=T)
+    sess = "/usr/share/wayland-sessions/plasma.desktop"
+    info = struct.pack(">I", 4) + m.qstring("Authentication information")
+    fake = FakeSddm(f"{d}/s", info + struct.pack(">I", 2))
+    fake.start()
+    ok = m.sddm_login(USER, sess, f"{d}/s", timeout=5)
+    fake.join(5)
+    expect(fake.got == (1, USER, "", 2, sess), f"SDDM: Login(user, empty password, Wayland session) ({fake.got})")
+    expect(ok, "SDDM: LoginSucceeded after an InformationMessage -> True")
+    fake = FakeSddm(f"{d}/f", struct.pack(">I", 3))
+    fake.start()
+    expect(not m.sddm_login(USER, "/usr/share/xsessions/plasma.desktop", f"{d}/f", timeout=5),
+           "SDDM: LoginFailed -> False")
+    fake.join(5)
+    expect(fake.got[3] == 1, "SDDM: an X11 session is type 1")
+    fake = FakeSddm(f"{d}/c", b"")
+    fake.start()
+    expect(not m.sddm_login(USER, sess, f"{d}/c", timeout=5), "SDDM: no answer (closed) -> False")
+    expect(not m.sddm_login(USER, sess, f"{d}/none", timeout=1), "SDDM: no socket -> False")
+    lines = ["0000000000000000: 00000002 00000000 00010000 0001 01 58406 /tmp/sddm-auth-1a1c3451-5238",
+             "0000000000000000: 00000002 00000000 00010000 0001 01 58500 /tmp/sddm--gyeEMW",
+             "0000000000000000: 00000003 00000000 00000000 0001 03 58501 /tmp/sddm--gyeEMW",
+             "0000000000000000: 00000002 00000000 00010000 0001 01 58432 /tmp/.XBnoku/s"]
+    expect(m.greeter_socket_path({"58406", "58500", "58432"}, lines) == "/tmp/sddm--gyeEMW",
+           "SDDM: the greeter socket, not sddm-auth-* or others")
+    expect(m.greeter_socket_path({"58501"}, lines) is None, "SDDM: a connected (not listening) socket is not it")
+    st = f"{d}/state.conf"
+    open(st, "w").write("[Last]\n# Name of the last logged-in user.\nUser=steamos\n\n"
+                        "Session=/usr/share/wayland-sessions/plasma.desktop \n")
+    expect(m.sddm_last("User", st) == "steamos" and m.sddm_last("Session", st) == sess,
+           "SDDM: last user and session from state.conf (trailing space)")
+
+
+def check_wake():
+    immediate = ["/usr/lib/kscreenlocker_greet", "--immediateLock", "--graceTime", "5000", "--ksldfd", "174"]
+    idle = ["/usr/lib/kscreenlocker_greet", "--graceTime", "5000", "--ksldfd", "174"]
+    expect(m.tap_reason(None, 99, False, None) == "no lock screen", "wake: no lock screen -> no tap")
+    expect(m.tap_reason(immediate, 99, True, None) == "face unlock runs already", "wake: a watch runs -> no tap")
+    expect(m.tap_reason(idle + ["--nolock"], 99, False, None) == "the lock needs no password",
+           "wake: --nolock -> never")
+    expect(m.tap_reason(idle, 7.9, False, None) == "grace time" and m.tap_reason(idle, 8.1, False, None) is None,
+           "wake: idle lock with 5 s grace -> only 8 s after it locked")
+    expect(m.tap_reason(immediate, 0.5, False, None) == "grace time" and
+           m.tap_reason(immediate, 1.5, False, None) is None, "wake: immediate lock -> after 1 s")
+    expect(m.tap_reason(immediate, 9, False, (False, "wait 60 s")).startswith("face refused"),
+           "wake: face refused -> no tap")
+
+    # Waker on a fake logind: a tap only after PrepareForSleep(false), never on a lock alone
+    import types
+    fake = types.ModuleType("dbus")
+
+    class DBusException(Exception):
+        pass
+    sessions = {"/s2": {"Name": "root", "User": (0, "/u"), "Class": "user", "Type": "wayland", "Active": True,
+                        "Remote": False, "LockedHint": True, "Seat": ("seat0", "/seat")}}
+
+    class Iface:
+        def __init__(self, obj, iface):
+            self.obj = obj
+
+        def ListSessions(self):
+            return [("2", 0, "root", "seat0", p) for p in sessions]
+
+        def GetAll(self, iface):
+            return sessions[self.obj]
+
+    class Bus:
+        def get_object(self, name, path, introspect=True):
+            assert not introspect, "proxies without introspection"
+            return path
+    fake.Interface, fake.DBusException = Iface, DBusException
+    real = sys.modules.get("dbus")
+    sys.modules["dbus"] = fake
+    taps = []
+    saved = {k: getattr(m, k) for k in ("display_on", "lid_closed", "greeter_args", "watch_alive", "refusal",
+                                         "tap_f24", "lockout_conf")}
+    try:
+        m.display_on, m.lid_closed = lambda: True, lambda: False
+        m.greeter_args = lambda uid: immediate
+        m.watch_alive = lambda rt, mode="watch": False
+        m.refusal = lambda *a: None
+        m.tap_f24 = lambda: taps.append(time.monotonic())
+        m.lockout_conf = lambda: conf()
+        w = m.Waker(Bus())
+        w.tick_start = lambda: None
+        w.locked_since["/s2"] = time.monotonic() - 30
+        w.on_props(m.SESSION, {"LockedHint": True}, [], path="/s2")
+        expect(not w.tick() and taps == [], "wake: locked, no wake from sleep -> no tap (Meta+L, idle lock)")
+        w.on_sleep(True)
+        expect(not w.tick() and taps == [], "wake: going to sleep -> no tap")
+        w.on_sleep(False)
+        expect(w.tick() and len(taps) == 1, "wake: the lock screen after a wake -> one tap")
+        expect(w.tick() and len(taps) == 1, "wake: not again within 5 s")
+        m.watch_alive = lambda rt, mode="watch": True
+        w.last_tap = 0
+        w.tick()
+        expect(len(taps) == 1 and not w.tick(), "wake: the watch started -> done, no more taps")
+        w.on_sleep(False)
+        m.watch_alive = lambda rt, mode="watch": False
+        m.display_on = lambda: False
+        expect(w.tick() and len(taps) == 1, "wake: display still off after the wake -> waits")
+        m.display_on = lambda: True
+        w.resume_until = time.monotonic() - 1
+        expect(not w.tick() and len(taps) == 1, "wake: the window after the wake is over -> no tap")
+        # the login screen: a greeter session starts and stops its background scan (dry run: logged only)
+        sessions["/g1"] = {"Name": "sddm", "User": (964, "/u"), "Class": "greeter", "Type": "wayland",
+                           "Active": True, "Remote": False, "LockedHint": False, "Seat": ("seat0", "/seat")}
+        w.dry = True
+        w.check_greeter()
+        expect(w.greeter_session == "/g1", "wake: a greeter session on seat0 -> its scan (dry run)")
+        sessions["/g1"]["Active"] = False
+        w.check_greeter()
+        expect(w.greeter_session is None, "wake: the greeter went away -> its scan stops")
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
+        if real is not None:
+            sys.modules["dbus"] = real
+        else:
+            sys.modules.pop("dbus", None)
+
+
+def check_greeter_loop():
+    """The login screen's loop: a match whose Login is not sent (a login is being checked) waits for the next
+    trigger; a match that SDDM takes ends it."""
+    rig, st, rt = Rig(), state(), runtime()
+    rig.codes("0 0.05", "0 0.05")
+    calls = []
+
+    def on_match():
+        calls.append(1)
+        return len(calls) > 1
+    out = {}
+    th = threading.Thread(target=lambda: out.setdefault("rc", m.watch_loop(rig.runner(st, conf()), rt, on_match)),
+                          daemon=True)
+    th.start()
+    time.sleep(1.5)
+    expect(th.is_alive() and calls == [1], "greeter: first match not taken -> waits")
+    rt.update(lambda d: d.__setitem__("rescan", d.get("rescan", 0) + 1))
+    th.join(5)
+    expect(out.get("rc") == 0 and calls == [1, 1], "greeter: Enter -> a new run, match taken -> ends (0)")
+
+
 def check_sleep():
     s = m.Sleep()
     expect(not s.slept(), "sleep: no suspend in between")
@@ -472,6 +680,10 @@ check_watch()
 check_grace()
 check_sleep()
 check_kill_tree()
+check_token()
+check_sddm()
+check_wake()
+check_greeter_loop()
 import shutil
 shutil.rmtree(T, ignore_errors=True)
 print("ALL PASS" if failures == 0 else f"{failures} FAILED")
