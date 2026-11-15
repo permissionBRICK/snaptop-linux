@@ -239,9 +239,10 @@ streams at a time, and the camera light is on while either does.
 - The app's menu entry starts it with `WEBKIT_DISABLE_DMABUF_RENDERER=1`: WebKitGTK's DMA-BUF renderer ends it at
   once on this GPU under Wayland ("Error 71 (Protocol error) dispatching to Wayland display"). From a terminal:
   `WEBKIT_DISABLE_DMABUF_RENDERER=1 biopass`.
-- polkit re-reads its actions when the app's policy file comes or goes. After one install it was left with none,
-  and Plasma hid shutdown and sleep and ignored the lid; `install-face.sh` checks for that afterwards and restarts
-  polkit and Plasma's polkit agent and power management if needed.
+- polkit re-reads all its actions as soon as a policy file appears. When the install unpacked the app's policy file
+  with everything else, polkit read it half-written and was left with no actions at all, every time: Plasma then
+  hid shutdown and sleep and ignored the lid. `install-face.sh` now puts that file last, complete, with a rename,
+  and still checks afterwards (restarting polkit and Plasma's polkit agent and power management if needed).
 
 Your data stays with your user: settings in `~/.config/com.ticklab.biopass/config.yaml`, enrolled faces (cropped
 images: `faces/`, `faces-ir/`, `faces-rgb/`) and models in `~/.local/share/com.ticklab.biopass/`, on the encrypted

@@ -87,7 +87,12 @@ put() {
   zstd -dc "$pkg" | tar -xf - -C "$s/root"
   remove_files "$R"
   (cd "$s/root" && find . \( -type f -o -type l \) | sed 's#^\.##') > "$s/files"
-  tar -C "$s/root" --owner=0 --group=0 -cf - usr | tar -C "$R/" -xpf - --no-overwrite-dir
+  # polkit re-reads all its actions as soon as a .policy file appears; reading one that tar was still writing left it
+  # with none (every time). The policy file therefore comes last and complete, renamed into place.
+  local pol=usr/share/polkit-1/actions/com.ticklab.biopass.policy
+  tar -C "$s/root" --owner=0 --group=0 --exclude="$pol" -cf - usr | tar -C "$R/" -xpf - --no-overwrite-dir
+  install -m0644 "$s/root/$pol" "$R/${pol%/*}/.${pol##*/}.new"
+  mv -f "$R/${pol%/*}/.${pol##*/}.new" "$R/$pol"
   # A build from the cache links the libraries of the version it was built for; one this version lacks: build again.
   local missing
   missing=$(chroot "${R:-/}" /bin/sh -c 'for f in /usr/bin/biopass /usr/bin/biopass-helper /usr/lib/security/libbiopass_pam.so \
@@ -119,9 +124,9 @@ pacman_deps() {  # $1: root ("" = running system)
   [ $ok = 1 ] || die "pacman -S $DEPS in $R failed"
 }
 
-# polkit re-reads its actions when /usr/share/polkit-1/actions changes. After one install it was left with none:
-# Plasma then hid shutdown and sleep and ignored the lid and the power button. If that happened, restart it and the
-# Plasma parts that asked it.
+# polkit re-reads its actions when /usr/share/polkit-1/actions changes. When it read the policy file half-written
+# (put() now avoids that), it was left with none: Plasma then hid shutdown and sleep and ignored the lid and the
+# power button. If that happens anyway, restart it and the Plasma parts that asked it.
 polkit_check() {
   local n u
   n=$(pkaction 2>/dev/null | wc -l)
