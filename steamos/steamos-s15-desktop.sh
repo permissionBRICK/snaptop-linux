@@ -114,9 +114,12 @@ fi
 # runs "-steamdeck -steamos3" (steamdeck_stable). Every mode switch then changed the client branch and Steam
 # downloaded the other build first (a minute of black screen). Start the desktop client as a Deck client too,
 # like SteamOS on a Steam Deck: user-level overrides of the autostart and menu entries.
+# Not started with the desktop (Hidden=true; the user entry hides the system one too): idle in the background the client
+# and its web helper woke the CPU about 100 times a second (docs/power.md). The menu entry starts it; Steam's own
+# setting "Run Steam when my computer starts" rewrites this file if it is turned on there.
 H="$R/home/steamos"; install -d "$H/.config/autostart" "$H/.local/share/applications"
 sed 's#^Exec=/usr/bin/steam -silent -vrdisable -deckard %U#Exec=/usr/bin/steam -silent -vrdisable -steamdeck -steamos3 %U#' \
-  "$R/etc/xdg/autostart/steam.desktop" > "$H/.config/autostart/steam.desktop"
+  "$R/etc/xdg/autostart/steam.desktop" | sed '/^Hidden=/d; /^\[Desktop Entry\]$/a Hidden=true' > "$H/.config/autostart/steam.desktop"
 awk 'BEGIN{d=0} /^Exec=\/usr\/bin\/steam %U$/ && !d {print "Exec=/usr/bin/steam -steamdeck -steamos3 %U"; d=1; next} {print}' \
   "$R/usr/share/applications/steam.desktop" > "$H/.local/share/applications/steam.desktop"
 chown -R 1000:1000 "$H/.config" "$H/.local/share/applications" 2>/dev/null || true

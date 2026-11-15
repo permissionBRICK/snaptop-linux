@@ -167,6 +167,10 @@ on the laptop just bounced back to Game Mode, and later showed a black screen wi
   client) did nothing when started (Qt aborts: "no Qt platform plugin could be initialized"); with the fallback
   they run on Xwayland.
 - A "Return to Gaming Mode" desktop icon (the image has none).
+- **The Steam client does not start with the desktop** (`Hidden=true` in the user autostart entry, which also hides
+  Valve's): idle in the background, the client and its web helper woke the CPU about 100 times a second. Start it
+  from the menu; Game Mode starts it as always. Turning on "Run Steam when my computer starts" in Steam's settings
+  brings the autostart back (Steam rewrites the entry).
 - **60 Hz on battery, 120 Hz on AC**, like Windows (user service `s15-refresh-on-battery`, about 0.7 W less at idle):
   it follows UPower's power-supply events, so it switches as soon as the charger is plugged in or out, and right
   after a resume if that happened during sleep. A rate set by hand in the display settings stays until the next
