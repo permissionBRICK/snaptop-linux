@@ -4,6 +4,8 @@
 #                                resume=/resume_offset= in every boot entry of this install, initramfs, TPM re-seal
 #   hibernate.sh status
 #   hibernate.sh disable         resume options out of the boot entries (TPM re-seal), swap file removed
+#   hibernate.sh after SECONDS   hibernate after that long in standby on battery (s15-ec-darkwake); 0: never.
+#                                Default after enable: 18000 (5 h, as Windows on this laptop)
 # The hooks (s15-hibernate, s15-hibernate-initrd, initcpio hook s15-hibernate, s15-hibernate-swap.service) come with
 # steamos-s15-setup.sh and do nothing until this script wrote /etc/s15-hibernate.conf.
 set -euo pipefail
@@ -57,7 +59,9 @@ case ${1:-status} in
     esac
     TD=$(findmnt -no SOURCE "$TOP" | sed 's/\[.*//')
     [ "$(stat -L -c %t:%T "$DEV")" = "$(stat -L -c %t:%T "$TD")" ] || die "root=$R is not $TD, the swap file's device"
-    printf 'RESUME_DEV=%s\nRESUME_OFFSET=%s\nSWAPFILE=%s\n' "$DEV" "$OFF" "$SWAPFILE" > $C
+    HA=; [ -r $C ] && HA=$(sed -n 's/^HIBERNATE_AFTER=//p' $C | tail -1)   # keep a value set before
+    printf 'RESUME_DEV=%s\nRESUME_OFFSET=%s\nSWAPFILE=%s\nHIBERNATE_AFTER=%s\n' "$DEV" "$OFF" "$SWAPFILE" \
+      "${HA:-18000}" > $C
     for f in $(entries "$R"); do
       set_resume "$f" "resume=$R resume_offset=$OFF"
       echo "boot entry $(basename "$f"): resume=$R resume_offset=$OFF"
@@ -75,7 +79,10 @@ case ${1:-status} in
     /usr/local/sbin/s15-update-esp "$KV"   # copies it to S15BOOT and re-seals the TPM unlock for the new entries
     echo "hibernation enabled: systemctl hibernate" ;;
   status)
-    if [ -r $C ]; then . $C; echo "config: resume from $RESUME_DEV page $RESUME_OFFSET ($SWAPFILE)"; else echo "not enabled"; fi
+    if [ -r $C ]; then . $C; echo "config: resume from $RESUME_DEV page $RESUME_OFFSET ($SWAPFILE)"
+      echo "hibernate after ${HIBERNATE_AFTER:-0} s of standby on battery (0: never); wake alarm:" \
+        "$(ls /sys/class/rtc/rtc*/wakealarm 2>/dev/null | head -1 || true)"
+    else echo "not enabled"; fi
     swapon --show
     [ -f "$SWAPFILE" ] && echo "swap file offset now: page $(btrfs inspect-internal map-swapfile -r "$SWAPFILE")"
     echo "this boot: $(grep -o 'resume[^ ]*' /proc/cmdline | tr '\n' ' ')(kernel: $(cat /sys/power/resume) page $(cat /sys/power/resume_offset))"
@@ -86,6 +93,11 @@ case ${1:-status} in
       echo "initramfs: no s15-hibernate hook"
     echo "hibernate-prepare.service: $(systemctl is-enabled hibernate-prepare.service 2>/dev/null || true)"
     echo "logind CanHibernate: $(busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager CanHibernate 2>/dev/null)" ;;
+  after)
+    [ -r $C ] || die "not enabled"
+    [[ ${2:-} =~ ^[0-9]+$ ]] || die "usage: hibernate.sh after SECONDS (0: never)"
+    sed -i '/^HIBERNATE_AFTER=/d' $C && echo "HIBERNATE_AFTER=$2" >> $C
+    echo "hibernate after $2 s of standby on battery" ;;
   disable)
     esp_mount
     R=$(root_arg)

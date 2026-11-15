@@ -122,13 +122,16 @@ only the user or the battery wakes the machine.
 | ath12k (driver) | shuts the Wi-Fi half of the WCN7850 down on suspend and reloads its firmware on resume |
 | `s15-sleep-radios` (sleep hook) | Bluetooth off during suspend (`/etc/s15-sleep-keep-bt` keeps it on) |
 | `92-s15-wakeup.rules` | no wakeup from battery/charger reports, Wi-Fi (MHI, its PCIe root port) or the compute DSP |
-| `s15-ec-darkwake` (sleep hook) | a wake without a wakeup IRQ (the EC, roughly hourly) goes back to sleep after 2 s; with the lid open only if no key or button is pressed within 3 s (`s15-input-wait`) and the lid was not opened; at or below 5 % battery it powers off instead; a failed suspend is not retried |
+| `s15-ec-darkwake` (sleep hook) | a wake without a wakeup IRQ (the battery management at every 1 % step on battery, every 3-4 h) goes back to sleep after 2 s; with the lid open only if no key or button is pressed within 3 s (`s15-input-wait`) and the lid was not opened; at or below 5 % battery it powers off instead (hibernates with [hibernate after hours](#hibernate-after-hours)); a failed suspend is not retried |
 | `s15-lid-watchdog` (timer) | awake with the lid closed and no external display for two minutes: suspend, whatever an application requested (`/run/s15-keepawake` disables it) |
 | `s15-lid-wake` (sleep hook) | no lid wakeup when suspended with the lid open (the EC pulses the lid GPIO) |
 
 Still able to wake the machine: lid, keyboard, touchpad, power key, USB devices, the EC, the ADSP (battery
-management) and the thermal sensors. The RTC cannot (the firmware owns its alarm), so there are no timed wakes and
-no suspend-then-hibernate. Hibernation is experimental and off by default ([below](#hibernation)).
+management) and the thermal sensors. The RTC cannot (the ADSP owns its alarm, see
+[hibernate after hours](#hibernate-after-hours)), so there are no timed wakes and no suspend-then-hibernate.
+Hibernation is experimental and off by default ([below](#hibernation)).
+Note: the sleep mode `deep` is PSCI SYSTEM_SUSPEND, not s2idle: any interrupt that wakes the SoC resumes the whole
+system, also one from a source without wakeup flag (the ADSP's glink messages), which is what a dark wake is.
 
 ## Standby: CX collapse (2026-11-01)
 
@@ -216,10 +219,43 @@ CPU (freezes, hard lockups). Two other approaches made the machine reset silentl
 before the image was written: unbinding the USB controllers before hibernating, and PHY driver patches that
 release the PHYs before the snapshot. `echo platform > /sys/power/pm_test` reproduces such resets without writing an
 image (the `devices` level stops before the late/noirq phase).
-Test aids: `/run/s15-hibernate-signal` (Caps Lock blinks when the restored system runs), `/run/s15-hibernate-entry`
-(one-shot entry for the resume, e.g. one without `quiet`), `s15.hibernate_report=1` on that entry (the boot kernel
-writes its log to `S15BOOT/s15-hibernate-resume.log` before the image load). `clk_ignore_unused` on the resume entry
-crashed the restore.
+Test aids: `/run/s15-hibernate-entry` (one-shot entry for the resume, e.g. one without `quiet`),
+`s15.hibernate_report=1` on that entry (the boot kernel writes its log to `S15BOOT/s15-hibernate-resume.log` before
+the image load), `echo platform > /sys/power/pm_test` (see above). `clk_ignore_unused` on the resume entry crashed the
+restore.
+
+### Hibernate after hours
+
+Windows on this laptop hibernates after some hours of standby. `hibernate.sh enable` sets `HIBERNATE_AFTER=18000`
+(5 h) in `/etc/s15-hibernate.conf`; `hibernate.sh after SECONDS` changes it, 0 turns it off. `s15-ec-darkwake`
+then hibernates instead of suspending again at a dark wake on battery once the standby has lasted that long, and at
+low battery. The standby starts at the first suspend after a real wake (`/run/s15-standby.since`); a wake with a
+wakeup IRQ, a key press or the opened lid after a dark wake, and a resume from hibernation end it.
+
+There is no timer that wakes the machine at the right time, so the check runs at the next dark wake: on battery the
+machine wakes at every 1 % step of the gauge (battery management, no wakeup IRQ; 10 500-13 800 s apart at
+0.15-0.19 W, always a multiple of 300 s plus a few seconds), so a 5 h setting hibernates after 5-9 h. On AC there are
+no such wakes and no hibernation; unplugging the charger wakes the machine (check that in the test).
+
+Why there is no wake timer (2026-11-14):
+- The PMIC RTC alarm (PMK8550 `0x6200`) belongs to the ADSP: the SPMI arbiter gives it the write and interrupt
+  permission, so `rtc-pm8xxx` runs with `qcom,no-alarm` (upstream commit 015b70bd6c75). Dropping the property gives
+  `-EPERM` on the alarm interrupt (reported on another X1 laptop); it cannot work and would fight the firmware.
+- Windows does not use it either: ASUS's PMIC Apps driver ships with `RtcAlarm\RtcAlarmSupport = 0`. Its wake
+  timer is the ACPI Time and Alarm Device `\_SB.PRTC` (ACPI000E, `_GCP` 0x1F7: AC and DC timers, also from S4/S5),
+  which the PMIC Apps driver passes to the ADSP over pmic_glink: owner 0x8010, opcodes 0x60-0x65 for
+  `_GWS`/`_CWS`/`_STP`/`_STV`/`_TIP`/`_TIV`, u32 timer id (0 AC, 1 DC) and value (seconds), u32 result. The ADSP's
+  battery manager (`BattMngrTech_TAD`) programs the alarm.
+- Linux can send the same requests (prototype driver `rtc-qcom-tad`, not part of the build), and the ADSP accepts
+  them (result 0, timers read back). But ASUS's ADSP firmware (ADSP.HT.5.9-00806, January 2025) does not wake Linux
+  when the timer expires (tested 2026-11-15: 30 s and 120 s alarms in standby, the machine woke only at the next
+  charger update ~61 s later; awake, no message arrives on expiry). Qualcomm added an "alarm expired" glink message
+  to the ADSP firmware only in 2026 (linux-firmware, `qcom/x1e80100/adsp.mbn`, for their reference boards; retail
+  laptops need the vendor-signed firmware), with a driver `rtc-qcom-glink` under review. If an `rtc*/wakealarm`
+  exists, `s15-ec-darkwake` sets it to the end of the standby period at every suspend.
+- No alternative: the Hamoa EC protocol has no timer command; the RPMh/PDC wake timer is not used on X1E
+  (`CONTROL_TCS` 0) and PSCI SYSTEM_SUSPEND leaves the system sleep to the firmware; the APSS watchdog would reset
+  the machine if its bark could not wake it.
 
 ## Idle on the new kernel (2026-11-01, keyboard backlight off, Wi-Fi on)
 

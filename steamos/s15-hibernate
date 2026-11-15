@@ -75,6 +75,9 @@ case "$1" in
     else log "WARNING: systemd-boot one-shot entry not set (selected '$sel')"; fi
     used=$(awk '/^MemTotal:/ {t = $2} /^MemAvailable:/ {a = $2} END {print (t - a + 262144) * 1024}' /proc/meminfo)
     echo "$used" > /sys/power/image_size
+    # A wake alarm left armed (s15-ec-darkwake arms the ADSP's timers) could start the machine from the power-off;
+    # the ADSP owns the alarm, so disarm it while the ADSP still runs.
+    for w in /sys/class/rtc/rtc*/wakealarm; do [ -w "$w" ] && echo 0 > "$w"; done
     # stop the DSPs once s15-sleep-hook has read the battery (it writes its state file first)
     for _ in $(seq 50); do
         [ "$(stat -c %Y /run/s15-sleep.state 2>/dev/null || echo 0)" -ge $((t0 - 1)) ] && break
@@ -99,12 +102,6 @@ case "$1" in
   post)
     [ -e $R.swapoff ] && { swapon "$SWAPFILE"; rm -f $R.swapoff; exit 0; }
     log "restored, hooks running at $(date +%T.%N | cut -c1-12)"
-    # Timing tests: with /run/s15-hibernate-signal (made before hibernating) Caps Lock blinks for 6 s at this point.
-    [ -e /run/s15-hibernate-signal ] && systemd-run --quiet --collect --no-block /bin/sh -c '
-        leds() { for l in /sys/class/leds/*::capslock; do echo "$2" > "$l/$1"; done; }
-        leds trigger none
-        for i in 1 2 3 4 5 6 7 8 9 10; do leds brightness 1; sleep 0.3; leds brightness 0; sleep 0.3; done
-        leds trigger kbd-capslock'
     efivars
     how="restored after a power-off (BootNext used)"
     bn=$(efibootmgr 2>/dev/null | sed -n 's/^BootNext: //p')

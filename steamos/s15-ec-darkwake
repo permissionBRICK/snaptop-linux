@@ -13,41 +13,75 @@
 # A failed suspend is not retried. Loop guard: three dark wakes within two minutes stretch the delay to 60 s.
 # (Both for the loop seen on 2026-11-01: the USB-C xHCI had died, every suspend failed at once, the hook suspended
 # again every few seconds and the screen flickered on and off.)
-# Low battery: a dark wake on battery at or below 5 % shuts the machine down cleanly instead (there is no
-# hibernation; the EC wakes the machine roughly hourly, so the check runs often enough at ~0.15 W standby).
-# Only suspends: a resume from hibernation (s15-hibernate) has no wakeup IRQ either, but it is not a dark wake.
-[ "${2:-suspend}" = suspend ] || exit 0
+# Low battery: a dark wake on battery at or below 5 % shuts the machine down cleanly instead (the battery management
+# wakes the machine at every 1 % step on battery, every 3-4 h at ~0.15-0.19 W standby, so the check runs often enough).
+# Hibernate after N hours (docs/power.md#hibernate-after-hours), as Windows does: with hibernation enabled and
+# HIBERNATE_AFTER (seconds, hibernate.sh after) above 0 in /etc/s15-hibernate.conf, a dark wake on battery at least
+# that long after the standby began hibernates instead of suspending, and so does a dark wake at low battery. The
+# standby begins at the first suspend after a real wake (/run/s15-standby.since). The 1 % wakes make that 5-9 h for
+# 5 h; if an RTC can wake the machine (wakealarm, e.g. rtc-qcom-tad), every suspend also sets the alarm to the end of
+# the period, and that wake is a dark wake like the others.
+# Only suspends: a resume from hibernation (s15-hibernate) has no wakeup IRQ either, but it is not a dark wake; it
+# ends the standby.
+SINCE=/run/s15-standby.since; HC=/etc/s15-hibernate.conf
+if [ "${2:-suspend}" != suspend ]; then
+  [ "$1" = post ] && [ "$2" = hibernate ] && rm -f $SINCE
+  exit 0
+fi
 B=/sys/class/power_supply/qcom-battmgr-bat; LOW=${S15_DARKWAKE_LOW_PCT:-5}
 battery_low() { [ "$(cat $B/status)" = Discharging ] && [ $(( $(cat $B/energy_now) * 100 / $(cat $B/energy_full) )) -le "$LOW" ]; }
 lid() { busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager LidClosed 2>/dev/null; }
 L=/var/log/s15-sleep.log; H=/run/s15-darkwake.times; S=/run/s15-darkwake.lid; F=/run/s15-darkwake.fails
 fails() { cat /sys/power/suspend_stats/fail 2>/dev/null || echo 0; }
+hib_after() { local a=; [ -r $HC ] && a=$(sed -n 's/^HIBERNATE_AFTER=//p' $HC | tail -1); [[ $a =~ ^[0-9]+$ ]] && echo "$a" || echo 0; }
+in_standby() { local s; read -r s < $SINCE 2>/dev/null && echo $(( $(date +%s) - s )); }   # seconds, or nothing
+hibernate_due() { local a t; a=$(hib_after); t=$(in_standby); [ "$a" -gt 0 ] && [ -n "$t" ] && [ "$t" -ge "$a" ] &&
+  [ "$(cat $B/status)" = Discharging ]; }
+wakealarm() { ls /sys/class/rtc/rtc*/wakealarm 2>/dev/null | head -1; }
+# The wake alarm is only touched with HIBERNATE_AFTER set (otherwise it stays free for rtcwake and the like).
+arm_alarm() {   # wake at the end of the standby period; when it is over already, the 1 % wakes are enough
+  local w a t; w=$(wakealarm); a=$(hib_after); t=$(in_standby)
+  [ -n "$w" ] && [ "$a" -gt 0 ] || return 0
+  echo 0 > "$w"
+  if [ -n "$t" ] && [ "$t" -lt "$a" ]; then echo "+$(( a - t < 10 ? 10 : a - t ))" > "$w"; fi
+}
+standby_over() { local w; rm -f $SINCE; w=$(wakealarm); [ -n "$w" ] && [ "$(hib_after)" -gt 0 ] && echo 0 > "$w"; }
+sleep_again() {
+  if hibernate_due; then
+    echo "$(date -Is) dark wake: in standby for $(in_standby) s (HIBERNATE_AFTER $(hib_after)) -> hibernate" >> $L
+    systemctl hibernate || systemctl suspend
+  else systemctl suspend; fi
+}
+battery_low_action() {
+  if [ "$(hib_after)" -gt 0 ]; then
+    echo "$(date -Is) dark wake: battery at or below $LOW % -> hibernate" >> $L; systemctl hibernate || systemctl poweroff
+  else echo "$(date -Is) dark wake: battery at or below $LOW % -> power off" >> $L; systemctl poweroff; fi
+}
 # s15-sleep-radios keeps Bluetooth off after a dark wake; switch it back on whenever we stay awake.
 bt_restore() { [ -e /run/s15-sleep-radios.blocked ] && rfkill unblock bluetooth && rm -f /run/s15-sleep-radios.blocked; }
 case "$1" in
-  pre) fails > $F; exit 0 ;;
+  pre) fails > $F; [ -e $SINCE ] || date +%s > $SINCE; arm_alarm; exit 0 ;;
   post)
     # A suspend that failed (a driver refused, e.g. a dead xHCI returns -EINVAL) is not a wake: suspending
     # again would fail the same way, in a loop.
     if [ "$(fails)" != "$(cat $F 2>/dev/null)" ]; then
       echo "$(date -Is) suspend failed (device: $(cat /sys/power/suspend_stats/last_failed_dev 2>/dev/null)), not retrying" >> $L
-      bt_restore; exit 0
+      standby_over; bt_restore; exit 0
     fi ;;
   resuspend)   # run by the delayed unit
     read -r lid0 < $S 2>/dev/null
     if [ "$(lid)" = "b true" ]; then
-      if battery_low; then echo "$(date -Is) dark wake: battery at or below $LOW % -> power off" >> $L; systemctl poweroff
-      else systemctl suspend; fi
-    elif [ "$lid0" = "b true" ]; then echo "$(date -Is) dark wake: lid opened, staying awake" >> $L; bt_restore
-    elif /usr/local/bin/s15-input-wait 3; then echo "$(date -Is) dark wake: key pressed, staying awake" >> $L; bt_restore
-    elif battery_low; then echo "$(date -Is) dark wake: battery at or below $LOW % -> power off" >> $L; systemctl poweroff
-    else systemctl suspend; fi
+      if battery_low; then battery_low_action; else sleep_again; fi
+    elif [ "$lid0" = "b true" ]; then echo "$(date -Is) dark wake: lid opened, staying awake" >> $L; standby_over; bt_restore
+    elif /usr/local/bin/s15-input-wait 3; then echo "$(date -Is) dark wake: key pressed, staying awake" >> $L; standby_over; bt_restore
+    elif battery_low; then battery_low_action
+    else sleep_again; fi
     exit 0 ;;
   *) exit 0 ;;
 esac
 irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null)
-[ -n "$irq" ] && exit 0
-[ -e /run/s15-no-darkwake ] && { bt_restore; exit 0; }   # touch this to keep the machine awake for debugging
+[ -n "$irq" ] && { standby_over; exit 0; }
+[ -e /run/s15-no-darkwake ] && { standby_over; bt_restore; exit 0; }   # touch this to keep the machine awake for debugging
 now=$(date +%s); echo "$now" >> $H
 recent=$(awk -v t=$((now - 120)) '$1 >= t' $H | wc -l); tail -5 $H > $H.new && mv $H.new $H
 d=${S15_DARKWAKE_DELAY:-2}; [ "$recent" -ge 3 ] && d=60
