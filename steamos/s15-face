@@ -30,6 +30,9 @@
 #                                       the app lists the main camera's under Saved Faces. The app's own "add face"
 #                                       cannot pick the IR camera (it lists only /dev/video nodes, which both
 #                                       cameras share)
+#   s15-face antispoof on|off [user]    Biopass's AI anti-spoofing model on the colour picture (rgb and both; never
+#                                       in ir: it is trained on colour images). Use this, not the app's settings
+#                                       page: saving that page drops the settings above
 #   s15-face check                      (as yourself) one face scan as the lock screen runs it, showing each step
 #                                       (face size, match scores); counts as no scan for the gates
 #   s15-face snapshot ir|rgb [file]     one frame as Biopass sees it (default /tmp/s15-face-<camera>.png)
@@ -422,6 +425,33 @@ EOF
 
 # One face scan as the lock screen runs it (Biopass's helper with the user's settings), with its steps on the
 # terminal. Not counted by the gates; their own checks (login since boot, settings) are shown separately.
+antispoof() {
+  local on=${1:-} u=${2:-$(default_user)} home
+  case $on in on|off) ;; *) die "usage: s15-face antispoof on|off [user]" ;; esac
+  valid_user "$u" || die "bad user name"
+  home=$(getent passwd "$u" | cut -d: -f6)
+  [ -f "$home/$CONF" ] || die "no camera set yet: sudo s15-face camera both"
+  pgrep -u "$u" -x biopass >/dev/null && die "close the Biopass app first (it would write its own settings back)"
+  local run=()
+  [ "$(id -u)" = 0 ] && [ "$u" != root ] && run=(runuser -u "$u" --)
+  "${run[@]}" python3 -I - "$home/$CONF" "$on" <<'EOF' || die "configuration not changed"
+import os, sys, yaml
+path, on = sys.argv[1:]
+c = yaml.safe_load(open(path)) or {}
+face = (c.get("methods") or {}).get("face") or {}
+anti = face.setdefault("anti_spoofing", {})
+if on == "on" and face.get("camera") and face.get("camera") == anti.get("ir_camera"):
+    sys.exit("s15-face: not in ir mode: the model is trained on colour images (s15-face camera both or rgb first)")
+anti["enable"] = on == "on"
+model = anti.setdefault("model", {"model_id": "mobilenetv3-antispoof", "threshold": 0.8})
+tmp = path + ".s15-face"
+with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    yaml.safe_dump(c, f, sort_keys=False)
+os.replace(tmp, path)
+print(f"AI anti-spoofing {on} ({model.get('model_id')}, threshold {model.get('threshold')})")
+EOF
+}
+
 check() {
   local u out rc
   u=$(id -un)
@@ -465,8 +495,9 @@ case "${1:-}" in
   reset) reset "${2:-}" ;;
   camera) camera "${2:-}" "${3:-}" ;;
   enrol|enroll) enrol "${2:-}" ;;
+  antispoof) antispoof "${2:-}" "${3:-}" ;;
   check) check ;;
   snapshot) snapshot "${2:-}" "${3:-}" ;;
   cameras) cameras ;;
-  *) sed -n '2,36p' "$0"; exit 2 ;;
+  *) sed -n '2,39p' "$0"; exit 2 ;;
 esac
