@@ -240,9 +240,12 @@ pam_insert() {  # before|after|replace file ere line...
 face_pam_add() {  # $1: root, $2: yes = sudo and polkit too
   local R=$1 admin=$2 k src
   face_check_valve "$R" "$admin"
-  # login screen: before the password, on an empty field only; a successful login allows face until the next boot
-  pam_insert before "$R/etc/pam.d/sddm" '^auth[[:space:]]+include[[:space:]]+system-login$' \
-    "$FACE_EMPTY" "$FACE_PREAUTH" "$FACE_SCAN" "$FACE_DENY"
+  # login screen: on an empty field only, in front of the PIN line and the password. In front of the PIN, not after
+  # it: pam_setcred replays the auth chain, and modules that did not run in it (all after the PIN's "sufficient"
+  # success) decide by their setcred result; pam_exec's is PAM_IGNORE, so pam-empty's default=3 jump made the whole
+  # setcred PAM_IGNORE and SDDM refused every PIN login ("Session started false"). Here a PIN or password skips the
+  # face lines with the jump in auth, and setcred follows that path.
+  pam_insert before "$R/etc/pam.d/sddm" '^-?auth[[:space:]]' "$FACE_EMPTY" "$FACE_PREAUTH" "$FACE_SCAN" "$FACE_DENY"
   pam_insert after "$R/etc/pam.d/sddm" '^account[[:space:]]+include[[:space:]]+system-login$' "$FACE_ACCT"
   [ "$(grep -cxF -f <(face_lines) "$R/etc/pam.d/sddm")" = 5 ] || die "$R/etc/pam.d/sddm: face lines not added"
   # lock screen: kscreenlocker runs kde-fingerprint next to the password service (kde). Valve's file with our watch
@@ -260,8 +263,8 @@ face_pam_add() {  # $1: root, $2: yes = sudo and polkit too
   # a password unlock of the lock screen allows face scans again
   pam_insert after "$R/etc/pam.d/kde" '^auth[[:space:]]+include[[:space:]]+system-local-login$' "$FACE_OK"
   # Enter on the lock screen's empty field: a new face run, and a failure without a password check (it never counts
-  # towards pam_faillock); kscreenlocker sends every Enter to this service
-  pam_insert before "$R/etc/pam.d/kde" '^auth[[:space:]]' "$FACE_RESCAN" "$FACE_DENY"
+  # towards pam_faillock); kscreenlocker sends every Enter to this service. In front of the PIN line (see sddm).
+  pam_insert before "$R/etc/pam.d/kde" '^-?auth[[:space:]]' "$FACE_RESCAN" "$FACE_DENY"
   [ "$(grep -cxF -f <(face_lines) "$R/etc/pam.d/kde")" = 3 ] || die "$R/etc/pam.d/kde: face lines not added"
   [ "$admin" = yes ] || return 0
   # sudo and polkit dialogs (opt-in): face first, the password when it fails
