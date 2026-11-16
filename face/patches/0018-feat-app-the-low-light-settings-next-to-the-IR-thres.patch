@@ -1,0 +1,813 @@
+From a9ba6f1c60768a22760fce2f674fbfd161f5402f Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:50:33 +0000
+Subject: [PATCH] feat(app): the low-light settings next to the IR threshold,
+ and Test shows the light
+
+The settings know anti_spoofing.low_light_luma (default 70, 0 = off)
+and recognition.ir_low_light_threshold (default 0.7), with the helper's
+defaults in defaults.yaml; a config without them loads the defaults,
+and a save writes and keeps them (as every other value).
+
+The Thresholds block gets a second row: "Low light below" (the colour
+face's brightness, 0-255, a whole-number slider; 0: off) and "IR camera
+in low light" (its threshold; it shows when the IR camera's own,
+higher threshold applies instead, as the helper never goes below it),
+each marked as used or not in the mode (rgb: only with faces enrolled
+for the IR camera), with a short explanation and the values measured on
+the ASUS Vivobook S 15 (an evening room about 48, daylight 86). An
+effective low-light threshold below 0.6 warns as the others do.
+Threshold takes a max (above 1 it shows a whole number).
+
+Test reads the helper's light line ("Low light on the colour camera |
+face luma 48 < 70: the IR camera decides alone (threshold 0.70)",
+"Enough light ...") into its summary: the brightness against the limit
+and whether the IR camera decided alone, and at what threshold; the
+light lines and "Recognised on the IR camera alone" are in its steps.
+Tests: scan (light lines), config (load and save), faceMode.test.ts.
+---
+ app/src-tauri/src/config.rs                   |  48 +++++++
+ app/src-tauri/src/scan.rs                     | 133 +++++++++++++++++-
+ .../-components/face/TestScan.tsx             |  40 ++++--
+ .../-components/face/ThresholdsSection.tsx    |  62 +++++++-
+ .../-components/face/faceMode.test.ts         |  25 ++++
+ .../-components/face/faceMode.ts              |  18 +++
+ .../-components/methods/shared/Threshold.tsx  |  16 ++-
+ .../configuration/-components/validation.ts   |   5 +
+ app/src/bindings.ts                           |  66 +++++++++
+ app/src/lib/models.test.ts                    |   2 +
+ auth/test/config/defaults.yaml                |   2 +
+ 11 files changed, 402 insertions(+), 15 deletions(-)
+
+diff --git a/app/src-tauri/src/config.rs b/app/src-tauri/src/config.rs
+index 4f4a66e..b928e86 100644
+--- a/app/src-tauri/src/config.rs
++++ b/app/src-tauri/src/config.rs
+@@ -110,6 +110,10 @@ pub struct RecognitionConfig {
+     /// `anti_spoofing.ir_recognition`); None: `threshold`.
+     #[specta(type = Option<specta_typescript::Number>)]
+     pub ir_threshold: Option<f32>,
++    /// The IR camera's when it decides alone because the colour picture is
++    /// too dark (`anti_spoofing.low_light_luma`); never below its own.
++    #[specta(type = specta_typescript::Number)]
++    pub ir_low_light_threshold: f32,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Type)]
+@@ -140,6 +144,12 @@ pub struct AntiSpoofingConfig {
+     /// ... and their heights at most this ratio apart.
+     #[specta(type = specta_typescript::Number)]
+     pub pair_max_size_ratio: f32,
++    /// Low light: below this mean luma (0-255) of the colour picture's face
++    /// (or of the whole picture without a face) the IR camera decides alone,
++    /// without anti-spoofing and colour recognition (both cameras, or the
++    /// colour camera with faces enrolled for the IR camera). 0: off.
++    #[specta(type = specta_typescript::Number)]
++    pub low_light_luma: f32,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Type)]
+@@ -183,6 +193,7 @@ fn get_default_config() -> BiopassConfig {
+                     model_id: "edgeface-s-gamma-05".to_string(),
+                     threshold: 0.5,
+                     ir_threshold: None,
++                    ir_low_light_threshold: 0.7,
+                 },
+                 anti_spoofing: AntiSpoofingConfig {
+                     // Off: the bundled checkpoints reject real faces (#76). Keep in sync
+@@ -198,6 +209,7 @@ fn get_default_config() -> BiopassConfig {
+                     ir_recognition: false,
+                     pair_max_offset: 0.5,
+                     pair_max_size_ratio: 1.5,
++                    low_light_luma: 70.0,
+                 },
+             },
+             fingerprint: FingerprintMethodConfig {
+@@ -1042,6 +1054,42 @@ mod tests {
+         assert!(face.anti_spoofing.ir_recognition);
+     }
+ 
++    /// Low light: missing in an older config, the helper's defaults (70, 0.7);
++    /// a value of the user's (0: off) is read, and a save writes and keeps it.
++    #[test]
++    fn low_light_settings_load_and_save() {
++        let face = get_default_config().methods.face;
++        assert_eq!(face.anti_spoofing.low_light_luma, 70.0);
++        assert_eq!(face.recognition.ir_low_light_threshold, 0.7);
++        let missing = format!(
++            "schema_version: {CURRENT_SCHEMA_VERSION}\nmethods:\n  face:\n    recognition:\n      threshold: 0.6\n"
++        );
++        let face = parse_config(&missing).unwrap().methods.face;
++        assert_eq!(face.anti_spoofing.low_light_luma, 70.0);
++        assert_eq!(face.recognition.ir_low_light_threshold, 0.7);
++
++        let on_disk = format!(
++            "schema_version: {CURRENT_SCHEMA_VERSION}\nmethods:\n  face:\n    recognition:\n      ir_low_light_threshold: 0.75\n    anti_spoofing:\n      low_light_luma: 0\n"
++        );
++        let mut config = parse_config(&on_disk).unwrap();
++        assert_eq!(config.methods.face.anti_spoofing.low_light_luma, 0.0);
++        assert_eq!(config.methods.face.recognition.ir_low_light_threshold, 0.75);
++        config.methods.face.anti_spoofing.low_light_luma = 64.0;
++        let saved = yaml(&merged_yaml(Some(&on_disk), &config).unwrap());
++        let face = &saved["methods"]["face"];
++        assert_eq!(face["anti_spoofing"]["low_light_luma"], yaml("64.0"));
++        assert_eq!(face["recognition"]["ir_low_light_threshold"], yaml("0.75"));
++        assert_eq!(
++            parse_config(&yaml_serde::to_string(&saved).unwrap()).unwrap(),
++            config
++        );
++        // Not a number: the config is an error, never defaults.
++        let bad = format!(
++            "schema_version: {CURRENT_SCHEMA_VERSION}\nmethods:\n  face:\n    anti_spoofing:\n      low_light_luma: dark\n"
++        );
++        assert!(parse_config(&bad).is_err());
++    }
++
+     #[test]
+     fn main_camera_is_ir_when_camera_is_the_ir_camera() {
+         let mut face = get_default_config().methods.face;
+diff --git a/app/src-tauri/src/scan.rs b/app/src-tauri/src/scan.rs
+index cab1e2a..a4d02e0 100644
+--- a/app/src-tauri/src/scan.rs
++++ b/app/src-tauri/src/scan.rs
+@@ -53,6 +53,8 @@ pub struct ScanResult {
+     pub anti_spoofing: Option<SpoofResult>,
+     /// Both cameras: whether their faces were one face (in the same place).
+     pub pair: Option<PairResult>,
++    /// The light on the colour camera, while the low-light mode is on.
++    pub light: Option<LightResult>,
+     #[specta(type = specta_typescript::Number)]
+     pub duration_ms: u64,
+ }
+@@ -105,6 +107,24 @@ pub struct PairResult {
+     pub same_place: bool,
+ }
+ 
++#[derive(Debug, Serialize, Clone, PartialEq, specta::Type)]
++pub struct LightResult {
++    /// The mean luma (0-255) of the colour picture's face, or of the whole
++    /// picture when it showed no face.
++    #[specta(type = specta_typescript::Number)]
++    pub luma: f64,
++    /// Whether the colour picture showed a face.
++    pub face: bool,
++    /// Low light below this luma.
++    #[specta(type = Option<specta_typescript::Number>)]
++    pub limit: Option<f64>,
++    pub low: bool,
++    /// The IR camera decided alone, at this threshold (None: the colour
++    /// checks ran).
++    #[specta(type = Option<specta_typescript::Number>)]
++    pub ir_alone_threshold: Option<f64>,
++}
++
+ /// The number after `name` among the whitespace-separated words of `text`
+ /// ("score=0.4813", "x=0.12").
+ fn field(text: &str, name: &str) -> Option<f64> {
+@@ -118,6 +138,36 @@ fn field(text: &str, name: &str) -> Option<f64> {
+         .filter(|v| v.is_finite())
+ }
+ 
++/// The number in `text` right after `before` ("luma 48 < 70": "luma " -> 48).
++fn number_after(text: &str, before: &str) -> Option<f64> {
++    text.split(before)
++        .nth(1)?
++        .split_whitespace()
++        .next()?
++        .trim_end_matches([',', ')', ':'])
++        .parse::<f64>()
++        .ok()
++        .filter(|v| v.is_finite())
++}
++
++/// "Low light on the colour camera | face luma 48 < 70: the IR camera decides
++/// alone (threshold 0.70)", "... | no face, picture luma 5 < 70: ...",
++/// "Enough light on the colour camera | face luma 86 (low light below 70)".
++fn light_from(rest: &str, low: bool) -> Option<LightResult> {
++    let luma = number_after(rest, "luma ")?;
++    Some(LightResult {
++        luma,
++        face: !rest.starts_with("no face"),
++        limit: number_after(rest, "< ").or_else(|| number_after(rest, "below ")),
++        low,
++        ir_alone_threshold: if rest.contains("the IR camera decides alone") {
++            number_after(rest, "(threshold ")
++        } else {
++            None
++        },
++    })
++}
++
+ /// The two limits of "(at most 0.50, 1.50)".
+ fn at_most(text: &str) -> (Option<f64>, Option<f64>) {
+     let Some(rest) = text.split("(at most ").nth(1) else {
+@@ -135,6 +185,7 @@ struct ScanDetails {
+     cameras: Vec<CameraResult>,
+     anti_spoofing: Option<SpoofResult>,
+     pair: Option<PairResult>,
++    light: Option<LightResult>,
+ }
+ 
+ /// What the helper's debug log says about the faces it compared, per face, per
+@@ -235,6 +286,17 @@ fn details_from_log(log: &str) -> ScanDetails {
+                     spoof,
+                 });
+             }
++        } else if let Some((rest, low)) = m
++            .strip_prefix("Low light on the colour camera | ")
++            .map(|r| (r, true))
++            .or_else(|| {
++                m.strip_prefix("Enough light on the colour camera | ")
++                    .map(|r| (r, false))
++            })
++        {
++            if let Some(light) = light_from(rest, low) {
++                d.light = Some(light);
++            }
+         } else if let Some((rest, same_place)) = m
+             .strip_prefix("One face on both cameras")
+             .map(|r| (r, true))
+@@ -275,7 +337,7 @@ fn outcome_for(code: Option<i32>) -> ScanOutcome {
+ /// "[2026-11-15 14:00:01.234] [biopass] [debug] FaceAuth: Face on ..." ->
+ /// "14:00:01.234 Face on ...". Enrolled faces show as faces*/<name>.
+ fn steps_from_log(log: &str) -> Vec<String> {
+-    const STEPS: [&str; 13] = [
++    const STEPS: [&str; 16] = [
+         "Face on",
+         "No face",
+         "Recognition PASSED",
+@@ -289,6 +351,9 @@ fn steps_from_log(log: &str) -> Vec<String> {
+         "IR presence check",
+         "One face on both cameras",
+         "The faces on the colour and the IR camera are not one face",
++        "Low light on the colour camera",
++        "Enough light on the colour camera",
++        "Recognised on the IR camera alone",
+     ];
+     log.lines()
+         .filter_map(|line| {
+@@ -399,6 +464,7 @@ fn scan(helper: &str, user: &str) -> Result<ScanResult, String> {
+         cameras: details.cameras,
+         anti_spoofing: details.anti_spoofing,
+         pair: details.pair,
++        light: details.light,
+         duration_ms: started.elapsed().as_millis() as u64,
+     })
+ }
+@@ -542,6 +608,71 @@ libcamera noise without brackets
+         );
+     }
+ 
++    #[test]
++    fn light_on_the_colour_camera() {
++        let low = "\
++[2026-11-16 20:00:01.100] [biopass] [debug] FaceAuth: Enough light on the colour camera | face luma 86 (low light below 70)
++[2026-11-16 20:00:02.100] [biopass] [debug] FaceAuth: Low light on the colour camera | face luma 48 < 70: the IR camera decides alone (threshold 0.70)
++[2026-11-16 20:00:02.900] [biopass] [debug] FaceAuth: Recognition on the IR camera | threshold=0.700 enrolled_count=5
++[2026-11-16 20:00:03.000] [biopass] [debug] FaceAuth: Recognition PASSED on the IR camera | matched face='/h/faces-ir/a.jpg' score=0.8012
++[2026-11-16 20:00:03.010] [biopass] [debug] FaceAuth: Recognised on the IR camera alone (low light), above 0.70
++";
++        let d = details_from_log(low);
++        assert_eq!(
++            d.light,
++            Some(LightResult {
++                luma: 48.0,
++                face: true,
++                limit: Some(70.0),
++                low: true,
++                ir_alone_threshold: Some(0.7)
++            })
++        );
++        assert_eq!(
++            d.cameras,
++            vec![CameraResult {
++                camera: "IR camera".into(),
++                best: 0.8012,
++                threshold: Some(0.7),
++                matched: true
++            }]
++        );
++        assert_eq!(
++            steps_from_log(low),
++            vec![
++                "20:00:01.100 Enough light on the colour camera | face luma 86 (low light below 70)",
++                "20:00:02.100 Low light on the colour camera | face luma 48 < 70: the IR camera decides alone (threshold 0.70)",
++                "20:00:03.000 Recognition PASSED on the IR camera | matched faces-ir/a.jpg score=0.8012",
++                "20:00:03.010 Recognised on the IR camera alone (low light), above 0.70",
++            ]
++        );
++
++        let dark = "[2026-11-16 20:00:02.100] [biopass] [debug] FaceAuth: Low light on the colour camera | no face, picture luma 5 < 70: the IR camera decides alone (threshold 0.75)\n";
++        let light = details_from_log(dark).light.unwrap();
++        assert!(!light.face && light.luma == 5.0 && light.ir_alone_threshold == Some(0.75));
++
++        let no_ir = "[2026-11-16 20:00:02.100] [biopass] [debug] FaceAuth: Low light on the colour camera | face luma 48 < 70, but no faces are enrolled for the IR camera (faces-ir/): the colour camera decides\n";
++        let light = details_from_log(no_ir).light.unwrap();
++        assert!(
++            light.low
++                && light.face
++                && light.limit == Some(70.0)
++                && light.ir_alone_threshold.is_none()
++        );
++
++        let bright = "[2026-11-16 20:00:01.100] [biopass] [debug] FaceAuth: Enough light on the colour camera | face luma 86 (low light below 70)\n";
++        assert_eq!(
++            details_from_log(bright).light,
++            Some(LightResult {
++                luma: 86.0,
++                face: true,
++                limit: Some(70.0),
++                low: false,
++                ir_alone_threshold: None
++            })
++        );
++    }
++
+     #[test]
+     fn face_paths_without_a_faces_dir_stay() {
+         assert_eq!(short_face_paths("face='x.jpg' a"), "x.jpg a");
+diff --git a/app/src/app/configuration/-components/face/TestScan.tsx b/app/src/app/configuration/-components/face/TestScan.tsx
+index da6a7d1..e11e9de 100644
+--- a/app/src/app/configuration/-components/face/TestScan.tsx
++++ b/app/src/app/configuration/-components/face/TestScan.tsx
+@@ -19,15 +19,36 @@ const OUTCOME_TEXT: Record<ScanOutcome, string> = {
+ const fmt = (v: number | null | undefined) =>
+   v === null || v === undefined ? "?" : v.toFixed(2);
+ 
+-/** Each camera's verdict, the anti-spoofing score and the two cameras' faces. */
++/**
++ * The light on the colour camera, each camera's verdict, the anti-spoofing
++ * score and the two cameras' faces.
++ */
+ function ScanDetails({ result }: { result: ScanResult }) {
+-  const rows: { label: string; text: string; ok: boolean }[] = [
++  // mark: a neutral sign instead of a verdict (the light is no check).
++  const rows: { label: string; text: string; ok: boolean; mark?: string }[] =
++    [];
++  if (result.light) {
++    const l = result.light;
++    const what = `${l.face ? "face" : "no face, picture"} brightness ${l.luma.toFixed(0)}`;
++    const limit = `low light below ${fmt(l.limit)}`;
++    rows.push({
++      label: "Light on the colour camera",
++      text: !l.low
++        ? `${what} (${limit})`
++        : l.ir_alone_threshold !== null && l.ir_alone_threshold !== undefined
++          ? `${what}, ${limit}: the IR camera decides alone, above ${fmt(l.ir_alone_threshold)}`
++          : `${what}, ${limit}, but no faces enrolled for the IR camera: the colour camera decides`,
++      ok: true,
++      mark: l.low ? "☾" : "☀",
++    });
++  }
++  rows.push(
+     ...result.cameras.map((c) => ({
+       label: c.camera.charAt(0).toUpperCase() + c.camera.slice(1),
+       text: `best ${fmt(c.best)}, matches above ${fmt(c.threshold)}`,
+       ok: c.matched,
+     })),
+-  ];
++  );
+   if (result.anti_spoofing) {
+     const a = result.anti_spoofing;
+     rows.push({
+@@ -52,12 +73,14 @@ function ScanDetails({ result }: { result: ScanResult }) {
+           <span
+             className={cn(
+               "w-4 shrink-0 font-bold",
+-              r.ok
+-                ? "text-emerald-600 dark:text-emerald-400"
+-                : "text-destructive",
++              r.mark
++                ? "text-muted-foreground"
++                : r.ok
++                  ? "text-emerald-600 dark:text-emerald-400"
++                  : "text-destructive",
+             )}
+           >
+-            {r.ok ? "✓" : "✗"}
++            {r.mark ?? (r.ok ? "✓" : "✗")}
+           </span>
+           <span className="font-medium">{r.label}:</span>
+           <span className="text-muted-foreground">{r.text}</span>
+@@ -99,7 +122,8 @@ export function TestScan({ unsaved, result, onResult }: Props) {
+           </h4>
+           <p className="text-xs text-muted-foreground">
+             One scan with the saved settings, as the lock screen runs it: the
+-            face's size, each enrolled face's score. It counts nowhere.
++            light, the face's size, each enrolled face's score. It counts
++            nowhere.
+             {unsaved && " Save first: unsaved changes are not used."}
+           </p>
+         </div>
+diff --git a/app/src/app/configuration/-components/face/ThresholdsSection.tsx b/app/src/app/configuration/-components/face/ThresholdsSection.tsx
+index 3d5a4cc..6491b8b 100644
+--- a/app/src/app/configuration/-components/face/ThresholdsSection.tsx
++++ b/app/src/app/configuration/-components/face/ThresholdsSection.tsx
+@@ -4,6 +4,8 @@ import { Threshold } from "../methods/shared/Threshold";
+ import {
+   faceModeOf,
+   irThresholdOf,
++  lowLightThresholdOf,
++  lowLightUsed,
+   RECOMMENDED_THRESHOLD,
+   thresholdsUsed,
+ } from "./faceMode";
+@@ -14,8 +16,9 @@ const OPTIONS = { shouldDirty: true, shouldValidate: true } as const;
+  * The thresholds that decide a scan, side by side: each camera's recognition
+  * threshold (recognition.threshold for the colour camera,
+  * recognition.ir_threshold for the IR camera: their pictures score
+- * differently) and the AI anti-spoofing model's. Test shows the scores they
+- * are compared with.
++ * differently) and the AI anti-spoofing model's; below them the low-light
++ * mode (anti_spoofing.low_light_luma, recognition.ir_low_light_threshold).
++ * Test shows the scores and the light they are compared with.
+  */
+ export function ThresholdsSection() {
+   const { setValue } = useFormContext<BiopassConfig>();
+@@ -26,9 +29,13 @@ export function ThresholdsSection() {
+   const used = thresholdsUsed(mode);
+   const ownIr = face.recognition.ir_threshold !== null;
+   const antiSpoofing = face.anti_spoofing.enable && mode !== "ir";
++  const lowLight = lowLightUsed(mode);
++  const lowLightOn = face.anti_spoofing.low_light_luma > 0;
++  const lowLightThreshold = lowLightThresholdOf(face);
+   const low = [
+     used.colour && face.recognition.threshold < RECOMMENDED_THRESHOLD,
+     used.ir && irThresholdOf(face) < RECOMMENDED_THRESHOLD,
++    lowLight && lowLightOn && lowLightThreshold < RECOMMENDED_THRESHOLD,
+   ].some(Boolean);
+   const note = (on: boolean) =>
+     on ? "used in this mode" : "not used in this mode";
+@@ -107,6 +114,57 @@ export function ThresholdsSection() {
+           </p>
+         </div>
+       </div>
++      <div className="grid grid-cols-3 gap-6 pt-1">
++        <div className="grid gap-1">
++          <Threshold
++            label="Low light below"
++            step={1}
++            max={255}
++            value={face.anti_spoofing.low_light_luma}
++            onChange={(v) =>
++              setValue("methods.face.anti_spoofing.low_light_luma", v, OPTIONS)
++            }
++          />
++          <p className="text-[11px] text-muted-foreground">
++            {lowLightOn
++              ? "the colour face's brightness, 0-255"
++              : "0: off, the colour checks always run"}
++            {" · "}
++            {lowLight
++              ? mode === "rgb"
++                ? "used with faces enrolled for the IR camera"
++                : "used in this mode"
++              : "not used in this mode"}
++          </p>
++        </div>
++        <div className="grid gap-1">
++          <Threshold
++            label="IR camera in low light"
++            step={0.01}
++            disabled={!lowLightOn}
++            value={face.recognition.ir_low_light_threshold}
++            onChange={(v) =>
++              setValue(
++                "methods.face.recognition.ir_low_light_threshold",
++                v,
++                OPTIONS,
++              )
++            }
++          />
++          <p className="text-[11px] text-muted-foreground">
++            {lowLightThreshold > face.recognition.ir_low_light_threshold
++              ? `never below the IR camera's: ${lowLightThreshold.toFixed(2)} applies`
++              : "when the IR camera decides alone"}
++          </p>
++        </div>
++        <p className="text-[11px] text-muted-foreground self-center">
++          When the colour camera's face (or its whole picture, without a face)
++          is darker than this, anti-spoofing and the colour camera need more
++          light: the IR camera, which lights the face itself, then decides
++          alone, above its low-light threshold, as Windows Hello does. An
++          evening room measured about 48, daylight 86; Test shows the value.
++        </p>
++      </div>
+       <p
+         className={`text-xs ${low ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground"}`}
+       >
+diff --git a/app/src/app/configuration/-components/face/faceMode.test.ts b/app/src/app/configuration/-components/face/faceMode.test.ts
+index 3f52653..b998e65 100644
+--- a/app/src/app/configuration/-components/face/faceMode.test.ts
++++ b/app/src/app/configuration/-components/face/faceMode.test.ts
+@@ -8,6 +8,8 @@ import {
+   faceDirRole,
+   faceModeOf,
+   irThresholdOf,
++  lowLightThresholdOf,
++  lowLightUsed,
+   mainIsIr,
+   missingFaces,
+   RECOMMENDED_MIN_FACE_HEIGHT,
+@@ -45,6 +47,7 @@ function config(): BiopassConfig {
+           model_id: "edgeface-s-gamma-05",
+           threshold: 0.5,
+           ir_threshold: null,
++          ir_low_light_threshold: 0.7,
+         },
+         anti_spoofing: {
+           enable: false,
+@@ -55,6 +58,7 @@ function config(): BiopassConfig {
+           ir_recognition: false,
+           pair_max_offset: 0.5,
+           pair_max_size_ratio: 1.5,
++          low_light_luma: 70,
+         },
+       },
+       fingerprint: { enable: false, retries: 1, timeout: 5000 },
+@@ -127,6 +131,27 @@ describe("withFaceMode", () => {
+     expect(irThresholdOf(face())).toBe(0.5);
+   });
+ 
++  test("low light: in rgb and both, its threshold never below the IR camera's", () => {
++    expect(lowLightUsed("ir")).toBe(false);
++    expect(lowLightUsed("rgb")).toBe(true);
++    expect(lowLightUsed("both")).toBe(true);
++    expect(lowLightUsed(null)).toBe(false);
++    const f = face();
++    expect(lowLightThresholdOf(f)).toBe(0.7);
++    f.recognition.ir_threshold = 0.75;
++    expect(lowLightThresholdOf(f)).toBe(0.75);
++    f.recognition.ir_threshold = null;
++    f.recognition.threshold = 0.8;
++    expect(lowLightThresholdOf(f)).toBe(0.8);
++    // A mode change keeps the low-light settings as they are.
++    const g = face();
++    g.anti_spoofing.low_light_luma = 0;
++    g.recognition.ir_low_light_threshold = 0.65;
++    const out = withFaceMode(g, "both", { ir: IR, colour: RGB });
++    expect(out.anti_spoofing.low_light_luma).toBe(0);
++    expect(out.recognition.ir_low_light_threshold).toBe(0.65);
++  });
++
+   test("each mode uses its cameras' thresholds", () => {
+     expect(thresholdsUsed("ir")).toEqual({ colour: false, ir: true });
+     expect(thresholdsUsed("rgb")).toEqual({ colour: true, ir: false });
+diff --git a/app/src/app/configuration/-components/face/faceMode.ts b/app/src/app/configuration/-components/face/faceMode.ts
+index 547d071..dde8c63 100644
+--- a/app/src/app/configuration/-components/face/faceMode.ts
++++ b/app/src/app/configuration/-components/face/faceMode.ts
+@@ -47,6 +47,24 @@ export function irThresholdOf(face: FaceConfig): number {
+   return face.recognition.ir_threshold ?? face.recognition.threshold;
+ }
+ 
++/**
++ * Whether the low-light mode can apply in `mode`: a colour picture too dark
++ * for the colour checks (anti_spoofing.low_light_luma) hands the decision to
++ * the IR camera. In both, and in rgb when faces are enrolled for the IR
++ * camera (faces-ir/); in ir the IR camera decides anyway.
++ */
++export function lowLightUsed(mode: FaceMode | null): boolean {
++  return mode === "rgb" || mode === "both";
++}
++
++/**
++ * The IR camera's threshold when it decides alone in low light: the
++ * low-light one, never below the IR camera's own (as the helper does).
++ */
++export function lowLightThresholdOf(face: FaceConfig): number {
++  return Math.max(face.recognition.ir_low_light_threshold, irThresholdOf(face));
++}
++
+ /** Which cameras' recognition thresholds `mode` uses. */
+ export function thresholdsUsed(mode: FaceMode | null): {
+   colour: boolean;
+diff --git a/app/src/app/configuration/-components/methods/shared/Threshold.tsx b/app/src/app/configuration/-components/methods/shared/Threshold.tsx
+index 69ab403..97aaa9b 100644
+--- a/app/src/app/configuration/-components/methods/shared/Threshold.tsx
++++ b/app/src/app/configuration/-components/methods/shared/Threshold.tsx
+@@ -6,6 +6,9 @@ interface Props {
+   value: number;
+   onChange: (value: number) => void;
+   step?: number;
++  /** The largest value (1: a score; a step below 0.05 shows two decimals,
++   * else a percentage). Above 1 the value shows as a whole number. */
++  max?: number;
+   disabled?: boolean;
+ }
+ 
+@@ -14,20 +17,25 @@ export function Threshold({
+   value,
+   onChange,
+   step = 0.05,
++  max = 1,
+   disabled,
+ }: Props) {
++  const shown =
++    max > 1
++      ? value.toFixed(0)
++      : step < 0.05
++        ? value.toFixed(2)
++        : `${(value * 100).toFixed(0)}%`;
+   return (
+     <div className="grid gap-2">
+       <div className="flex items-center justify-between">
+         <Label className="text-xs text-muted-foreground">{label}</Label>
+-        <span className="text-xs font-mono font-medium">
+-          {step < 0.05 ? value.toFixed(2) : `${(value * 100).toFixed(0)}%`}
+-        </span>
++        <span className="text-xs font-mono font-medium">{shown}</span>
+       </div>
+       <div className="h-9 flex items-center">
+         <Slider
+           value={[value]}
+-          max={1}
++          max={max}
+           step={step}
+           disabled={disabled}
+           onValueChange={([v]) => onChange(v)}
+diff --git a/app/src/app/configuration/-components/validation.ts b/app/src/app/configuration/-components/validation.ts
+index 6cdff5f..a384a85 100644
+--- a/app/src/app/configuration/-components/validation.ts
++++ b/app/src/app/configuration/-components/validation.ts
+@@ -75,6 +75,7 @@ export const biopassConfigSchema = z.object({
+           model_id: z.string(),
+           threshold: thresholdSchema,
+           ir_threshold: thresholdSchema.nullable(),
++          ir_low_light_threshold: thresholdSchema,
+         }),
+         anti_spoofing: z.object({
+           enable: z.boolean(),
+@@ -96,6 +97,10 @@ export const biopassConfigSchema = z.object({
+           ir_recognition: z.boolean(),
+           pair_max_offset: z.number().min(0).max(2),
+           pair_max_size_ratio: z.number().min(1).max(4),
++          low_light_luma: z
++            .number("Low light must be a number")
++            .min(0, "Low light must be at least 0 (off)")
++            .max(255, "Low light must be at most 255"),
+         }),
+       })
+       // The camera UI sets a mode (camera, IR camera), never profiles.
+diff --git a/app/src/bindings.ts b/app/src/bindings.ts
+index ce07753..12c62ea 100644
+--- a/app/src/bindings.ts
++++ b/app/src/bindings.ts
+@@ -88,6 +88,13 @@ export type AntiSpoofingConfig_Deserialize = {
+ 	pair_max_offset?: number,
+ 	/**  ... and their heights at most this ratio apart. */
+ 	pair_max_size_ratio?: number,
++	/**
++	 *  Low light: below this mean luma (0-255) of the colour picture's face
++	 *  (or of the whole picture without a face) the IR camera decides alone,
++	 *  without anti-spoofing and colour recognition (both cameras, or the
++	 *  colour camera with faces enrolled for the IR camera). 0: off.
++	 */
++	low_light_luma?: number,
+ };
+ 
+ export type AntiSpoofingConfig_Serialize = {
+@@ -110,6 +117,13 @@ export type AntiSpoofingConfig_Serialize = {
+ 	pair_max_offset: number,
+ 	/**  ... and their heights at most this ratio apart. */
+ 	pair_max_size_ratio: number,
++	/**
++	 *  Low light: below this mean luma (0-255) of the colour picture's face
++	 *  (or of the whole picture without a face) the IR camera decides alone,
++	 *  without anti-spoofing and colour recognition (both cameras, or the
++	 *  colour camera with faces enrolled for the IR camera). 0: off.
++	 */
++	low_light_luma: number,
+ };
+ 
+ export type AntiSpoofingModelConfig = AntiSpoofingModelConfig_Serialize | AntiSpoofingModelConfig_Deserialize;
+@@ -391,6 +405,44 @@ export type KeyringStatus_Serialize = {
+ 	pcr7: boolean | null,
+ };
+ 
++export type LightResult = LightResult_Serialize | LightResult_Deserialize;
++
++export type LightResult_Deserialize = {
++	/**
++	 *  The mean luma (0-255) of the colour picture's face, or of the whole
++	 *  picture when it showed no face.
++	 */
++	luma: number,
++	/**  Whether the colour picture showed a face. */
++	face: boolean,
++	/**  Low light below this luma. */
++	limit?: number | null,
++	low: boolean,
++	/**
++	 *  The IR camera decided alone, at this threshold (None: the colour
++	 *  checks ran).
++	 */
++	ir_alone_threshold?: number | null,
++};
++
++export type LightResult_Serialize = {
++	/**
++	 *  The mean luma (0-255) of the colour picture's face, or of the whole
++	 *  picture when it showed no face.
++	 */
++	luma: number,
++	/**  Whether the colour picture showed a face. */
++	face: boolean,
++	/**  Low light below this luma. */
++	limit: number | null,
++	low: boolean,
++	/**
++	 *  The IR camera decided alone, at this threshold (None: the colour
++	 *  checks ran).
++	 */
++	ir_alone_threshold: number | null,
++};
++
+ export type LockoutSetting = {
+ 	key: string,
+ 	value: number,
+@@ -494,6 +546,11 @@ export type RecognitionConfig_Deserialize = {
+ 	 *  `anti_spoofing.ir_recognition`); None: `threshold`.
+ 	 */
+ 	ir_threshold?: number | null,
++	/**
++	 *  The IR camera's when it decides alone because the colour picture is
++	 *  too dark (`anti_spoofing.low_light_luma`); never below its own.
++	 */
++	ir_low_light_threshold?: number,
+ };
+ 
+ export type RecognitionConfig_Serialize = {
+@@ -508,6 +565,11 @@ export type RecognitionConfig_Serialize = {
+ 	 *  `anti_spoofing.ir_recognition`); None: `threshold`.
+ 	 */
+ 	ir_threshold: number | null,
++	/**
++	 *  The IR camera's when it decides alone because the colour picture is
++	 *  too dark (`anti_spoofing.low_light_luma`); never below its own.
++	 */
++	ir_low_light_threshold: number,
+ };
+ 
+ /**  What save_config did besides writing config.yaml. */
+@@ -564,6 +626,8 @@ export type ScanResult_Deserialize = {
+ 	anti_spoofing?: SpoofResult_Deserialize | null,
+ 	/**  Both cameras: whether their faces were one face (in the same place). */
+ 	pair?: PairResult_Deserialize | null,
++	/**  The light on the colour camera, while the low-light mode is on. */
++	light?: LightResult_Deserialize | null,
+ 	duration_ms: number,
+ };
+ 
+@@ -586,6 +650,8 @@ export type ScanResult_Serialize = {
+ 	anti_spoofing: SpoofResult_Serialize | null,
+ 	/**  Both cameras: whether their faces were one face (in the same place). */
+ 	pair: PairResult_Serialize | null,
++	/**  The light on the colour camera, while the low-light mode is on. */
++	light: LightResult_Serialize | null,
+ 	duration_ms: number,
+ };
+ 
+diff --git a/app/src/lib/models.test.ts b/app/src/lib/models.test.ts
+index 719436b..784b491 100644
+--- a/app/src/lib/models.test.ts
++++ b/app/src/lib/models.test.ts
+@@ -31,6 +31,7 @@ function makeConfig(
+           model_id: ids.recognition ?? "edgeface-s-gamma-05",
+           threshold: 0.5,
+           ir_threshold: null,
++          ir_low_light_threshold: 0.7,
+         },
+         anti_spoofing: {
+           enable: face.antiSpoofing ?? false,
+@@ -44,6 +45,7 @@ function makeConfig(
+           ir_recognition: false,
+           pair_max_offset: 0.5,
+           pair_max_size_ratio: 1.5,
++          low_light_luma: 70,
+         },
+       },
+       fingerprint: { enable: false, retries: 1, timeout: 5000 },
+diff --git a/auth/test/config/defaults.yaml b/auth/test/config/defaults.yaml
+index b4fbf58..5404e6c 100644
+--- a/auth/test/config/defaults.yaml
++++ b/auth/test/config/defaults.yaml
+@@ -24,6 +24,7 @@ methods:
+       model_id: edgeface-s-gamma-05
+       threshold: 0.5
+       ir_threshold: null
++      ir_low_light_threshold: 0.7
+     anti_spoofing:
+       enable: false
+       model:
+@@ -35,6 +36,7 @@ methods:
+       ir_recognition: false
+       pair_max_offset: 0.5
+       pair_max_size_ratio: 1.5
++      low_light_luma: 70.0
+   fingerprint:
+     enable: false
+     retries: 1
+-- 
+2.43.0
+

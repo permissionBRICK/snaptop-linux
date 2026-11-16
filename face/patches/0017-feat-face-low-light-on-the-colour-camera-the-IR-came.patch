@@ -1,0 +1,1298 @@
+From bd6cfdef8f40d911edbf3fc9830242dba3ee5be6 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:41:51 +0000
+Subject: [PATCH] feat(face): low light on the colour camera: the IR camera
+ decides alone
+
+In an ordinary evening room the AI anti-spoofing model took real faces
+for spoofs and the colour camera's recognition scored the user far
+lower, while the IR camera, which lights the face itself, recognised as
+in daylight. Measured on the ASUS Vivobook S 15 (both cameras' mode,
+MiniFASNet V2 at 0.8): the colour picture's face box had a mean luma of
+47-48 of 255 (the whole picture 55-59); MiniFASNet V2 scored the real
+face 0.86-0.99 (a spoof), colour recognition 0.45-0.70, IR recognition
+typically 0.75-0.83. In bright light: luma 86, spoof scores 0.01-0.08,
+colour 0.75-0.80, IR 0.72-0.76. Face detection on the colour camera
+still worked in the low light.
+
+anti_spoofing.low_light_luma (default 70, 0 = off) and
+recognition.ir_low_light_threshold (default 0.7): with a colour main
+camera and a separate IR camera (ir_recognition, or the IR presence
+check with faces in faces-ir/), the mean luma of the colour picture's
+face box (or of the whole picture when it shows no face) is measured
+first. Below the limit the IR camera decides alone, as Windows Hello
+does: no AI anti-spoofing, no colour recognition; the IR face must
+match faces-ir/ above the low-light threshold, which is never below the
+IR camera's own threshold. When the colour camera saw a face, the IR
+camera's face must be that face (the one-face check) at that moment
+(kBothCamerasMaxGap); when it saw none in a dark picture (a dark room,
+or the lens covered), the IR camera decides alone. A face on the colour
+camera that is too small or cut off still compares nothing. An attempt
+that starts on the IR camera (left open by the last one) matched its
+face at the IR threshold while the colour camera opened; a dark colour
+picture then compares it again at the low-light threshold, if that is
+higher. With enough light, or the limit at 0, nothing changes.
+
+The decision is a pure function (face/common/low_light.h). Each attempt
+logs the light against the limit while the mode is on ("Low light on
+the colour camera | face luma 48 < 70: the IR camera decides alone
+(threshold 0.70)", "Enough light on the colour camera | face luma 86
+(low light below 70)") and a match "Recognised on the IR camera alone
+(low light)". The gap and the one-face checks moved into helpers, with
+their log lines unchanged. A value out of range (luma outside 0-255, a
+threshold outside 0-1, NaN) turns face off, as the other limits do.
+Tests: low_light (new), face_both_cameras (fake frames with a grey
+level, the threshold of each match), config_validation, config_golden.
+---
+ auth/CMakeLists.txt                  |   1 +
+ auth/core/auth_config.cc             |  14 +-
+ auth/core/auth_config.h              |  26 ++-
+ auth/face/CMakeLists.txt             |   1 +
+ auth/face/common/low_light.cc        |  25 +++
+ auth/face/common/low_light.h         |  51 +++++
+ auth/face/face_auth.cc               | 218 ++++++++++++++++++---
+ auth/face/face_auth.h                |  56 +++++-
+ auth/test/config_golden/main.cpp     |   3 +
+ auth/test/config_validation/main.cpp |  64 +++++-
+ auth/test/face_both_cameras/main.cpp | 280 ++++++++++++++++++++++++++-
+ auth/test/low_light/CMakeLists.txt   |  14 ++
+ auth/test/low_light/main.cpp         |  85 ++++++++
+ 13 files changed, 790 insertions(+), 48 deletions(-)
+ create mode 100644 auth/face/common/low_light.cc
+ create mode 100644 auth/face/common/low_light.h
+ create mode 100644 auth/test/low_light/CMakeLists.txt
+ create mode 100644 auth/test/low_light/main.cpp
+
+diff --git a/auth/CMakeLists.txt b/auth/CMakeLists.txt
+index a9fb556..6c22b61 100644
+--- a/auth/CMakeLists.txt
++++ b/auth/CMakeLists.txt
+@@ -94,6 +94,7 @@ if(BUILD_TESTS)
+     add_subdirectory(test/runpath)
+     add_subdirectory(test/camera_list)
+     add_subdirectory(test/face_pair)
++    add_subdirectory(test/low_light)
+ endif()
+ 
+ install(
+diff --git a/auth/core/auth_config.cc b/auth/core/auth_config.cc
+index 2083887..0b2158d 100644
+--- a/auth/core/auth_config.cc
++++ b/auth/core/auth_config.cc
+@@ -63,16 +63,20 @@ std::vector<std::string> dedupeServices(const std::vector<std::string>& services
+ // them has a safe value to clamp to, so face is turned off and PAM falls
+ // through to the next module. The anti-spoofing threshold only counts when
+ // anti-spoofing is on. detection.min_face_height likewise: negative or NaN
+-// would silently drop the check, above 1 nothing could pass.
++// would silently drop the check, above 1 nothing could pass. A NaN
++// low_light_luma would turn the low-light mode off without a word, one above
++// 255 would hand every picture to the IR camera.
+ bool faceThresholdsValid(const FaceMethodConfig& face) {
+   const AntiSpoofingConfig& a = face.anti_spoofing;
+   return thresholdInRange(face.detection.threshold) &&
+          thresholdInRange(face.detection.min_face_height) &&
+          thresholdInRange(face.recognition.threshold) &&
+          (!face.recognition.ir_threshold || thresholdInRange(*face.recognition.ir_threshold)) &&
++         thresholdInRange(face.recognition.ir_low_light_threshold) &&
+          (!a.enable || thresholdInRange(a.model.threshold)) && a.pair_max_offset >= 0.0f &&
+          a.pair_max_offset <= kMaxPairOffset && a.pair_max_size_ratio >= 1.0f &&
+-         a.pair_max_size_ratio <= kMaxPairSizeRatio;
++         a.pair_max_size_ratio <= kMaxPairSizeRatio && a.low_light_luma >= 0.0f &&
++         a.low_light_luma <= kMaxLowLightLuma;
+ }
+ 
+ }  // namespace
+@@ -85,8 +89,8 @@ void validateConfig(BiopassConfig& config) {
+   FaceMethodConfig& face = config.methods.face;
+   if (face.enable && !faceThresholdsValid(face)) {
+     spdlog::warn(
+-        "Biopass: a face threshold or min_face_height is outside [{}, {}], or a pair limit outside "
+-        "its range, face is disabled",
++        "Biopass: a face threshold or min_face_height is outside [{}, {}], or a pair limit or "
++        "low_light_luma outside its range, face is disabled",
+         kMinThreshold, kMaxThreshold);
+     face.enable = false;
+   }
+@@ -197,6 +201,7 @@ void parseAntiSpoofing(const YAML::Node& a, AntiSpoofingConfig& out) {
+   readStrictBool(a, "ir_recognition", out.ir_recognition);
+   readIf(a, "pair_max_offset", out.pair_max_offset);
+   readIf(a, "pair_max_size_ratio", out.pair_max_size_ratio);
++  readIf(a, "low_light_luma", out.low_light_luma);
+ }
+ 
+ // A list of {camera, ir_camera, allow_without_ir} maps; null is no profiles, as in the app.
+@@ -239,6 +244,7 @@ void parseFace(const YAML::Node& f, FaceMethodConfig& out) {
+     if (f["recognition"]["ir_threshold"] && !f["recognition"]["ir_threshold"].IsNull()) {
+       out.recognition.ir_threshold = f["recognition"]["ir_threshold"].as<float>();
+     }
++    readIf(f["recognition"], "ir_low_light_threshold", out.recognition.ir_low_light_threshold);
+   }
+   readOptionalString(f, "camera", out.camera);
+   if (f["camera_profiles"]) {
+diff --git a/auth/core/auth_config.h b/auth/core/auth_config.h
+index 72663cf..adb86a3 100644
+--- a/auth/core/auth_config.h
++++ b/auth/core/auth_config.h
+@@ -53,6 +53,10 @@ struct RecognitionConfig {
+   // ir_recognition): the two cameras' pictures score differently. nullopt =
+   // `threshold`.
+   std::optional<float> ir_threshold = std::nullopt;
++  // The IR camera's when it decides alone because the colour picture is too
++  // dark (anti_spoofing.low_light_luma); never below the IR camera's own
++  // threshold (face/common/low_light.h).
++  float ir_low_light_threshold = 0.7f;
+ };
+ 
+ struct AntiSpoofingModelConfig {
+@@ -79,12 +83,21 @@ struct AntiSpoofingConfig {
+   // than the main camera; when the IR camera is the main camera it already
+   // recognises and this changes nothing.
+   bool ir_recognition = false;
+-  // With ir_recognition: the faces the two cameras recognised must be one face,
++  // With ir_recognition (and in low light, when the colour camera saw a
++  // face): the faces the two cameras saw must be one face,
+   // in the same place in both pictures (face/common/face_pair.h): centres at
+   // most pair_max_offset face sizes apart (0 = no check), heights at most
+   // pair_max_size_ratio apart. Else the attempt fails like a spoof.
+   float pair_max_offset = 0.5f;
+   float pair_max_size_ratio = 1.5f;
++  // Low light (face/common/low_light.h): with a colour main camera and a
++  // separate IR camera (ir_recognition, or the IR presence check with faces
++  // in faces-ir/), a colour picture whose face (or, without a face, the whole
++  // picture) has a mean luma (0-255) below this hands the decision to the IR
++  // camera: no AI anti-spoofing, no colour recognition; the IR camera
++  // recognises alone at recognition.ir_low_light_threshold, on the colour
++  // camera's face when it saw one. 0 = off (the colour checks always run).
++  float low_light_luma = 70.0f;
+ };
+ 
+ // One colour + IR camera pair in `camera_profiles` (see camera_profile.h).
+@@ -152,13 +165,16 @@ inline constexpr float kMaxThreshold = 1.0f;
+ // pair_max_size_ratio in [1, kMaxPairSizeRatio].
+ inline constexpr float kMaxPairOffset = 2.0f;
+ inline constexpr float kMaxPairSizeRatio = 4.0f;
++// anti_spoofing.low_light_luma in [0, kMaxLowLightLuma] (8-bit luma).
++inline constexpr float kMaxLowLightLuma = 255.0f;
+ 
+ // Puts a config into the ranges the helper relies on. readConfig() calls it
+ // on every config it returns.
+-// - A face threshold (recognition.ir_threshold when set) or
+-//   detection.min_face_height outside [kMinThreshold, kMaxThreshold] (or
+-//   NaN), or a pair_max_offset / pair_max_size_ratio outside its range, turns
+-//   face off: there is no safe value to clamp it to. The anti-spoofing
++// - A face threshold (recognition.ir_threshold when set,
++//   ir_low_light_threshold) or detection.min_face_height outside
++//   [kMinThreshold, kMaxThreshold] (or NaN), or a pair_max_offset /
++//   pair_max_size_ratio / low_light_luma outside its range, turns face off:
++//   there is no safe value to clamp it to. The anti-spoofing
+ //   threshold only counts while anti-spoofing is on.
+ // - order keeps each method once and appends the missing ones;
+ //   ignore_services drops empty and repeated names.
+diff --git a/auth/face/CMakeLists.txt b/auth/face/CMakeLists.txt
+index 8483a75..abfe7b0 100644
+--- a/auth/face/CMakeLists.txt
++++ b/auth/face/CMakeLists.txt
+@@ -52,6 +52,7 @@ add_library(biopass_face_common STATIC
+     common/frame_darkness.cc
+     common/face_framing.cc
+     common/face_pair.cc
++    common/low_light.cc
+     common/v4l2_capture.cc
+ )
+ set_target_properties(biopass_face_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
+diff --git a/auth/face/common/low_light.cc b/auth/face/common/low_light.cc
+new file mode 100644
+index 0000000..0ada0bb
+--- /dev/null
++++ b/auth/face/common/low_light.cc
+@@ -0,0 +1,25 @@
++#include "low_light.h"
++
++#include <algorithm>
++
++namespace biopass {
++
++bool isLowLight(double luma, float limit) {
++  // NaN fails every comparison: never low.
++  return limit > 0.0f && luma < static_cast<double>(limit);
++}
++
++LightPath chooseLightPath(bool colour_face, std::optional<double> luma, float limit,
++                          bool ir_faces) {
++  const bool low = luma && isLowLight(*luma, limit) && ir_faces;
++  if (colour_face) {
++    return low ? LightPath::IrSameFace : LightPath::Colour;
++  }
++  return low ? LightPath::IrAlone : LightPath::NoFace;
++}
++
++float lowLightThreshold(float low_light_threshold, float ir_threshold) {
++  return std::max(low_light_threshold, ir_threshold);
++}
++
++}  // namespace biopass
+diff --git a/auth/face/common/low_light.h b/auth/face/common/low_light.h
+new file mode 100644
+index 0000000..af36f6a
+--- /dev/null
++++ b/auth/face/common/low_light.h
+@@ -0,0 +1,51 @@
++#pragma once
++
++// Low light on the colour camera (anti_spoofing.low_light_luma): with a colour
++// and an IR camera (both-cameras mode, or the IR presence check with faces
++// enrolled for the IR camera), a colour picture too dark for the colour
++// checks hands the decision to the IR camera, which lights the face itself:
++// it recognises alone, at a stricter threshold, as Windows Hello does. The AI
++// anti-spoofing models and the colour recognition need light: in an ordinary
++// evening room they took real faces for spoofs (scores 0.86-0.99 at a
++// threshold of 0.8, the face's mean luma about 48 of 255) and scored the user
++// far lower, while the IR camera recognised as well as in daylight. Pure, so
++// the decision can be tested without a camera.
++
++#include <optional>
++
++namespace biopass {
++
++// True when the low-light mode is on (limit above 0) and `luma` is below
++// `limit`. A NaN luma or limit never is.
++bool isLowLight(double luma, float limit);
++
++// Which camera decides an attempt, from the colour picture's light.
++enum class LightPath {
++  // Enough light, the low-light mode off, or no faces enrolled for the IR
++  // camera: anti-spoofing and the recognitions, as without the mode.
++  Colour,
++  // Low light, a face in front of the colour camera: the IR camera
++  // recognises alone, at the low-light threshold, and its face must be the
++  // colour camera's (the one-face check, face_pair.h).
++  IrSameFace,
++  // Low light and no face at all in the colour picture (a dark room, or the
++  // lens covered): the IR camera recognises alone, at the low-light threshold.
++  IrAlone,
++  // No face in front of the colour camera and not low light, or a face that is
++  // too small or cut off: nothing to compare (as without the mode).
++  NoFace,
++};
++
++// colour_face: the colour camera found a face in front of it; `luma` is then
++// its box's mean luma, else the whole picture's when it showed no face at all
++// (nullopt: neither, i.e. a face too small or cut off, or no picture).
++// limit: anti_spoofing.low_light_luma. ir_faces: faces are enrolled for the IR
++// camera, so it can recognise.
++LightPath chooseLightPath(bool colour_face, std::optional<double> luma, float limit, bool ir_faces);
++
++// The IR camera's threshold when it decides alone: the configured low-light
++// threshold, never below the IR camera's own threshold (low light never
++// loosens recognition).
++float lowLightThreshold(float low_light_threshold, float ir_threshold);
++
++}  // namespace biopass
+diff --git a/auth/face/face_auth.cc b/auth/face/face_auth.cc
+index eaf67ff..2da8d38 100644
+--- a/auth/face/face_auth.cc
++++ b/auth/face/face_auth.cc
+@@ -1,5 +1,6 @@
+ #include "face_auth.h"
+ 
++#include <spdlog/fmt/fmt.h>
+ #include <spdlog/spdlog.h>
+ #include <sys/stat.h>
+ 
+@@ -21,6 +22,7 @@
+ #include "face_pair.h"
+ #include "frame_darkness.h"
+ #include "image_io.h"
++#include "low_light.h"
+ #include "onnx_session.h"
+ #include "status_reporter.h"
+ #include "user_file.h"
+@@ -88,6 +90,17 @@ float FaceAuth::recognitionThreshold(FaceSet set) const {
+   return ir && r.ir_threshold ? *r.ir_threshold : r.threshold;
+ }
+ 
++bool FaceAuth::lowLightMode() const {
++  const auto& ir_camera = face_config_.anti_spoofing.ir_camera;
++  return face_config_.anti_spoofing.low_light_luma > 0.0f && ir_camera && !ir_camera->empty() &&
++         !irIsMainCamera();
++}
++
++float FaceAuth::lowLightIrThreshold() const {
++  return lowLightThreshold(face_config_.recognition.ir_low_light_threshold,
++                           recognitionThreshold(FaceSet::Ir));
++}
++
+ std::chrono::steady_clock::time_point FaceAuth::now() const {
+   return seams_.now ? seams_.now() : std::chrono::steady_clock::now();
+ }
+@@ -286,8 +299,24 @@ AuthResult FaceAuth::attempt(const std::string& username, const AuthConfig& conf
+     reportInfo("Biopass: looking for your face...");
+   }
+ 
++  // Low light (the IR presence check beside a colour camera): with faces
++  // enrolled for the IR camera, a dark colour picture hands the decision to
++  // the IR camera's recognition, which replaces the anti-spoofing checks.
++  const bool low_light_mode = lowLightMode();
++  std::optional<double> faceless_luma;
+   const std::optional<Sighting> seen =
+-      lookForFace(camera_session_, cameraName(false, irIsMainCamera()));
++      lookForFace(camera_session_, cameraName(false, irIsMainCamera()),
++                  low_light_mode ? &faceless_luma : nullptr);
++  if (low_light_mode && (seen || faceless_luma)) {
++    const std::vector<std::string> ir_faces = enrolledFaces(username, FaceSet::Ir);
++    const LightPath path = lightOnColour(seen ? &*seen : nullptr, faceless_luma, !ir_faces.empty());
++    if (path == LightPath::IrSameFace || path == LightPath::IrAlone) {
++      if (cancel_signal && cancel_signal->load()) {
++        return AuthResult::Failure;
++      }
++      return lowLightAttempt(username, config, cancel_signal, seen ? &*seen : nullptr, ir_faces);
++    }
++  }
+   if (!seen) {
+     return AuthResult::NoFace;
+   }
+@@ -391,7 +420,22 @@ AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthC
+     reportInfo("Biopass: looking for your face...");
+   }
+ 
+-  const std::optional<Sighting> first_seen = lookForFace(first_slot, name(first));
++  // Low light: the colour picture decides which camera decides (lowLightMode()).
++  const bool low_light_mode = lowLightMode();
++  std::optional<double> faceless_luma;
++  const std::optional<Sighting> first_seen = lookForFace(
++      first_slot, name(first), first == Camera::Main && low_light_mode ? &faceless_luma : nullptr);
++  if (first == Camera::Main && low_light_mode) {
++    const LightPath path =
++        lightOnColour(first_seen ? &*first_seen : nullptr, faceless_luma, !ir_faces.empty());
++    if (path == LightPath::IrSameFace || path == LightPath::IrAlone) {
++      if (cancel_signal && cancel_signal->load()) {
++        return AuthResult::Failure;
++      }
++      return lowLightAttempt(username, config, cancel_signal, first_seen ? &*first_seen : nullptr,
++                             ir_faces);
++    }
++  }
+   if (!first_seen) {
+     return AuthResult::NoFace;
+   }
+@@ -433,16 +477,30 @@ AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthC
+     return AuthResult::NoFace;
+   }
+ 
+-  const std::optional<Sighting> second_seen = lookForFace(second_slot, name(second));
++  // Started on the IR camera: its face matched the IR camera's threshold;
++  // now the colour picture's light decides whether the colour checks follow.
++  std::optional<double> second_faceless_luma;
++  const bool light_check = second == Camera::Main && low_light_mode;
++  const std::optional<Sighting> second_seen =
++      lookForFace(second_slot, name(second), light_check ? &second_faceless_luma : nullptr);
++  if (light_check) {
++    const LightPath path = lightOnColour(second_seen ? &*second_seen : nullptr,
++                                         second_faceless_luma, !ir_faces.empty());
++    if (path == LightPath::IrSameFace || path == LightPath::IrAlone) {
++      if (cancel_signal && cancel_signal->load()) {
++        return AuthResult::Failure;
++      }
++      return irDecides(username, config, *first_seen, second_seen ? &*second_seen : nullptr,
++                       ir_faces, recognitionThreshold(FaceSet::Ir));
++    }
++  }
+   if (!second_seen) {
+     return AuthResult::NoFace;
+   }
+-  const auto gap = second_seen->at - first_seen->at;
+-  const long long gap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(gap).count();
+-  if (gap > kBothCamerasMaxGap) {
+-    spdlog::error("FaceAuth: The {} frame came {} ms after the {} frame (at most {} ms), not "
+-                  "one moment",
+-                  name(second), gap_ms, name(first), kBothCamerasMaxGap.count());
++  const long long gap_ms =
++      std::chrono::duration_cast<std::chrono::milliseconds>(second_seen->at - first_seen->at)
++          .count();
++  if (!oneMoment(*first_seen, name(first), *second_seen, name(second))) {
+     return AuthResult::NoFace;
+   }
+   if (cancel_signal && cancel_signal->load()) {
+@@ -452,42 +510,150 @@ AuthResult FaceAuth::attemptBothCameras(const std::string& username, const AuthC
+   // face that the IR camera recognises fails here (face/common/face_pair.h).
+   const Sighting& colour_seen = first == Camera::Main ? *first_seen : *second_seen;
+   const Sighting& ir_seen = first == Camera::Ir ? *first_seen : *second_seen;
++  if (!oneFace(colour_seen, ir_seen)) {
++    second_slot.reset();
++    return AuthResult::Failure;
++  }
++  if (second == Camera::Main && !aiAntiSpoofPasses(username, *second_seen, config, cancel_signal)) {
++    spdlog::warn("FaceAuth: Anti-spoofing failed on the {} — returning Failure", name(second));
++    second_slot.reset();
++    return AuthResult::Failure;
++  }
++  if (!matchFace(username, second_seen->face.image, setOf(second), facesOf(second))) {
++    if (config.debug) {
++      saveFailedFace(username, second_seen->face.image, "not_similar");
++    }
++    return AuthResult::Retry;
++  }
++  spdlog::debug("FaceAuth: Recognised on both cameras, {} ms apart", gap_ms);
++  return AuthResult::Success;
++}
++
++bool FaceAuth::oneMoment(const Sighting& earlier, const char* earlier_name, const Sighting& later,
++                         const char* later_name) const {
++  const auto gap = later.at - earlier.at;
++  if (gap <= kBothCamerasMaxGap) {
++    return true;
++  }
++  spdlog::error(
++      "FaceAuth: The {} frame came {} ms after the {} frame (at most {} ms), not "
++      "one moment",
++      later_name, std::chrono::duration_cast<std::chrono::milliseconds>(gap).count(), earlier_name,
++      kBothCamerasMaxGap.count());
++  return false;
++}
++
++bool FaceAuth::oneFace(const Sighting& colour, const Sighting& ir) const {
+   const auto boxOf = [](const Sighting& s) {
+     const Box& b = s.face.box;
+     return frameBox(b.x1, b.y1, b.x2, b.y2, s.frame.width, s.frame.height);
+   };
+   const AntiSpoofingConfig& anti = face_config_.anti_spoofing;
+-  const FacePair pair = checkFacePair(boxOf(colour_seen), boxOf(ir_seen), anti.pair_max_offset,
+-                                      anti.pair_max_size_ratio);
++  const FacePair pair =
++      checkFacePair(boxOf(colour), boxOf(ir), anti.pair_max_offset, anti.pair_max_size_ratio);
+   if (!pair.same_place) {
+     spdlog::warn(
+         "FaceAuth: The faces on the colour and the IR camera are not one face | offset x={:.2f} "
+         "y={:.2f} size={:.2f} (at most {:.2f}, {:.2f}) — returning Failure",
+         pair.dx, pair.dy, pair.size_ratio, anti.pair_max_offset, anti.pair_max_size_ratio);
+-    second_slot.reset();
+-    return AuthResult::Failure;
++    return false;
+   }
+   spdlog::debug(
+       "FaceAuth: One face on both cameras | offset x={:.2f} y={:.2f} size={:.2f} (at "
+       "most {:.2f}, {:.2f})",
+       pair.dx, pair.dy, pair.size_ratio, anti.pair_max_offset, anti.pair_max_size_ratio);
+-  if (second == Camera::Main && !aiAntiSpoofPasses(username, *second_seen, config, cancel_signal)) {
+-    spdlog::warn("FaceAuth: Anti-spoofing failed on the {} — returning Failure", name(second));
+-    second_slot.reset();
++  return true;
++}
++
++// Logged in every attempt while the mode is on, so a scan (s15-face check,
++// the app's Test) shows the light against the limit.
++LightPath FaceAuth::lightOnColour(const Sighting* colour, std::optional<double> faceless_luma,
++                                  bool ir_faces) const {
++  const float limit = face_config_.anti_spoofing.low_light_luma;
++  const std::optional<double> luma =
++      colour ? std::optional<double>(measureLuma(colour->face.image).mean) : faceless_luma;
++  const LightPath path = chooseLightPath(colour != nullptr, luma, limit, ir_faces);
++  if (!luma) {
++    return path;
++  }
++  const std::string what = colour ? fmt::format("face luma {:.0f}", *luma)
++                                  : fmt::format("no face, picture luma {:.0f}", *luma);
++  if (path == LightPath::IrSameFace || path == LightPath::IrAlone) {
++    spdlog::debug(
++        "FaceAuth: Low light on the colour camera | {} < {:.0f}: the IR camera decides alone "
++        "(threshold {:.2f})",
++        what, limit, lowLightIrThreshold());
++  } else if (isLowLight(*luma, limit)) {
++    spdlog::debug(
++        "FaceAuth: Low light on the colour camera | {} < {:.0f}, but no faces are enrolled for "
++        "the IR camera (faces-ir/): the colour camera decides",
++        what, limit);
++  } else if (colour) {
++    spdlog::debug("FaceAuth: Enough light on the colour camera | {} (low light below {:.0f})", what,
++                  limit);
++  }
++  return path;
++}
++
++AuthResult FaceAuth::lowLightAttempt(const std::string& username, const AuthConfig& config,
++                                     std::atomic<bool>* cancel_signal, const Sighting* colour,
++                                     const std::vector<std::string>& ir_faces) {
++  // Only one camera streams at a time (see irPresenceSession).
++  camera_session_.reset();
++  if (!ir_camera_session_ || !ir_camera_session_->isOpen()) {
++    ir_camera_session_.reset();
++    ir_camera_session_ = openSession(Camera::Ir);
++  }
++  if (!ir_camera_session_ || !ir_camera_session_->isOpen()) {
++    spdlog::error("FaceAuth: Could not open the IR camera");
++    ir_camera_session_.reset();
++    return AuthResult::NoFace;
++  }
++  const std::optional<Sighting> ir_seen = lookForFace(ir_camera_session_, "IR camera");
++  if (!ir_seen) {
++    return AuthResult::NoFace;
++  }
++  if (cancel_signal && cancel_signal->load()) {
+     return AuthResult::Failure;
+   }
+-  if (!matchFace(username, second_seen->face.image, setOf(second), facesOf(second))) {
++  return irDecides(username, config, *ir_seen, colour, ir_faces, std::nullopt);
++}
++
++AuthResult FaceAuth::irDecides(const std::string& username, const AuthConfig& config,
++                               const Sighting& ir_seen, const Sighting* colour,
++                               const std::vector<std::string>& ir_faces,
++                               std::optional<float> matched_above) {
++  if (colour) {
++    // The colour camera saw a face: the IR camera's must be that face, at
++    // that moment (a dark photo held up for the colour camera next to
++    // someone else does not hand the decision to the IR camera's face).
++    const bool ir_first = ir_seen.at < colour->at;
++    const bool same_moment = ir_first ? oneMoment(ir_seen, "IR camera", *colour, "colour camera")
++                                      : oneMoment(*colour, "colour camera", ir_seen, "IR camera");
++    if (!same_moment) {
++      return AuthResult::NoFace;
++    }
++    if (!oneFace(*colour, ir_seen)) {
++      ir_camera_session_.reset();
++      camera_session_.reset();
++      return AuthResult::Failure;
++    }
++  }
++  const float threshold = lowLightIrThreshold();
++  if (!(matched_above && *matched_above >= threshold) &&
++      !matchFace(username, ir_seen.face.image, FaceSet::Ir, ir_faces, threshold)) {
+     if (config.debug) {
+-      saveFailedFace(username, second_seen->face.image, "not_similar");
++      saveFailedFace(username, ir_seen.face.image, "not_similar");
+     }
+     return AuthResult::Retry;
+   }
+-  spdlog::debug("FaceAuth: Recognised on both cameras, {} ms apart", gap_ms);
++  spdlog::debug("FaceAuth: Recognised on the IR camera alone (low light), above {:.2f}", threshold);
+   return AuthResult::Success;
+ }
+ 
+ std::optional<FaceAuth::Sighting> FaceAuth::lookForFace(
+-    std::unique_ptr<ICameraCaptureSession>& slot, const char* camera_name) {
++    std::unique_ptr<ICameraCaptureSession>& slot, const char* camera_name,
++    std::optional<double>* faceless_luma) {
+   ImageRGB frame = slot->capture();
+   const auto at = now();
+   if (frame.empty()) {
+@@ -507,6 +673,9 @@ std::optional<FaceAuth::Sighting> FaceAuth::lookForFace(
+     }
+     spdlog::error("FaceAuth: No face detected on the {} | luma mean={:.1f} stddev={:.1f}",
+                   camera_name, luma.mean, luma.stddev);
++    if (faceless_luma) {
++      *faceless_luma = luma.mean;
++    }
+     return std::nullopt;
+   }
+ 
+@@ -537,13 +706,14 @@ std::vector<std::string> FaceAuth::enrolledFaces(const std::string& username, Fa
+ }
+ 
+ bool FaceAuth::matchFace(const std::string& username, const ImageRGB& face, FaceSet set,
+-                         const std::vector<std::string>& enrolled_paths) {
++                         const std::vector<std::string>& enrolled_paths,
++                         std::optional<float> threshold) {
++  const float t = threshold.value_or(recognitionThreshold(set));
+   if (seams_.match) {
+-    return seams_.match(face, set, enrolled_paths);
++    return seams_.match(face, set, enrolled_paths, t);
+   }
+   return matchAgainstEnrolled(username, face, enrolled_paths,
+-                              cameraName(bothCameras(), set == FaceSet::Ir || irIsMainCamera()),
+-                              recognitionThreshold(set));
++                              cameraName(bothCameras(), set == FaceSet::Ir || irIsMainCamera()), t);
+ }
+ 
+ bool FaceAuth::aiAntiSpoofPasses(const std::string& username, const Sighting& seen,
+diff --git a/auth/face/face_auth.h b/auth/face/face_auth.h
+index 7e74e3b..c91021a 100644
+--- a/auth/face/face_auth.h
++++ b/auth/face/face_auth.h
+@@ -14,6 +14,7 @@
+ #include "face_as.h"
+ #include "face_detection.h"
+ #include "face_recognition.h"
++#include "low_light.h"
+ #include "model_registry.h"
+ #include "session_engine.h"
+ 
+@@ -40,12 +41,14 @@ class FaceAuth : public IAuthMethod {
+ 
+   // Test seams; each one left empty is the real thing: the user's enrolled
+   // faces (listFaces/listIrFaces), the user's detection model, matching
+-  // against the enrolled images with the user's recognition model, and the
+-  // steady clock. With detect and match set, no model is loaded.
++  // against the enrolled images with the user's recognition model (a match
++  // scores above `threshold`), and the steady clock. With detect and match
++  // set, no model is loaded.
+   struct Seams {
+     std::function<std::vector<std::string>(FaceSet)> enrolled;
+     std::function<std::vector<Detection>(const ImageRGB&)> detect;
+-    std::function<bool(const ImageRGB& face, FaceSet set, const std::vector<std::string>& enrolled)>
++    std::function<bool(const ImageRGB& face, FaceSet set, const std::vector<std::string>& enrolled,
++                       float threshold)>
+         match;
+     std::function<std::chrono::steady_clock::time_point()> now;
+   };
+@@ -88,6 +91,15 @@ class FaceAuth : public IAuthMethod {
+   // faces/ when the IR camera is the main camera, else recognition.threshold.
+   float recognitionThreshold(FaceSet set) const;
+ 
++  // True when the colour picture's light can hand the decision to the IR
++  // camera (anti_spoofing.low_light_luma above 0, a colour main camera and a
++  // separate IR camera; face/common/low_light.h).
++  bool lowLightMode() const;
++
++  // The IR camera's threshold when it decides alone in low light:
++  // recognition.ir_low_light_threshold, never below the IR camera's own.
++  float lowLightIrThreshold() const;
++
+  private:
+   enum class Camera { Main, Ir };
+ 
+@@ -108,6 +120,32 @@ class FaceAuth : public IAuthMethod {
+   // on the other one, within kBothCamerasMaxGap.
+   AuthResult attemptBothCameras(const std::string& username, const AuthConfig& config,
+                                 std::atomic<bool>* cancel_signal);
++  // Which camera decides, from the colour picture's light (lowLightMode()),
++  // logged: `colour` is the colour camera's face in front of it or nullptr,
++  // `faceless_luma` the picture's mean luma when it showed no face at all.
++  LightPath lightOnColour(const Sighting* colour, std::optional<double> faceless_luma,
++                          bool ir_faces) const;
++  // Low light after a colour picture: the colour camera closes, the IR camera
++  // opens (if it is not open), and its face decides alone (irDecides).
++  AuthResult lowLightAttempt(const std::string& username, const AuthConfig& config,
++                             std::atomic<bool>* cancel_signal, const Sighting* colour,
++                             const std::vector<std::string>& ir_faces);
++  // The IR camera's face decides alone (low light): with a colour face, both
++  // pictures must be one moment and one face; then a match against faces-ir/
++  // above lowLightIrThreshold(). `matched_above`: the threshold that face
++  // already scored above (an attempt that started on the IR camera), so it is
++  // only compared again when the low-light threshold is higher.
++  AuthResult irDecides(const std::string& username, const AuthConfig& config,
++                       const Sighting& ir_seen, const Sighting* colour,
++                       const std::vector<std::string>& ir_faces,
++                       std::optional<float> matched_above);
++  // True when `later` came at most kBothCamerasMaxGap after `earlier`
++  // (logged when not).
++  bool oneMoment(const Sighting& earlier, const char* earlier_name, const Sighting& later,
++                 const char* later_name) const;
++  // True when the colour and the IR camera's faces are one face
++  // (face/common/face_pair.h; logged either way).
++  bool oneFace(const Sighting& colour, const Sighting& ir) const;
+   // True when ir_camera names the same device as camera.
+   bool irIsMainCamera() const;
+   // The main camera; opened as grey when it is the IR camera. Closes the IR
+@@ -121,15 +159,19 @@ class FaceAuth : public IAuthMethod {
+   // Captures from `session` and finds the largest face; nullopt (logged)
+   // when the capture fails (the session in `slot` is dropped), there is no
+   // face, or it is not framed as someone in front of the camera
+-  // (detection.min_face_height).
++  // (detection.min_face_height). `faceless_luma`, if given, gets the
++  // picture's mean luma when it showed no face at all (else stays empty).
+   std::optional<Sighting> lookForFace(std::unique_ptr<ICameraCaptureSession>& slot,
+-                                      const char* camera_name);
++                                      const char* camera_name,
++                                      std::optional<double>* faceless_luma = nullptr);
+   // Loads detection + recognition once; false if either fails to load.
+   bool ensureModelsLoaded();
+   std::vector<std::string> enrolledFaces(const std::string& username, FaceSet set) const;
+-  // True once `face` matches one of the enrolled images of `set`.
++  // True once `face` matches one of the enrolled images of `set`, above
++  // `threshold` (default: its camera's, recognitionThreshold()).
+   bool matchFace(const std::string& username, const ImageRGB& face, FaceSet set,
+-                 const std::vector<std::string>& enrolled_paths);
++                 const std::vector<std::string>& enrolled_paths,
++                 std::optional<float> threshold = std::nullopt);
+   // True once `face` scores above `threshold` against one of the enrolled
+   // images.
+   bool matchAgainstEnrolled(const std::string& username, const ImageRGB& face,
+diff --git a/auth/test/config_golden/main.cpp b/auth/test/config_golden/main.cpp
+index b629b95..5799a85 100644
+--- a/auth/test/config_golden/main.cpp
++++ b/auth/test/config_golden/main.cpp
+@@ -61,6 +61,8 @@ void expectSameConfig(const BiopassConfig& a, const BiopassConfig& b, const std:
+   field(fa.recognition.threshold == fb.recognition.threshold, "face.recognition.threshold");
+   field(fa.recognition.ir_threshold == fb.recognition.ir_threshold,
+         "face.recognition.ir_threshold");
++  field(fa.recognition.ir_low_light_threshold == fb.recognition.ir_low_light_threshold,
++        "face.recognition.ir_low_light_threshold");
+ 
+   const auto& aa = fa.anti_spoofing;
+   const auto& ab = fb.anti_spoofing;
+@@ -74,6 +76,7 @@ void expectSameConfig(const BiopassConfig& a, const BiopassConfig& b, const std:
+   field(aa.ir_recognition == ab.ir_recognition, "anti_spoofing.ir_recognition");
+   field(aa.pair_max_offset == ab.pair_max_offset, "anti_spoofing.pair_max_offset");
+   field(aa.pair_max_size_ratio == ab.pair_max_size_ratio, "anti_spoofing.pair_max_size_ratio");
++  field(aa.low_light_luma == ab.low_light_luma, "anti_spoofing.low_light_luma");
+ 
+   const auto& pa = a.methods.fingerprint;
+   const auto& pb = b.methods.fingerprint;
+diff --git a/auth/test/config_validation/main.cpp b/auth/test/config_validation/main.cpp
+index f1ee313..2e7a569 100644
+--- a/auth/test/config_validation/main.cpp
++++ b/auth/test/config_validation/main.cpp
+@@ -89,7 +89,7 @@ methods:
+       - {camera: /dev/v4l/by-path/pci-0-usb-0:8:1.0-video-index0, ir_camera: /dev/video2}
+       - {}
+     detection: {model_id: det, threshold: 0.6, min_face_height: 0.3}
+-    recognition: {model_id: rec, threshold: 0.7, ir_threshold: 0.65}
++    recognition: {model_id: rec, threshold: 0.7, ir_threshold: 0.65, ir_low_light_threshold: 0.8}
+     anti_spoofing:
+       enable: true
+       model: {model_id: as, threshold: 0.9}
+@@ -99,6 +99,7 @@ methods:
+       ir_recognition: true
+       pair_max_offset: 0.4
+       pair_max_size_ratio: 1.3
++      low_light_luma: 55
+   fingerprint:
+     enable: true
+     retries: 2
+@@ -118,14 +119,16 @@ void checkParse() {
+     expect(f.enable && f.retries == 3 && f.retry_delay == 100 && f.camera == "/dev/video0" &&
+                f.detection.model_id == "det" && f.detection.threshold == 0.6f &&
+                f.detection.min_face_height == 0.3f && f.recognition.model_id == "rec" &&
+-               f.recognition.threshold == 0.7f && f.recognition.ir_threshold == 0.65f,
++               f.recognition.threshold == 0.7f && f.recognition.ir_threshold == 0.65f &&
++               f.recognition.ir_low_light_threshold == 0.8f,
+            "parse: face read");
+     expect(
+         f.anti_spoofing.enable && f.anti_spoofing.model.model_id == "as" &&
+             f.anti_spoofing.model.threshold == 0.9f && f.anti_spoofing.ir_camera == "/dev/video2" &&
+             f.anti_spoofing.ir_warmup_delay_ms == 100 &&
+             f.anti_spoofing.ir_presence_timeout_ms == 200 && f.anti_spoofing.ir_recognition &&
+-            f.anti_spoofing.pair_max_offset == 0.4f && f.anti_spoofing.pair_max_size_ratio == 1.3f,
++            f.anti_spoofing.pair_max_offset == 0.4f &&
++            f.anti_spoofing.pair_max_size_ratio == 1.3f && f.anti_spoofing.low_light_luma == 55.0f,
+         "parse: anti_spoofing read");
+     const auto& p = f.camera_profiles;
+     expect(p.size() == 3 && p[0].camera == "/dev/v4l/by-id/usb-Dock-video-index0" &&
+@@ -213,6 +216,42 @@ void checkParse() {
+                c.methods.face.anti_spoofing.pair_max_offset == 0.5f &&
+                c.methods.face.anti_spoofing.pair_max_size_ratio == 1.5f,
+            "parse: missing ir_threshold and pair limits -> the threshold, 0.5 and 1.5");
++    expect(c.methods.face.anti_spoofing.low_light_luma == 70.0f &&
++               c.methods.face.recognition.ir_low_light_threshold == 0.7f,
++           "parse: missing low_light_luma and ir_low_light_threshold -> 70 and 0.7");
++  }
++
++  {
++    const BiopassConfig c =
++        parseOrDie("schema_version: 2\nmethods:\n  face: {anti_spoofing: {low_light_luma: 0}}\n");
++    expect(c.methods.face.enable && c.methods.face.anti_spoofing.low_light_luma == 0.0f,
++           "parse: low_light_luma 0 -> the low-light mode off, face on");
++  }
++
++  for (const char* bad : {"-1", "256", ".nan", ".inf"}) {
++    const BiopassConfig c = parseOrDie(
++        std::string("schema_version: 2\nmethods:\n  face: {anti_spoofing: {low_light_luma: ") +
++        bad + "}}\n");
++    expect(!c.methods.face.enable, std::string("parse: low_light_luma ") + bad + " -> face off");
++  }
++
++  for (const char* bad : {"1.5", "-0.1", ".nan"}) {
++    const BiopassConfig c = parseOrDie(
++        std::string(
++            "schema_version: 2\nmethods:\n  face: {recognition: {ir_low_light_threshold: ") +
++        bad + "}}\n");
++    expect(!c.methods.face.enable,
++           std::string("parse: recognition.ir_low_light_threshold ") + bad + " -> face off");
++  }
++
++  {
++    // Not a number: the whole config is rejected, as for any other value.
++    expect(!biopass::parseConfig(
++               "schema_version: 2\nmethods:\n  face: {anti_spoofing: {low_light_luma: dark}}\n"),
++           "parse: low_light_luma not a number -> config rejected");
++    expect(!biopass::parseConfig("schema_version: 2\nmethods:\n  face: {recognition: "
++                                 "{ir_low_light_threshold: [0.7]}}\n"),
++           "parse: ir_low_light_threshold not a number -> config rejected");
+   }
+ 
+   {
+@@ -327,6 +366,25 @@ int main() {
+                  [](BiopassConfig& c, float v) { c.methods.face.detection.min_face_height = v; });
+   checkThreshold("recognition.ir_threshold",
+                  [](BiopassConfig& c, float v) { c.methods.face.recognition.ir_threshold = v; });
++  checkThreshold("recognition.ir_low_light_threshold", [](BiopassConfig& c, float v) {
++    c.methods.face.recognition.ir_low_light_threshold = v;
++  });
++
++  for (const auto& [luma, keep] : std::vector<std::pair<float, bool>>{
++           {70.0f, true},
++           {0.0f, true},  // the low-light mode off
++           {255.0f, true},
++           {-0.5f, false},
++           {255.5f, false},
++           {kNaN, false},
++           {kInf, false},
++       }) {
++    BiopassConfig c;
++    c.methods.face.anti_spoofing.low_light_luma = luma;
++    biopass::validateConfig(c);
++    expect(c.methods.face.enable == keep, "low_light_luma " + std::to_string(luma) +
++                                              (keep ? " keeps face on" : " turns face off"));
++  }
+ 
+   for (const auto& [offset, ratio, keep] : std::vector<std::tuple<float, float, bool>>{
+            {0.5f, 1.5f, true},
+diff --git a/auth/test/face_both_cameras/main.cpp b/auth/test/face_both_cameras/main.cpp
+index da65a3e..76632e9 100644
+--- a/auth/test/face_both_cameras/main.cpp
++++ b/auth/test/face_both_cameras/main.cpp
+@@ -6,7 +6,9 @@
+ // camera open for the next attempt. Nothing falls back to one camera. And
+ // detection.min_face_height: a face that is too small or cut off is never
+ // matched, on either camera. An attempt that compared no face is NoFace, one
+-// whose face did not match is Retry.
++// whose face did not match is Retry. And low light (anti_spoofing.
++// low_light_luma): a dark colour picture hands the decision to the IR camera,
++// at its low-light threshold.
+ // Fake cameras, detector, matcher and clock: no camera or model needed.
+ // Exits non-zero on any failure.
+ 
+@@ -63,9 +65,13 @@ struct Rig {
+   std::map<int, std::deque<Seen>> seen;
+   std::map<int, milliseconds> capture_time{{kRgbWidth, milliseconds(100)},
+                                            {kIrWidth, milliseconds(100)}};
++  // Per camera: the grey level of each next frame (default 128: enough light;
++  // the low-light limit is 70).
++  std::map<int, std::deque<int>> light;
+   // Per face set: the next match results (default: match).
+   std::map<FaceAuth::FaceSet, std::deque<bool>> matches;
+   std::vector<std::string> matched_sets;  // "rgb" / "ir", in order
++  std::vector<float> thresholds;          // the threshold of each match, in order
+   std::map<FaceAuth::FaceSet, std::vector<std::string>> enrolled{
+       {FaceAuth::FaceSet::Main, {"faces/a.jpg"}}, {FaceAuth::FaceSet::Ir, {"faces-ir/a.jpg"}}};
+   Clock::time_point now{};
+@@ -78,7 +84,15 @@ class FakeSession : public biopass::ICameraCaptureSession {
+   bool isOpen() const override { return true; }
+   ImageRGB capture() override {
+     rig_.now += rig_.capture_time[width_];
+-    return ImageRGB(width_, kHeight);
++    int level = 128;
++    auto& queue = rig_.light[width_];
++    if (!queue.empty()) {
++      level = queue.front();
++      queue.pop_front();
++    }
++    ImageRGB frame(width_, kHeight);
++    std::fill(frame.data.begin(), frame.data.end(), static_cast<uint8_t>(level));
++    return frame;
+   }
+ 
+  private:
+@@ -123,8 +137,10 @@ FaceAuth::Seams seams(Rig& rig) {
+     }
+     return {biopass::Detection(0, "face", 0.9f, box, frame.crop(box.x1, box.y1, box.x2, box.y2))};
+   };
+-  s.match = [&rig](const ImageRGB&, FaceAuth::FaceSet set, const std::vector<std::string>&) {
++  s.match = [&rig](const ImageRGB&, FaceAuth::FaceSet set, const std::vector<std::string>&,
++                   float threshold) {
+     rig.matched_sets.push_back(set == FaceAuth::FaceSet::Ir ? "ir" : "rgb");
++    rig.thresholds.push_back(threshold);
+     auto& queue = rig.matches[set];
+     if (queue.empty()) {
+       return true;
+@@ -154,6 +170,16 @@ std::string joined(const std::vector<std::string>& v) {
+   return out;
+ }
+ 
++std::string joined(const std::vector<float>& v) {
++  std::string out;
++  for (const float t : v) {
++    char buf[16];
++    std::snprintf(buf, sizeof buf, "%.2f", t);
++    out += (out.empty() ? "" : ",") + std::string(buf);
++  }
++  return out;
++}
++
+ // The face on both cameras: colour first (opened by the availability check),
+ // then the IR camera, which opens while the colour face is matched.
+ void checkBothMatch() {
+@@ -172,8 +198,9 @@ void checkBothMatch() {
+   expect(rig.live == 0, "both match: session end closes the camera");
+ }
+ 
+-// Too little light for the colour camera (or its lens covered): no face
+-// there, so the IR camera never decides alone.
++// No face on the colour camera in a bright picture (nobody there): the IR
++// camera never decides alone. With the low-light mode off, not in a dark one
++// either (the behaviour before it).
+ void checkNoFallbackToIr() {
+   Rig rig;
+   rig.seen[kRgbWidth] = {Seen::NoFace, Seen::NoFace, Seen::NoFace};
+@@ -186,6 +213,19 @@ void checkNoFallbackToIr() {
+   expect(joined(rig.opens) == "rgb", "no colour face: the IR camera is never opened (" +
+                                          joined(rig.opens) + ")");
+   expect(rig.matched_sets.empty(), "no colour face: nothing is matched");
++
++  Rig off;
++  off.seen[kRgbWidth] = {Seen::NoFace};
++  off.light[kRgbWidth] = {5};
++  biopass::FaceMethodConfig config = bothConfig();
++  config.anti_spoofing.low_light_luma = 0.0f;
++  FaceAuth unlit(config, kUser, opener(off), seams(off));
++  unlit.isAvailable();
++  expect(!unlit.lowLightMode(), "low_light_luma 0: the mode is off");
++  expect(unlit.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "mode off, dark and no colour face: nothing compared");
++  expect(joined(off.opens) == "rgb" && off.matched_sets.empty(),
++         "mode off, dark: the IR camera never decides alone");
+ }
+ 
+ // A face across the room or at the frame's edge is not matched.
+@@ -412,7 +452,237 @@ void checkThresholdPerCamera() {
+   }
+ }
+ 
++// Low light: a face in front of the colour camera, too dark for the colour
++// checks (luma 48, as in an evening room). The IR camera decides alone, at
++// its low-light threshold, on the same face; neither the AI anti-spoofing
++// model (on here, and unable to load in this test: it would fail the attempt)
++// nor the colour recognition runs.
++void checkLowLightFace() {
++  Rig rig;
++  rig.light[kRgbWidth] = {48};
++  biopass::FaceMethodConfig config = bothConfig();
++  config.anti_spoofing.enable = true;
++  FaceAuth face(config, kUser, opener(rig), seams(rig));
++  expect(face.lowLightMode(), "low light: on by default (70) in both cameras' mode");
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "low light, a face: recognised by the IR camera alone, without anti-spoofing");
++  expect(joined(rig.opens) == "rgb,ir",
++         "low light, a face: colour, then IR (" + joined(rig.opens) + ")");
++  expect(joined(rig.matched_sets) == "ir",
++         "low light, a face: only the IR face is matched (" + joined(rig.matched_sets) + ")");
++  expect(joined(rig.thresholds) == "0.70",
++         "low light: at the low-light threshold (" + joined(rig.thresholds) + ")");
++  expect(rig.max_live_at_open == 0, "low light: never two sessions at once");
++
++  // The same face in enough light: anti-spoofing runs (and fails here).
++  Rig bright;
++  FaceAuth lit(config, kUser, opener(bright), seams(bright));
++  lit.isAvailable();
++  expect(lit.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Failure,
++         "enough light, a face: anti-spoofing runs (no model in this test: fails closed)");
++  expect(bright.matched_sets.empty() || joined(bright.matched_sets) == "rgb",
++         "enough light: the colour face, never the IR camera alone");
++
++  // Not recognised by the IR camera at the low-light threshold: a retry.
++  Rig miss;
++  miss.light[kRgbWidth] = {48};
++  miss.matches[FaceAuth::FaceSet::Ir] = {false};
++  FaceAuth missed(bothConfig(), kUser, opener(miss), seams(miss));
++  missed.isAvailable();
++  expect(missed.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "low light, IR not recognised: retry");
++  expect(joined(miss.matched_sets) == "ir", "low light, IR not recognised: colour not matched");
++}
++
++// Low light and a face in front of the colour camera: the IR camera's face
++// must be that face (a dark photo held up for the colour camera next to
++// someone else), at that moment.
++void checkLowLightOneFace() {
++  Rig rig;
++  rig.light[kRgbWidth] = {48};
++  rig.seen[kIrWidth] = {Seen::Beside};
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Failure,
++         "low light, two faces: failure (counts as a false face)");
++  expect(rig.matched_sets.empty(), "low light, two faces: nothing matched");
++  expect(rig.live == 0, "low light, two faces: the cameras are closed");
++
++  Rig late;
++  late.light[kRgbWidth] = {48};
++  late.capture_time[kIrWidth] = biopass::kBothCamerasMaxGap + milliseconds(1);
++  FaceAuth slow(bothConfig(), kUser, opener(late), seams(late));
++  slow.isAvailable();
++  expect(slow.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "low light, IR frame after the gap: nothing compared");
++  expect(late.matched_sets.empty(), "low light, IR frame after the gap: not matched");
++}
++
++// Pitch black, or the colour lens covered: no face in a dark colour picture.
++// The IR camera decides alone (as Windows Hello does); without a face there
++// either, nothing is compared.
++void checkLowLightNoColourFace() {
++  Rig rig;
++  rig.seen[kRgbWidth] = {Seen::NoFace};
++  rig.light[kRgbWidth] = {5};
++  FaceAuth face(bothConfig(), kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "dark, no colour face: recognised by the IR camera alone");
++  expect(joined(rig.opens) == "rgb,ir" && joined(rig.matched_sets) == "ir",
++         "dark, no colour face: IR only (" + joined(rig.matched_sets) + ")");
++  expect(joined(rig.thresholds) == "0.70", "dark, no colour face: at the low-light threshold");
++
++  Rig nobody;
++  nobody.seen[kRgbWidth] = {Seen::NoFace};
++  nobody.seen[kIrWidth] = {Seen::NoFace};
++  nobody.light[kRgbWidth] = {5};
++  FaceAuth empty(bothConfig(), kUser, opener(nobody), seams(nobody));
++  empty.isAvailable();
++  expect(empty.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "dark, no face on either camera: nothing compared");
++  expect(nobody.matched_sets.empty(), "dark, no face on either camera: nothing matched");
++
++  // A colour face too small (across the room) in the dark: no colour face in
++  // front of it, but not "no face" either: nothing compared, IR not opened.
++  Rig far;
++  far.seen[kRgbWidth] = {Seen::Small};
++  far.light[kRgbWidth] = {5};
++  FaceAuth distant(bothConfig(), kUser, opener(far), seams(far));
++  distant.isAvailable();
++  expect(distant.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "dark, a small colour face: nothing compared");
++  expect(joined(far.opens) == "rgb", "dark, a small colour face: the IR camera is not opened");
++}
++
++// An attempt that starts on the IR camera (left open by the last one): its
++// face matched the IR camera's threshold while the colour camera opened; a
++// dark colour picture then asks for the low-light threshold, compared again.
++void checkLowLightIrFirst() {
++  Rig rig;
++  rig.matches[FaceAuth::FaceSet::Ir] = {false};
++  rig.light[kRgbWidth] = {128, 48};
++  biopass::FaceMethodConfig config = bothConfig();
++  config.recognition.ir_threshold = 0.6f;
++  FaceAuth face(config, kUser, opener(rig), seams(rig));
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "IR first: the first attempt (enough light) is not recognised in IR");
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "IR first, then a dark colour face: recognised by the IR camera alone");
++  expect(joined(rig.opens) == "rgb,ir,rgb",
++         "IR first: one switch to colour (" + joined(rig.opens) + ")");
++  expect(joined(rig.matched_sets) == "rgb,ir,ir,ir",
++         "IR first: the IR face again, not the colour one (" + joined(rig.matched_sets) + ")");
++  expect(joined(rig.thresholds) == "0.50,0.60,0.60,0.70",
++         "IR first: its threshold, then the low-light one (" + joined(rig.thresholds) + ")");
++
++  // Its face scores between the IR and the low-light threshold: a retry.
++  Rig between;
++  between.matches[FaceAuth::FaceSet::Ir] = {false, true, false};
++  between.light[kRgbWidth] = {128, 48};
++  FaceAuth face2(config, kUser, opener(between), seams(between));
++  face2.isAvailable();
++  face2.authenticate(kUser, biopass::AuthConfig{});
++  expect(face2.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Retry,
++         "IR first, dark: above the IR threshold but not the low-light one: retry");
++
++  // A low-light threshold no higher than the IR camera's: no second compare.
++  Rig same;
++  same.matches[FaceAuth::FaceSet::Ir] = {false};
++  same.seen[kRgbWidth] = {Seen::Face, Seen::NoFace};
++  same.light[kRgbWidth] = {128, 5};
++  config.recognition.ir_low_light_threshold = 0.6f;
++  FaceAuth face3(config, kUser, opener(same), seams(same));
++  face3.isAvailable();
++  face3.authenticate(kUser, biopass::AuthConfig{});
++  expect(face3.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "IR first, then a black colour picture without a face: the IR camera alone");
++  expect(joined(same.thresholds) == "0.50,0.60,0.60",
++         "low-light threshold = IR threshold: the IR face is not compared again (" +
++             joined(same.thresholds) + ")");
++}
++
++// The low-light threshold is never below the IR camera's own.
++void checkLowLightThreshold() {
++  biopass::FaceMethodConfig config = bothConfig();
++  {
++    FaceAuth face(config, kUser);
++    expect(face.lowLightIrThreshold() == 0.7f, "low-light threshold: 0.7 by default");
++  }
++  config.recognition.ir_threshold = 0.75f;
++  {
++    FaceAuth face(config, kUser);
++    expect(face.lowLightIrThreshold() == 0.75f, "low-light threshold: the IR one when higher");
++  }
++  config.recognition.ir_threshold.reset();
++  config.recognition.threshold = 0.8f;
++  {
++    FaceAuth face(config, kUser);
++    expect(face.lowLightIrThreshold() == 0.8f,
++           "low-light threshold: the colour one when the IR camera takes it");
++  }
++  // Only with a colour main camera and a separate IR camera.
++  biopass::FaceMethodConfig ir = bothConfig();
++  ir.camera = kIr;
++  {
++    FaceAuth face(ir, kUser);
++    expect(!face.lowLightMode(), "low light: not with the IR camera as the main camera");
++  }
++  biopass::FaceMethodConfig no_ir = bothConfig();
++  no_ir.anti_spoofing.ir_camera.reset();
++  no_ir.anti_spoofing.ir_recognition = false;
++  {
++    FaceAuth face(no_ir, kUser);
++    expect(!face.lowLightMode(), "low light: not without an IR camera");
++  }
++}
++
++// The colour camera with the IR presence check (ir_recognition off) and faces
++// enrolled for the IR camera: low light hands the decision to the IR
++// camera's recognition, which replaces the presence check. Without IR faces
++// nothing changes (here: a dark picture without a face compares nothing).
++void checkLowLightPresenceMode() {
++  Rig rig;
++  rig.seen[kRgbWidth] = {Seen::Face, Seen::NoFace};
++  rig.light[kRgbWidth] = {48, 128};
++  biopass::FaceMethodConfig rgb = bothConfig();
++  rgb.anti_spoofing.ir_recognition = false;
++  FaceAuth face(rgb, kUser, opener(rig), seams(rig));
++  expect(face.lowLightMode(), "presence check: low light possible");
++  face.isAvailable();
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::Success,
++         "presence check, low light: recognised by the IR camera alone");
++  expect(joined(rig.opens) == "rgb,ir" && joined(rig.matched_sets) == "ir" &&
++             joined(rig.thresholds) == "0.70",
++         "presence check, low light: IR faces at the low-light threshold (" +
++             joined(rig.matched_sets) + " " + joined(rig.thresholds) + ")");
++  // (Nobody there in enough light: the presence check would need the real
++  // detector.)
++  expect(face.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "presence check: the next attempt, nobody in a bright picture: nothing compared");
++  expect(joined(rig.opens) == "rgb,ir,rgb",
++         "presence check: the colour camera again (" + joined(rig.opens) + ")");
++
++  Rig none;
++  none.enrolled[FaceAuth::FaceSet::Ir].clear();
++  none.seen[kRgbWidth] = {Seen::NoFace};
++  none.light[kRgbWidth] = {5};
++  FaceAuth face2(rgb, kUser, opener(none), seams(none));
++  face2.isAvailable();
++  expect(face2.authenticate(kUser, biopass::AuthConfig{}) == AuthResult::NoFace,
++         "presence check, dark, no IR faces: nothing compared");
++  expect(joined(none.opens) == "rgb", "presence check, no IR faces: the IR camera stays closed");
++}
++
+ int main() {
++  checkLowLightFace();
++  checkLowLightOneFace();
++  checkLowLightNoColourFace();
++  checkLowLightIrFirst();
++  checkLowLightThreshold();
++  checkLowLightPresenceMode();
+   checkTwoFacesFail();
+   checkThresholdPerCamera();
+   checkBothMatch();
+diff --git a/auth/test/low_light/CMakeLists.txt b/auth/test/low_light/CMakeLists.txt
+new file mode 100644
+index 0000000..b12ea2d
+--- /dev/null
++++ b/auth/test/low_light/CMakeLists.txt
+@@ -0,0 +1,14 @@
++set(LOW_LIGHT_TEST low_light_test)
++
++# low_light.cc is a plain decision, built in directly so the test doesn't pull
++# libcamera in through biopass_face_common.
++add_executable(${LOW_LIGHT_TEST}
++    main.cpp
++    ${CMAKE_SOURCE_DIR}/face/common/low_light.cc
++)
++
++target_include_directories(${LOW_LIGHT_TEST} PRIVATE
++    ${CMAKE_SOURCE_DIR}/face/common
++)
++
++add_test(NAME low_light COMMAND ${LOW_LIGHT_TEST})
+diff --git a/auth/test/low_light/main.cpp b/auth/test/low_light/main.cpp
+new file mode 100644
+index 0000000..ff1ca5a
+--- /dev/null
++++ b/auth/test/low_light/main.cpp
+@@ -0,0 +1,85 @@
++// Checks face/common/low_light.h: when the colour picture is too dark for the
++// colour checks, the IR camera decides alone, at a threshold never below its
++// own. Exits non-zero on any failure.
++
++#include <cstdio>
++#include <limits>
++#include <optional>
++
++#include "low_light.h"
++
++namespace {
++
++using biopass::chooseLightPath;
++using biopass::isLowLight;
++using biopass::LightPath;
++using biopass::lowLightThreshold;
++
++int g_failures = 0;
++
++void expect(bool cond, const char* what) {
++  std::printf("[%s] %s\n", cond ? "PASS" : "FAIL", what);
++  if (!cond) {
++    g_failures++;
++  }
++}
++
++constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
++constexpr float kLimit = 70.0f;
++
++}  // namespace
++
++int main() {
++  // Measured on the laptop's colour camera (the face box's mean luma): an
++  // evening room 47-48, daylight 86.
++  expect(isLowLight(48.0, kLimit), "luma 48 against 70: low light");
++  expect(!isLowLight(86.0, kLimit), "luma 86 against 70: enough light");
++  expect(!isLowLight(70.0, kLimit), "luma at the limit: enough light (below it is low)");
++  expect(isLowLight(69.9, kLimit), "just below the limit: low light");
++  expect(!isLowLight(0.0, 0.0f), "limit 0: the mode is off, even for a black picture");
++  expect(!isLowLight(10.0, -1.0f), "a negative limit: off");
++  expect(!isLowLight(kNaN, kLimit), "a NaN luma: never low");
++  expect(!isLowLight(10.0, std::numeric_limits<float>::quiet_NaN()), "a NaN limit: never low");
++  expect(isLowLight(254.0, 255.0f), "limit 255: nearly every picture is low");
++
++  // A face in front of the colour camera.
++  expect(chooseLightPath(true, 86.0, kLimit, true) == LightPath::Colour,
++         "a face in enough light: the colour checks");
++  expect(chooseLightPath(true, 48.0, kLimit, true) == LightPath::IrSameFace,
++         "a face in low light: the IR camera decides, on the same face");
++  expect(chooseLightPath(true, 48.0, kLimit, false) == LightPath::Colour,
++         "a face in low light, no IR faces: the colour checks (nothing else can decide)");
++  expect(chooseLightPath(true, 48.0, 0.0f, true) == LightPath::Colour,
++         "a face in low light, mode off: the colour checks");
++
++  // No face at all in the colour picture: its whole luma.
++  expect(chooseLightPath(false, 30.0, kLimit, true) == LightPath::IrAlone,
++         "no face, a dark picture: the IR camera decides alone");
++  expect(chooseLightPath(false, 2.0, kLimit, true) == LightPath::IrAlone,
++         "no face, pitch black or the lens covered: the IR camera decides alone");
++  expect(chooseLightPath(false, 100.0, kLimit, true) == LightPath::NoFace,
++         "no face in a bright picture: nobody there, nothing to compare");
++  expect(chooseLightPath(false, 30.0, kLimit, false) == LightPath::NoFace,
++         "no face, dark, no IR faces: nothing to compare");
++  expect(chooseLightPath(false, 30.0, 0.0f, true) == LightPath::NoFace,
++         "no face, dark, mode off: nothing to compare (as without the mode)");
++
++  // A face too small or cut off (or no picture): no luma, never the IR camera.
++  expect(chooseLightPath(false, std::nullopt, kLimit, true) == LightPath::NoFace,
++         "a face too small or cut off: nothing to compare, also in the dark");
++  expect(chooseLightPath(true, kNaN, kLimit, true) == LightPath::Colour,
++         "a face with a NaN luma: the colour checks");
++
++  // The IR camera's threshold when it decides alone.
++  expect(lowLightThreshold(0.7f, 0.6f) == 0.7f, "low-light 0.70 above the IR 0.60: 0.70");
++  expect(lowLightThreshold(0.55f, 0.6f) == 0.6f,
++         "low-light 0.55 below the IR 0.60: the IR camera's own (never looser)");
++  expect(lowLightThreshold(0.7f, 0.75f) == 0.75f, "an IR threshold above it: the IR one");
++
++  if (g_failures != 0) {
++    std::printf("%d FAILED\n", g_failures);
++    return 1;
++  }
++  std::printf("ALL PASS\n");
++  return 0;
++}
+-- 
+2.43.0
+
