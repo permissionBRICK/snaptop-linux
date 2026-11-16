@@ -2,33 +2,49 @@
 
 ## Current figures
 
-SteamOS 0.5.7 (build 20261103.6153824), kernel 7.3.0-s15+ with patches `0001`-`0035` ([kernel.md](kernel.md)),
-battery 56.5 Wh full (70.0 Wh design). On battery, Wi-Fi connected, nothing on USB, keyboard light off, Desktop Mode
-idle on the plain desktop, no Steam client; `s15-powerlog`, 3.5-4.5 min per step, the first 40 s dropped.
+SteamOS 0.5.7 (build 20261103.6153824), kernel 7.3.0-s15+ with patches `0001`-`0040` ([kernel.md](kernel.md)),
+battery 56.5 Wh full (70.0 Wh design). On battery, Wi-Fi connected (2.4 GHz, power save on), Bluetooth on, nothing on
+USB, keyboard light off, Desktop Mode idle on the plain desktop, no Steam client, after the first sleep of the boot
+(see below). Measured with the system power meter (`s15-adsp-power`, [Measuring](#measuring)): 60 s per step, the
+median of the 1 s records from the 10th second on, two runs (2026-11-17). DDR ran at 547 MHz in every step.
 
 | State | Power | Runtime from full | Measured |
 |---|---|---|---|
-| Screen on, 25 % brightness, 60 Hz | 3.98 W (3.94-4.06 over 6 runs) | 14 h | 2026-11-15 |
-| Screen on, 25 %, 120 Hz (the rate on AC) | 4.30 W | 13 h | 2026-11-15 |
-| Screen on, 1 % / 5 %, 60 Hz | 3.71 / 3.75 W | 15 h | 2026-11-15 |
-| Screen on, windows open, 25 %, 60 Hz | 5.1 W | 11 h | 2026-11-05 |
-| Screen off (DPMS), idle | 1.34 W | 42 h | 2026-11-15 |
+| Screen on, 1 % brightness, 60 Hz | 4.00 W | 14 h | 2026-11-17 |
+| Screen on, 5 %, 60 Hz | 4.06 W | 14 h | 2026-11-17 |
+| Screen on, 25 %, 60 Hz | 4.30 W (4.29-4.35 over 4 steps) | 13 h | 2026-11-17 |
+| Screen on, 50 %, 60 Hz | 4.45 W | 12.7 h | 2026-11-17 |
+| Screen on, 100 %, 60 Hz | 4.97 W | 11.4 h | 2026-11-17 |
+| Screen on, 25 %, 120 Hz (the rate on AC) | 4.65 W (4.59-4.71) | 12 h | 2026-11-17 |
+| A black full-screen window (any brightness on the OLED) | 3.80 W (3.77-3.88) | 15 h | 2026-11-17 |
+| Screen on, windows open, 25 %, 60 Hz | 5.1 W (battery gauge) | 11 h | 2026-11-05 |
+| Screen off (DPMS), idle | 1.42 W (1.41-1.45) | 40 h | 2026-11-17 |
 | Standby (`deep`, CX collapse) | 0.15-0.19 W | 12-16 days | nights 2026-11-08 to 11-14, `/var/log/s15-sleep.log` |
 | Hibernated | 0 W (off) | | back in 17.5 s from the power button |
 
-Cross-check with the system power meter (`s15-adsp-power`, 2026-11-16, 2 min per step): plain desktop at 20 %
-brightness 4.10 W, a black full-screen window 3.7 W, display off 1.46 W.
+The battery gauge (`s15-powerlog`, 3.5-4 min steps, 2026-11-15) read about 0.3 W less with the screen on (1 %
+3.71 W, 25 % 3.98 W, 120 Hz 4.30 W, screen off 1.34 W); the meter measures the whole system at its input, and
+its 1 s records show bursts the gauge averages away. Single steps can still catch background work: once a 25 % step
+jumped from 4.4 to 6.2 W for its last 37 s, starting with a change event on the backlight device (a brightness
+change from outside the test; most likely the desktop rendering for a while), so the table uses medians and
+repeated steps.
+
+Before the first sleep of a boot the figures are higher: the bootloader's maximum votes stay in force until then
+(DDR at 4224 MHz), 5.29 W at the login screen against 4.52 W once they are released
+([known issues](known-issues.md)). After a restore from hibernation, until patches `0036`-`0040`, DDR stayed at
+3686 MHz and standby lost CX collapse
+([kernel](kernel.md#our-patches-restore-from-hibernation-0016-0020-0022-0024-0026-0040)).
 
 From the evening of 2026-11-14 to a reboot on 11-15 the sleep log showed no CX collapse (`cxsd 0%`) and 0.22 W over
 the night: a prototype driver of the wake-timer tests (`rtc-qcom-tad`, loaded by hand, not part of the install) was
 loaded during those sleeps. Without it CX collapse is back (99 % and 98 % of the first sleeps after the reboot).
 
-Where it goes (2026-11-15 unless noted):
+Where it goes (2026-11-15 unless noted; costs from the meter series of 2026-11-17 above):
 
 | Part | Cost |
 |---|---|
-| Screen on at all, 1 % brightness | +2.4 W over screen off: panel electronics, the eDP link (HBR3, 4 lanes) and the display engine reading the frame from memory 60 times a second (1.4-1.6 GB/s requested; the frame is 10-bit and UBWC-compressed). KWin does not repaint at idle (1 frame and 2 vblank events in 20 s). Panel Self Refresh could remove part of it, but the panel does not enter PSR, and Windows does not use it either ([below](#compared-with-windows-same-meter)). |
-| Brightness 1 % → 25 % | +0.27 W (1 % → 100 %: about +1 W, 2026-11-01) |
+| Screen on at all, 1 % brightness | +2.6 W over screen off: panel electronics, the eDP link (HBR3, 4 lanes) and the display engine reading the frame from memory 60 times a second (1.4-1.6 GB/s requested; the frame is 10-bit and UBWC-compressed). KWin does not repaint at idle (1 frame and 2 vblank events in 20 s). Panel Self Refresh could remove part of it, but the panel does not enter PSR, and Windows does not use it either ([below](#compared-with-windows-same-meter)). |
+| Brightness 1 % → 25 % | +0.30 W (1 % → 100 %: +0.97 W) |
 | 120 Hz instead of 60 Hz | +0.35 W at 25 % |
 | Keyboard light, level 1, white | +1.9 W with the screen on, +0.8 W with it off (2026-11-05); `s15-kbd-idle` turns it off after 30 s without input on battery ([steamos.md](steamos.md#keyboard-colour)) |
 | Screen content (OLED): windows open instead of the plain desktop | about +1 W (2026-11-05) |
