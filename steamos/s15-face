@@ -33,10 +33,12 @@
 #   s15-face lockout reset-defaults     (root) all back to the defaults
 #   s15-face camera ir|rgb|both [user]  set the cameras in the user's Biopass configuration (Biopass app closed;
 #                                       without one yet, Biopass's defaults are written first), with the minimum
-#                                       face size and threshold below where the settings have none or a looser one:
+#                                       face size and threshold below where the settings have none or a looser one,
+#                                       and the low-light settings where they have none:
 #                                       ir: the IR camera recognises, in the dark too (default);
 #                                       rgb: the colour camera recognises, the IR camera checks presence;
-#                                       both: the colour and the IR camera each recognise, in one moment.
+#                                       both: the colour and the IR camera each recognise, in one moment;
+#                                       in low light (rgb with IR faces, both) the IR camera decides alone.
 #                                       Enrolled faces stay with their camera: faces/ holds the main camera's (what
 #                                       the app lists), faces-ir/ the IR camera's in rgb and both, faces-rgb/ the
 #                                       colour camera's in ir; switching moves them
@@ -49,7 +51,7 @@
 #                                       in ir: it is trained on colour images). Use this, not the app's settings
 #                                       page: saving that page drops the settings above
 #   s15-face check                      (as yourself) one face scan as the lock screen runs it, showing each step
-#                                       (face size, match scores); not counted, display and lid not checked
+#                                       (light, face size, match scores); not counted, display and lid not checked
 #   s15-face snapshot ir|rgb [file]     one frame as Biopass sees it (default /tmp/s15-face-<camera>.png)
 #   s15-face cameras                    the cameras as Biopass's libcamera lists them
 set -u
@@ -66,6 +68,12 @@ HELPER=/usr/bin/biopass-helper
 # threshold (cosine similarity; Biopass's default 0.5).
 MIN_FACE=0.2
 MIN_THRESHOLD=0.6
+# Low light (Biopass patch 0017), written by `camera` where the settings have none: below this mean luma (0-255) of
+# the colour picture's face (the whole picture without a face) the IR camera decides alone, at this threshold (never
+# below its own). Measured on the laptop: an evening room 47-48 (the anti-spoofing model rejected the real face),
+# daylight 86. 0 turns it off.
+LOW_LIGHT_LUMA=70
+LOW_LIGHT_THRESHOLD=0.7
 log() { logger -t s15-face -p auth.notice -- "$*" 2>/dev/null || true; }
 die() { echo "s15-face: $*" >&2; exit 1; }
 valid_user() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
@@ -125,6 +133,30 @@ if a.get("ir_recognition") is True and cam != ir:
     pair = (f", one face on both cameras: at most {a.get('pair_max_offset', 0.5)} face sizes apart, "
             f"sizes at most {a.get('pair_max_size_ratio', 1.5)} apart")
 print(f"  AI anti-spoofing {spoof}, {f.get('retries', 5)} attempts{pair}")
+# Low light: the helper's defaults where the settings have none (70, 0.7); a value out of range turns face off
+def num(v, top):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= top
+luma, ll_t = a.get("low_light_luma", 70), r.get("ir_low_light_threshold", 0.7)
+ir_own = r.get("ir_threshold") if r.get("ir_threshold") is not None else r.get("threshold", 0.5)
+src = "" if "low_light_luma" in a else " (default)"
+t_src = "" if "ir_low_light_threshold" in r else " (default)"
+if not num(ll_t, 1):
+    t_src = " (invalid: face refused)"
+elif num(ir_own, 1) and ir_own > ll_t:
+    t_src += f", the IR camera's {ir_own} applies (never below it)"
+if not ir or cam == ir:
+    use = "not used in this mode"
+elif a.get("ir_recognition") is True:
+    use = "used"
+else:
+    use = "used with faces in faces-ir/"
+if not num(luma, 255):
+    state = f"limit {luma!r} (invalid: face refused)"
+elif luma == 0:
+    state = "off (low_light_luma 0)"
+else:
+    state = f"below a colour face luma of {luma}{src} the IR camera decides alone"
+print(f"  low light: {state}, IR threshold then {ll_t}{t_src}; {use}")
 EOF
   else
     echo "Biopass: not set up for $u yet (start the Biopass app once)"
@@ -155,9 +187,9 @@ camera() {
   local run=()
   [ "$(id -u)" = 0 ] && [ "$u" != root ] && run=(runuser -u "$u" --)
   "${run[@]}" python3 -I - "$home/$CONF" "$home/$DATA" "$mode" "$ir" "$rgb" "$MIN_FACE" "$MIN_THRESHOLD" \
-    <<'EOF' || die "configuration not changed"
+    "$LOW_LIGHT_LUMA" "$LOW_LIGHT_THRESHOLD" <<'EOF' || die "configuration not changed"
 import os, sys, yaml
-path, data, mode, ir, rgb, min_face, min_threshold = sys.argv[1:]
+path, data, mode, ir, rgb, min_face, min_threshold, low_light_luma, low_light_threshold = sys.argv[1:]
 # The app writes config.yaml only when its settings are saved. Without one: Biopass 1.5.1's defaults
 # (auth/test/config/defaults.yaml), which the helper reads as its own.
 DEFAULTS = {
@@ -215,6 +247,16 @@ if not (number(rec.get("threshold")) and rec["threshold"] >= float(min_threshold
 if rec.get("ir_threshold") is not None and not (number(rec["ir_threshold"]) and
                                                 rec["ir_threshold"] >= float(min_threshold)):
     rec["ir_threshold"] = float(min_threshold)
+# low light: written where missing (or not a valid value; the helper would refuse face), a value of the user's stays
+# (0: off); the IR camera's low-light threshold raised where looser than the minimum, as the thresholds above
+luma = anti.get("low_light_luma")
+if not (number(luma) and 0 <= luma <= 255):
+    anti["low_light_luma"] = int(low_light_luma)
+llt = rec.get("ir_low_light_threshold")
+if not (number(llt) and llt <= 1):
+    rec["ir_low_light_threshold"] = float(low_light_threshold)
+elif llt < float(min_threshold):
+    rec["ir_low_light_threshold"] = float(min_threshold)
 tmp = path + ".s15-face"
 with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
     yaml.safe_dump(c, f, sort_keys=False)
@@ -254,6 +296,11 @@ ir_t = rec.get("ir_threshold")
 print(f"mode: {mode}\ncamera: {face['camera']}\nIR camera: {ir}\nminimum face height: "
       f"{det['min_face_height']} of the picture's height\nrecognition threshold: colour {rec['threshold']}, IR "
       f"{ir_t if ir_t is not None else rec['threshold']}")
+if mode != "ir" and anti["low_light_luma"] == 0:
+    print("low light: off (low_light_luma 0)")
+elif mode != "ir":
+    print(f"low light: below a colour face luma of {anti['low_light_luma']} the IR camera decides alone, threshold "
+          f"{rec['ir_low_light_threshold']}" + ("" if mode == "both" else " (with faces in faces-ir/)"))
 n_main, n_ir = len(images(faces)), len(images(faces_ir))
 if mode == "ir":
     print(f"enrolled: {n_main} IR faces (faces/)")
@@ -422,7 +469,7 @@ check() {
   "$RUN" state "$u" | sed -n 's/^  face now: refused: /Note: the lock screen refuses face now: /p'
   echo "Scanning (look at the screen; the camera light comes on)..."
   out=$("$HELPER" auth --username "$u" --verbose 2>&1 >/dev/null); rc=$?
-  grep -E 'FaceAuth: (Face on|No face|Recognition (PASSED|FAILED)|The .* frame came|Recognised on both|One face on both|The faces on the colour|Could not|Both cameras must|No face enrolled|Anti-spoofing failed|AI anti-spoofing (detected spoof|check passed)|IR presence check (PASSED|FAILED))|camera appears covered' \
+  grep -E 'FaceAuth: (Face on|No face|Recognition (PASSED|FAILED)|The .* frame came|Recognised on both|One face on both|The faces on the colour|Could not|Both cameras must|No face enrolled|Anti-spoofing failed|AI anti-spoofing (detected spoof|check passed)|IR presence check (PASSED|FAILED)|Low light on|Enough light on|Recognised on the IR camera alone)|camera appears covered' \
     <<< "$out" | sed -E "s/^\[[0-9-]+ ([0-9:.]+)\] \[[a-z]+\] \[[a-z]+\] (FaceAuth: )?/\1 /; s/ \(NOTE:.*\)\$//;
                          s#face='[^']*/(faces[^/]*/[^']*)'#\1#"
   case $rc in
@@ -467,5 +514,5 @@ case "${1:-}" in
   check) check ;;
   snapshot) snapshot "${2:-}" "${3:-}" ;;
   cameras) cameras ;;
-  *) sed -n '2,51p' "$0"; exit 2 ;;
+  *) sed -n '2,/^set -u$/{/^set -u$/!p}' "$0"; exit 2 ;;
 esac
