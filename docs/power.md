@@ -27,7 +27,7 @@ Where it goes (2026-11-15 unless noted):
 
 | Part | Cost |
 |---|---|
-| Screen on at all, 1 % brightness | +2.4 W over screen off: panel electronics, the eDP link (HBR3, 4 lanes) and the display engine reading the frame from memory 60 times a second (1.4-1.6 GB/s requested; the frame is 10-bit and UBWC-compressed). KWin does not repaint at idle (1 frame and 2 vblank events in 20 s). Panel Self Refresh would save at most ~0.2 W of it: that is all it saves on Windows ([below](#compared-with-windows-same-meter)). |
+| Screen on at all, 1 % brightness | +2.4 W over screen off: panel electronics, the eDP link (HBR3, 4 lanes) and the display engine reading the frame from memory 60 times a second (1.4-1.6 GB/s requested; the frame is 10-bit and UBWC-compressed). KWin does not repaint at idle (1 frame and 2 vblank events in 20 s). Panel Self Refresh could remove part of it, but the panel does not enter PSR, and Windows does not use it either ([below](#compared-with-windows-same-meter)). |
 | Brightness 1 % → 25 % | +0.27 W (1 % → 100 %: about +1 W, 2026-11-01) |
 | 120 Hz instead of 60 Hz | +0.35 W at 25 % |
 | Keyboard light, level 1, white | +1.9 W with the screen on, +0.8 W with it off (2026-11-05); `s15-kbd-idle` turns it off after 30 s without input on battery ([steamos.md](steamos.md#keyboard-colour)) |
@@ -48,12 +48,12 @@ keyboard light off; black makes the two systems' different brightness scales irr
 | State | Linux | Windows |
 |---|---|---|
 | Black screen, still | 3.7 W | 3.3 W (3.17-3.35) |
-| The pointer moving 60 times a second (every frame new; Windows has to leave PSR for each) | +0.1 W | +0.1-0.2 W |
+| The pointer moving 60 times a second (every frame new) | +0.1 W | +0.1-0.2 W |
 | An 8x8 square redrawn about 64 times a second (Windows) | | +0.25 W |
 | Display off, awake | 1.46 W | not possible: Windows turns the display off only into Modern Standby |
 
-Windows uses Panel Self Refresh on this panel, and it saves at most ~0.2 W there; the rest of the ~0.4 W gap at
-screen-on idle is elsewhere. Older figures without the meter: Windows about 0.5 W screen-off idle and 0.23 W in
+Windows does not use Panel Self Refresh on this panel (2026-11-16, [below](#what-is-in-place)), which fits the
+pointer costing about the same on both systems: the ~0.4 W gap at screen-on idle is elsewhere. Older figures without the meter: Windows about 0.5 W screen-off idle and 0.23 W in
 Modern Standby ([x1e-sleep](https://github.com/justririll/x1e-sleep) measurements on the same model).
 
 ## What is in place
@@ -226,22 +226,33 @@ Tools in `power/`, installed by `steamos-s15-setup.sh` (run as root):
   1/s, power unchanged.
 - HDMI hot-plug through gpio126 (`hpd-gpios`) lets the HDMI DP controller and MDSS runtime-suspend, but screen-off
   idle stayed at ~1.53 W; not adopted (HDMI hot-plug would be untested).
-- Panel Self Refresh (`msm.psr_enabled=1`): the screen goes black. The panel (Samsung ATNA56AC03) offers PSR1 only,
-  needs link training on PSR exit (DPCD `0x071` = `0x3a`), and has no Panel Replay or ALPM. The eDP controller is
-  newer (v1.4.1, `0x10040001`) than the sc7280 msm's PSR code was written for, and two things on the source side are
-  wrong at reset (2026-11-15): `PSR_CONFIG` (link + 0x100) and `PSR_CMD` (link + 0x110) hold garbage (`0x67438600`)
-  that msm's single-bit updates keep, and the PSR VSC SDP header (link + 0x170/0x174) defaults to the 3D-stereo
-  revision 1 instead of revision 2 with 8 data bytes (`0x16070000`/`0x5d08ce02`). With exact values written there the
-  source side works: PSR entry raises its update and capture interrupts and drops the link, PSR exit raises its exit
-  interrupt and the picture comes back without link training. But the panel never enters PSR: its PSR status
-  (`0x2008`) and "last received PSR SDP" (`0x200A`) stay 0 for sink settings `0x170` = 1, 3, 9 and `0x0B`, at 60 and
-  120 Hz, and the screen is black meanwhile (checked through the camera in a mirror). A PSR SDP built by hand in the
-  generic packet slot (GENERIC0) changed nothing, and a colour-format (VSC) SDP sent the same way blanked the panel
-  although it supports it (`0x2210` = `0x08`): most likely this controller does not put SDPs on the link the way
-  msm programs them. ASUS's Windows driver does PSR (it counts fast, full and no link training on exit and has
-  `EDPPsrTrainingPattern`, `EDPPsrTrainingDuration`, `EDPMaxPsrVersion` settings); its register sequence could not be
-  read from the binary. Measured on Windows with the same meter (2026-11-15/16), PSR saves at most ~0.2 W there
-  ([Compared with Windows](#compared-with-windows-same-meter)): parked for good.
+- Panel Self Refresh (`msm.psr_enabled=1`): the screen goes black, and PSR is parked for good. The panel (Samsung
+  ATNA56AC03) offers PSR1 only, needs link training on PSR exit (DPCD `0x071` = `0x3a`), and has no Panel Replay or
+  ALPM. The eDP controller is newer (v1.4.1, `0x10040001`) than the sc7280 controller msm's PSR code was written for.
+  - Source side: `PSR_CONFIG` (link + 0x100) and `PSR_CMD` (link + 0x110) hold garbage at reset (`0x67438600`) that
+    msm's single-bit updates keep. The PSR VSC SDP header (HB2/HB3) is at link + 0x150, not in the colorimetry/stereo
+    VSC slot at link + 0x170/0x174, and its reset value `0x5dce0802` has a header and a parity byte swapped (the
+    layout is header, parity, header, parity: `0x5d08ce02` for revision 2 with 8 bytes). With exact values the
+    source side works: PSR entry raises its update and capture interrupts and turns the link off, PSR exit raises its
+    exit interrupt and the picture comes back.
+  - The panel never enters PSR: its PSR status (`0x2008`) and "last received PSR SDP" (`0x200A`) stay 0 with no error
+    (`0x2006`/`0x2007`), and the screen is black while the link is off. That holds for sink settings `0x170` = 1, 3,
+    9 and `0x0B`, at 60 and 120 Hz, with a PSR SDP built by hand in the generic packet slot (GENERIC0), and with
+    Windows' own sequence (2026-11-16, from ASUS's Windows display driver `qcdxkm8380.sys`):
+    - configure: DPCD `0x170` = 0, `PSR_CMD` = 0, `PSR_CONFIG` = (old & ~0x1f) | 1, link + 0x114 = exit training
+      (pattern code 1, 2.5 ms in 19.2 MHz ticks), link + 0x48 |= `0x1000`, `SDP_CFG2` |= `0x07000000`,
+      `CONFIGURATION_CTRL` |= `SEND_VSC`, then DPCD `0x170` = 1;
+    - enter: acknowledge the PSR interrupts, `PSR_CMD` = 1, poll for the update interrupt;
+    - exit: a training pattern 1 burst through `STATE_CTRL`, `PSR_CMD` = 2, poll for the exit interrupt.
+
+    During PSR the panel reads DPCD `0x102` (TRAINING_PATTERN_SET) = `0x23`, written by the controller on entry
+    whether exit training is set or not.
+  - Windows does not use PSR on this laptop either. Its driver configures PSR after every mode change (the steps
+    above), but the idle path that would enter it is gated by a per-display flag that nothing in the driver sets.
+    Only a test command enters it. The deepest level would turn the main link, the link clocks and the eDP PHY off.
+    ASUS's panel config (ACPI, "Panel_Generic_Amoled") has no PSR settings. This comes from static analysis
+    (medium confidence), and matches the measurements: the pointer costs about the same on both systems
+    ([Compared with Windows](#compared-with-windows-same-meter)).
 - Display engine clock at 325 MHz instead of 575 MHz (the wide plane split across both mixers; the multimedia rail one
   level lower, no underruns in 40 min at 60 and 120 Hz): +0.01 / -0.04 W, within the noise. With the link at HBR2
   as well (the rail two levels lower) about -0.05 W, but HBR2 x4 carries 17.19 Gbit/s against the 17.13 the 10-bit
