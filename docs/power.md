@@ -16,6 +16,9 @@ idle on the plain desktop, no Steam client; `s15-powerlog`, 3.5-4.5 min per step
 | Standby (`deep`, CX collapse) | 0.15-0.19 W | 12-16 days | nights 2026-11-08 to 11-14, `/var/log/s15-sleep.log` |
 | Hibernated | 0 W (off) | | back in 17.5 s from the power button |
 
+Cross-check with the system power meter (`s15-adsp-power`, 2026-11-16, 2 min per step): plain desktop at 20 %
+brightness 4.10 W, a black full-screen window 3.7 W, display off 1.46 W.
+
 From the evening of 2026-11-14 to a reboot on 11-15 the sleep log showed no CX collapse (`cxsd 0%`) and 0.22 W over
 the night: a prototype driver of the wake-timer tests (`rtc-qcom-tad`, loaded by hand, not part of the install) was
 loaded during those sleeps. Without it CX collapse is back (99 % and 98 % of the first sleeps after the reboot).
@@ -24,7 +27,7 @@ Where it goes (2026-11-15 unless noted):
 
 | Part | Cost |
 |---|---|
-| Screen on at all, 1 % brightness | +2.4 W over screen off: panel electronics, the eDP link (HBR3, 4 lanes) and the display engine reading the frame from memory 60 times a second (1.4-1.6 GB/s requested; the frame is 10-bit and UBWC-compressed). Only Panel Self Refresh would remove it ([below](#tried-parked-or-not-adopted)). KWin does not repaint at idle (1 frame and 2 vblank events in 20 s). |
+| Screen on at all, 1 % brightness | +2.4 W over screen off: panel electronics, the eDP link (HBR3, 4 lanes) and the display engine reading the frame from memory 60 times a second (1.4-1.6 GB/s requested; the frame is 10-bit and UBWC-compressed). KWin does not repaint at idle (1 frame and 2 vblank events in 20 s). Panel Self Refresh would save at most ~0.2 W of it: that is all it saves on Windows ([below](#compared-with-windows-same-meter)). |
 | Brightness 1 % → 25 % | +0.27 W (1 % → 100 %: about +1 W, 2026-11-01) |
 | 120 Hz instead of 60 Hz | +0.35 W at 25 % |
 | Keyboard light, level 1, white | +1.9 W with the screen on, +0.8 W with it off (2026-11-05); `s15-kbd-idle` turns it off after 30 s without input on battery ([steamos.md](steamos.md#keyboard-colour)) |
@@ -36,8 +39,22 @@ measurable gain), rcu_sched 11, PowerDevil's `display_recheck` thread 8.5 (libdd
 monitors; `POWERDEVIL_NO_DDCUTIL=1` would stop it, and external monitors' brightness control with it), dbus-broker
 4, KWin 3. CPU load 0.1-0.2 %, the SoC-wide idle state 71-76 % of the time (34 % with the Steam client).
 
-Windows on this laptop for comparison: about 0.5 W screen-off idle, about 0.23 W in Modern Standby
-([x1e-sleep](https://github.com/justririll/x1e-sleep) measurements on the same model).
+### Compared with Windows (same meter)
+
+Windows' "Energy Meter" counter `SYS` reads the same ADSP meter as `s15-adsp-power` ([Measuring](#measuring)), so
+both systems can be compared directly (2026-11-15/16: on battery, 60 Hz, a black full-screen window, no input,
+keyboard light off; black makes the two systems' different brightness scales irrelevant on the OLED):
+
+| State | Linux | Windows |
+|---|---|---|
+| Black screen, still | 3.7 W | 3.3 W (3.17-3.35) |
+| The pointer moving 60 times a second (every frame new; Windows has to leave PSR for each) | +0.1 W | +0.1-0.2 W |
+| An 8x8 square redrawn about 64 times a second (Windows) | | +0.25 W |
+| Display off, awake | 1.46 W | not possible: Windows turns the display off only into Modern Standby |
+
+Windows uses Panel Self Refresh on this panel, and it saves at most ~0.2 W there; the rest of the ~0.4 W gap at
+screen-on idle is elsewhere. Older figures without the meter: Windows about 0.5 W screen-off idle and 0.23 W in
+Modern Standby ([x1e-sleep](https://github.com/justririll/x1e-sleep) measurements on the same model).
 
 ## What is in place
 
@@ -166,20 +183,27 @@ tray's hidden items, so the desktop setup sets it to "Always shown" ([steamos.md
 
 ## Measuring
 
-Tools in `power/` (install on the laptop as root):
+Tools in `power/`, installed by `steamos-s15-setup.sh` (run as root):
 
 | Tool | Purpose |
 |---|---|
-| `s15-powerlog.py` → `/usr/local/bin/s15-powerlog` | CSV every N s: battery power, energy, brightness, screen DPMS, CPU load and clocks, GPU clock, share of time the SoC-wide power domain spent idle, Wi-Fi state, USB device count. Run detached: `systemd-run --unit=s15-powerlog --collect -p Nice=10 /usr/local/bin/s15-powerlog --interval 5 --duration 14400` |
-| `s15-powerreport.py` | Averages per (screen, brightness, USB devices) segment of a CSV, with the runtime that would give on a full battery. |
+| `s15-adsp-power.py` → `/usr/local/bin/s15-adsp-power` | The system power meter: the ADSP's power-limits firmware writes the system's power once per second (and every 100 ms) into firmware-reserved memory at `0x81F30000`, where Windows' Energy Meter reads it too. Read-only through `/dev/mem` (the range is `reserved` in `/proc/iomem`). `s15-adsp-power` prints it every second, `--duration 120 -q` only the average over 120 s, `--all` the other channels (USB-C in/out; CPU and GPU read 0 or close to it under Linux). |
+| `s15-powerlog.py` → `/usr/local/bin/s15-powerlog` | CSV every N s: battery power, energy, brightness, screen DPMS, CPU load and clocks, GPU clock, share of time the SoC-wide power domain spent idle, Wi-Fi state, USB device count, and the meter's average over the interval (`sys_w`). Run detached: `systemd-run --unit=s15-powerlog --collect -p Nice=10 /usr/local/bin/s15-powerlog --interval 5 --duration 14400` |
+| `s15-powerreport.py` → `/usr/local/bin/s15-powerreport` | Averages per (screen, brightness, USB devices) segment of a CSV, with the runtime that would give on a full battery (from the meter when the CSV has it). |
 | `s15-sleep-hook` → `/usr/lib/systemd/system-sleep/` | Logs battery energy before/after every suspend to `/var/log/s15-sleep.log`, with average drain, CX collapse/AOSD/DDR residency (`qcom_stats`) during the sleep and the wake IRQ. |
 
 - Measure on battery: `qcom-battmgr-ac/online` stays 0 when charging over USB-C PD, so check that the battery
   `status` is Discharging. Nothing on USB (a USB Ethernet adapter alone draws a measurable amount), Wi-Fi connected.
-- Drop the first 30-45 s after each change; 4-5 min per step is enough at idle.
-- The figures come from the battery gauge (`energy_now` in 10 mWh steps, model-based, sometimes corrected after a long
-  rest), not from a power meter. For standby compare only sleeps of hours at similar charge levels; short sleeps
-  and the first sleep after charging show nonsense (negative or several watts).
+- Drop the first 30-45 s after each change; with the meter 2 min per step is enough at idle, with the gauge 4-5 min.
+- The meter (`sys_w`, `s15-adsp-power`) measures where the charger feeds the system: on battery it agrees with the
+  gauge's energy within ~5 %, while charging it includes the charging path (7-29 W), so it is only usable on
+  battery. The gauge's `power_now` is smoothed and lags by tens of seconds; `energy_now` moves in 10 mWh steps,
+  model-based and sometimes corrected after a long rest. The figures above before 2026-11-16 come from the gauge.
+  For standby compare only sleeps of hours at similar charge levels (the meter does not run in standby); short
+  sleeps and the first sleep after charging show nonsense (negative or several watts).
+- Keep the session awake and unlocked through a test (`kde-inhibit --power --screenSaver <command>`): Plasma locks
+  the screen 5 min after the last input once an inhibit ends, and a locked screen is a different state (the lock
+  screen redraws on input). KDE still dims the backlight under the inhibit; brightness changes themselves cost nothing.
 
 ## Milestones
 
@@ -216,7 +240,8 @@ Tools in `power/` (install on the laptop as root):
   although it supports it (`0x2210` = `0x08`): most likely this controller does not put SDPs on the link the way
   msm programs them. ASUS's Windows driver does PSR (it counts fast, full and no link training on exit and has
   `EDPPsrTrainingPattern`, `EDPPsrTrainingDuration`, `EDPMaxPsrVersion` settings); its register sequence could not be
-  read from the binary. Parked.
+  read from the binary. Measured on Windows with the same meter (2026-11-15/16), PSR saves at most ~0.2 W there
+  ([Compared with Windows](#compared-with-windows-same-meter)): parked for good.
 - Display engine clock at 325 MHz instead of 575 MHz (the wide plane split across both mixers; the multimedia rail one
   level lower, no underruns in 40 min at 60 and 120 Hz): +0.01 / -0.04 W, within the noise. With the link at HBR2
   as well (the rail two levels lower) about -0.05 W, but HBR2 x4 carries 17.19 Gbit/s against the 17.13 the 10-bit

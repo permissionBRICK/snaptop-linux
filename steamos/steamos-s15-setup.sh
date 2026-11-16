@@ -248,6 +248,10 @@ printf '[Unit]\nDescription=Lid watchdog every minute\n[Timer]\nOnBootSec=2min\n
 install -d "$R/etc/systemd/system/timers.target.wants"
 ln -sfn /etc/systemd/system/s15-lid-watchdog.timer "$R/etc/systemd/system/timers.target.wants/s15-lid-watchdog.timer"
 install -D -m0755 "$HERE/../power/s15-sleep-hook" "$R/usr/lib/systemd/system-sleep/s15-sleep-hook"
+# Measuring tools (docs/power.md, "Measuring"): the ADSP's system power meter, the CSV logger and its report
+install -D -m0755 "$HERE/../power/s15-adsp-power.py" "$R/usr/local/bin/s15-adsp-power"
+install -D -m0755 "$HERE/../power/s15-powerlog.py" "$R/usr/local/bin/s15-powerlog"
+install -D -m0755 "$HERE/../power/s15-powerreport.py" "$R/usr/local/bin/s15-powerreport"
 # USB controllers (docs/power.md, "USB runtime PM"): runtime PM while awake where a plug-in still wakes them
 # (s15-usb-pm: USB-C ports without a Type-C partner; USB-A with kernel patch 0021), all of them around a suspend.
 # Replaces the old udev rule that kept them runtime-suspended all the time: a plugged-in device then never woke them.

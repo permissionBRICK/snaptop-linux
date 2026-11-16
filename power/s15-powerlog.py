@@ -4,10 +4,11 @@
 Usage (root): s15-powerlog.py [--interval 5] [--duration 10800] [--out /var/tmp/s15-power.csv]
 Columns: time, ac (barrel/AC input; USB-C PD charging shows as status=Charging with ac=0), status, power_w (battery, positive = discharging), energy_wh, capacity, brightness_pct,
 screen (eDP DPMS), cpu_pct (all cores), freq_mhz (per cpufreq policy), gpu_mhz, sysidle_pct (share of the
-interval the SoC-wide power domain spent in its idle state), wifi (operstate), usb_devs.
+interval the SoC-wide power domain spent in its idle state), wifi (operstate), usb_devs, sys_w (the ADSP's system
+power meter averaged over the interval, s15-adsp-power; empty if it cannot be read).
 Run s15-powerreport.py on the CSV to get averages per state.
 """
-import argparse, glob, os, time
+import argparse, glob, mmap, os, time
 
 B = "/sys/class/power_supply/qcom-battmgr-bat"
 def rd(p, d=""):
@@ -29,6 +30,50 @@ def sysidle_ms():
     except (OSError, IndexError, ValueError):
         return None
 
+class AdspMeter:
+    """Mean of the ADSP's 1 s system power records since the last call (s15-adsp-power has the details)."""
+    PHYS, SIZE, IDX, RECS, N, REC, SYS = 0x81F30000, 0x6000, 0x2938, 0x2940, 128, 0x28, 0x18
+
+    def __init__(self):
+        self.w = None
+        try:
+            fd = os.open("/dev/mem", os.O_RDONLY | os.O_SYNC)
+            try:
+                self.w = memoryview(mmap.mmap(fd, self.SIZE, mmap.MAP_SHARED, mmap.PROT_READ,
+                                              offset=self.PHYS)).cast("I")
+            finally:
+                os.close(fd)
+            self.last = self.w[self.IDX >> 2]
+        except (OSError, ValueError):
+            self.w = None
+
+    def mean_w(self):
+        if self.w is None:
+            return ""
+        idx = self.w[self.IDX >> 2]
+        new = min((idx - self.last) & 0xFFFFFFFF, self.N - 1)
+        self.last = idx
+        vals = []
+        for i in range(idx - new, idx):
+            off = self.RECS + (i % self.N) * self.REC + self.SYS
+            v = self.w[off >> 2]
+            vals.append((v >> 16 if off & 2 else v & 0xFFFF) * 10)
+        return "%.3f" % (sum(vals) / len(vals) / 1000) if vals else ""
+
+
+def iomem_reserved(start, size):
+    """True if [start, start+size) is not System RAM (only then may /dev/mem map it)."""
+    try:
+        for line in open("/proc/iomem"):
+            rng, _, name = line.strip().partition(" : ")
+            a, b = (int(x, 16) for x in rng.split("-"))
+            if a <= start + size - 1 and b >= start and name == "System RAM":
+                return False
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=5)
@@ -42,10 +87,11 @@ def main():
     edp = (glob.glob("/sys/class/drm/card*-eDP-1") or [""])[0]
     pol = sorted(glob.glob("/sys/devices/system/cpu/cpufreq/policy*"))
     gpu = (glob.glob("/sys/class/devfreq/*gpu*") or [""])[0]
+    meter = AdspMeter() if iomem_reserved(AdspMeter.PHYS, AdspMeter.SIZE) else None
     new = not os.path.exists(a.out)
     f = open(a.out, "a", buffering=1)
     if new:
-        f.write("time,ac,status,power_w,energy_wh,capacity,brightness_pct,screen,cpu_pct,freq_mhz,gpu_mhz,sysidle_pct,wifi,usb_devs\n")
+        f.write("time,ac,status,power_w,energy_wh,capacity,brightness_pct,screen,cpu_pct,freq_mhz,gpu_mhz,sysidle_pct,wifi,usb_devs,sys_w\n")
     t_end = time.time() + a.duration
     c0, i0 = cpu_times(); s0 = sysidle_ms(); w0 = time.time()
     while time.time() < t_end:
@@ -67,7 +113,8 @@ def main():
             "%.0f" % (100.0 * int(rd(bl + "/brightness", "0") or 0) / bmax), rd(edp + "/dpms", "?"),
             "%.1f" % cpu, "/".join(str(int(rd(x + "/scaling_cur_freq", "0")) // 1000) for x in pol),
             str(int(rd(gpu + "/cur_freq", "0") or 0) // 1000000) if gpu else "", si,
-            rd(next(iter(glob.glob("/sys/class/net/wlan*/operstate")), "/nonexistent"), "-"), usb])) + "\n")
+            rd(next(iter(glob.glob("/sys/class/net/wlan*/operstate")), "/nonexistent"), "-"), usb,
+            meter.mean_w() if meter else ""])) + "\n")
 
 if __name__ == "__main__":
     main()

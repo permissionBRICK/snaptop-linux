@@ -4,7 +4,7 @@
 Usage: s15-powerreport.py <csv> [--since HH:MM] [--min-samples 6]
 Groups consecutive discharging samples by (screen, brightness, usb device count) and prints the mean power,
 CPU load, SoC-idle share and the estimated runtime on the full battery. The first two samples of each
-segment are dropped (transitions).
+segment are dropped (transitions). sys_W is the ADSP meter's mean (column sys_w, if the CSV has it).
 """
 import csv, sys
 
@@ -28,7 +28,8 @@ def main():
         key = k; cur.append(r)
     if cur:
         segs.append((key, cur))
-    print("%-19s %-8s %-6s %-4s %5s %8s %7s %8s %9s" % ("start", "screen", "bright", "usb", "n", "power_W", "cpu_%", "socidle%", "runtime_h"))
+    print("%-19s %-8s %-6s %-4s %5s %8s %7s %7s %8s %9s" % ("start", "screen", "bright", "usb", "n", "power_W", "sys_W",
+                                                          "cpu_%", "socidle%", "runtime_h"))
     for (scr, br, usb), rs in segs:
         rs = rs[2:]
         if len(rs) < mins:
@@ -36,8 +37,12 @@ def main():
         pw = sum(float(r["power_w"]) for r in rs) / len(rs)
         cpu = sum(float(r["cpu_pct"]) for r in rs) / len(rs)
         si = [float(r["sysidle_pct"]) for r in rs if r["sysidle_pct"]]
-        print("%-19s %-8s %-6s %-4s %5d %8.2f %7.1f %8s %9s" % (rs[0]["time"], scr, br + "%", usb, len(rs), pw, cpu,
-              "%.0f" % (sum(si) / len(si)) if si else "-", "%.1f" % (full / pw) if full and pw > 0 else "-"))
+        sw = [float(r["sys_w"]) for r in rs if r.get("sys_w")]
+        # runtime from the meter when there is one (the gauge's power_now lags by tens of seconds)
+        base = sum(sw) / len(sw) if sw else pw
+        print("%-19s %-8s %-6s %-4s %5d %8.2f %7s %7.1f %8s %9s" % (rs[0]["time"], scr, br + "%", usb, len(rs), pw,
+              "%.2f" % (sum(sw) / len(sw)) if sw else "-", cpu, "%.0f" % (sum(si) / len(si)) if si else "-",
+              "%.1f" % (full / base) if full and base > 0 else "-"))
 
 if __name__ == "__main__":
     main()
