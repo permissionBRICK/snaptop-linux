@@ -135,8 +135,8 @@ does.
 > the camera list (`hm1092` mono, `ov02c10` colour), the lockout through pkexec, a scan, and the app's page with the
 > real settings and faces (on a virtual display). Not yet done by hand in the app: Add 5, Test, saving a mode change,
 > Apply in the lockout card (the password dialog).
-> The [low-light mode](#low-light) (patches 0017-0018, 2026-11-16): its unit tests pass (built off the laptop); not
-> yet built and installed on the laptop, not yet tried by hand in a dark room.
+> The [low-light mode](#low-light) (patches 0017-0018, 2026-11-16): built and installed on the laptop with its
+> unit tests; not yet confirmed by hand in a dark room.
 
 ### Setting it up
 
@@ -442,9 +442,19 @@ between the IR camera's threshold and the low-light threshold counts as a false 
   line and `pam-ok` after a password unlock. Never `/etc/pam.d/sddm-autologin`. `admin on` adds the gate,
   `pam_faillock preauth` and `pam-scan` to `/etc/pam.d/sudo` and an `/etc/pam.d/polkit-1`, and a drop-in that opens
   polkit's sandboxed password helper to the cameras, udev, `/home` (read-only) and the count.
-- Logs: `journalctl -t s15-face` (refusals, false faces, run ends, matches, the wake service's taps), Biopass's own
-  in `~/.local/share/com.ticklab.biopass/logs/` when debug logging is on in the app (it also keeps pictures of
-  failed faces in `debugs/` then); `s15-face check` shows the same steps without it. `tools/test-s15-face-run.py`
+- Logs: `journalctl -t s15-face` (refusals, false faces, run ends, matches, the wake service's taps). Every false
+  face and every match carries the steps of the attempt that decided, as `s15-face check` shows them: the light
+  path, anti-spoofing's score, each camera's recognition score. The runner runs the helper with `--verbose` (log
+  level only, no pictures) and keeps its output in memory, and frames without a face are left out:
+  ```
+  steamos: false face 1 of this run, 1 since the last success (kde-fingerprint): Low light on the colour camera |
+    face luma 48 < 70: the IR camera decides alone (threshold 0.70); One face on both cameras | offset ...;
+    Recognition FAILED on the IR camera | best score=0.6612 threshold=0.700
+  steamos: match: Enough light on the colour camera | face luma 86 (low light below 70); AI anti-spoofing check
+    passed | score=0.012 threshold=0.800; Recognition PASSED on the colour camera | matched faces/... score=0.7712; ...
+  ```
+  Biopass's own logs go to `~/.local/share/com.ticklab.biopass/logs/` when debug logging is on in the app (it
+  also keeps pictures of failed faces in `debugs/` then). `tools/test-s15-face-run.py`
   tests the runner without a camera (a fake helper and display).
 - The build (`face/build.sh`, in a chroot of the running SteamOS under an overlay in `/var/tmp`, nothing installed
   on the system): the archives in `face/sources.sh` are pinned by sha256; the app's frontend packages come from

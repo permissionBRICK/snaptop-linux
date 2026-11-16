@@ -12,6 +12,8 @@ Rules for every run:
   display off a moment after the key: a match from just before must not unlock a laptop the user is leaving).
 - A run ends after run_false_faces (3) false faces: faces seen that did not match, or that anti-spoofing flagged,
   about a second apart. No face does not count.
+- Every false face and every match is logged with the helper's steps (its --verbose lines, as s15-face check shows
+  them: the light, anti-spoofing's score, each camera's recognition score), kept in memory, never on disk.
 - Lockout, as the PIN's (counted since the last success: face, password, PIN, login): after free_false_faces (6)
   false faces face waits first_wait (60 s), after each further one twice as long, up to max_wait (3600 s); after
   off_after (15) it is off until a password or PIN login or unlock. The numbers: /etc/s15-face.conf (root's; the
@@ -47,6 +49,7 @@ import ctypes
 import fcntl
 import os
 import pwd
+import re
 import signal
 import struct
 import subprocess
@@ -82,6 +85,8 @@ SETTLE_S = 0.5          # the display must be on this long before a run starts
 POLL_S = 0.2            # while the helper looks
 IDLE_S = 0.5            # while waiting
 HELPER_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
+STEPS_READ = 256 * 1024 # the end of a helper's --verbose output that is read (frames without a face come first)
+STEPS_MAX = 1500        # characters of steps in one journal line (the last ones: the attempt that decided)
 GREETER = "greeter"     # /run/s15-face/greeter (root's): the login screen's scan (its pid, Enter presses)
 TOKEN = "token"         # /run/s15-face/token (root's): a face recognised at the login screen, for SDDM's PAM stack
 TOKEN_LIFE_MS = 15000
@@ -96,6 +101,48 @@ MATCH, FALSE_FACE, NOTHING, NO_FACE = 0, 1, 2, 3
 def log(msg):
     syslog.openlog("s15-face", 0, syslog.LOG_AUTH)
     syslog.syslog(syslog.LOG_NOTICE, msg)
+
+
+# The helper's --verbose lines worth logging (the ones s15-face check shows), without the frames that showed no face
+STEP_RE = re.compile(r"FaceAuth: ((?:Face on|No face|Recognition (?:PASSED|FAILED)|The .* frame came|Recognised on "
+                     r"both|One face on both|The faces on the colour|Could not|Both cameras must|No face enrolled|"
+                     r"Anti-spoofing failed|AI anti-spoofing (?:detected spoof|check passed)|IR presence check "
+                     r"(?:PASSED|FAILED)|Low light on|Enough light on|Recognised on the IR camera alone).*)"
+                     r"|(the camera appears covered.*)")
+
+
+def helper_steps(text):
+    """The steps of the attempt that decided, from a helper's --verbose output, for one journal line. A frame
+    without a face (--keep-looking) is left out with the light line that came before it (the light of a picture
+    that led to nothing)."""
+    steps = []
+    for line in text.splitlines():
+        m = STEP_RE.search(line)
+        if not m:
+            continue
+        s = m.group(1) or m.group(2)
+        if s.startswith("No face detected"):
+            while steps and steps[-1].startswith(("Low light on", "Enough light on")):
+                steps.pop()
+            continue
+        s = re.sub(r" \(NOTE:.*\)$", "", s)
+        s = re.sub(r"face='[^']*/(faces[^/]*/[^']*)'", r"\1", s)
+        steps.append(s)
+    out = "; ".join(steps)
+    return out if len(out) <= STEPS_MAX else "..." + out[-STEPS_MAX:]
+
+
+def read_steps(fd):
+    """helper_steps of what the helper wrote to the memfd fd."""
+    size = os.fstat(fd).st_size
+    os.lseek(fd, max(0, size - STEPS_READ), os.SEEK_SET)
+    chunks = []
+    while True:
+        b = os.read(fd, 65536)
+        if not b:
+            break
+        chunks.append(b)
+    return helper_steps(b"".join(chunks).decode(errors="replace"))
 
 
 def valid_user(u):
@@ -456,6 +503,7 @@ class Runner:
         self.helper, self.display, self.lid = helper, display, lid
         self.sleep = Sleep()
         self.proc = None
+        self.steps = ""   # the last helper's steps (helper_steps)
         self.last_lid = (0.0, False)
 
     def lid_closed(self, fresh=False):
@@ -485,11 +533,23 @@ class Runner:
         self.proc = None
 
     def run_helper(self, look_ms):
-        """(exit code, None) or (None, why it was stopped)."""
-        self.proc = subprocess.Popen(
-            [self.helper, "auth", "--username", self.user, "--service", self.service, "--keep-looking", str(look_ms)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=HELPER_ENV, cwd="/",
-            preexec_fn=lambda: set_pdeathsig(signal.SIGKILL))
+        """(exit code, None) or (None, why it was stopped). self.steps: what the helper saw (helper_steps)."""
+        self.steps = ""
+        try:
+            out = os.memfd_create("s15-face-steps", os.MFD_CLOEXEC)   # its --verbose lines, in memory only
+        except (AttributeError, OSError):
+            out = None
+        try:
+            self.proc = subprocess.Popen(
+                [self.helper, "auth", "--username", self.user, "--service", self.service, "--keep-looking",
+                 str(look_ms)] + (["--verbose"] if out is not None else []),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=out if out is not None else subprocess.DEVNULL, env=HELPER_ENV, cwd="/",
+                preexec_fn=lambda: set_pdeathsig(signal.SIGKILL))
+        except BaseException:
+            if out is not None:
+                os.close(out)
+            raise
         deadline = time.monotonic() + look_ms / 1000 + 25
         try:
             while True:
@@ -504,6 +564,13 @@ class Runner:
                     return None, why
         finally:
             self.kill()
+            if out is not None:
+                try:
+                    self.steps = read_steps(out)
+                except OSError:
+                    pass
+                finally:
+                    os.close(out)
 
     def wait(self, seconds, fresh=False):
         """Waits; why a helper may no longer look, or None. fresh: the lid read anew at the end."""
@@ -530,6 +597,7 @@ class Runner:
             if why:
                 return "stopped", why
             if rc == MATCH:
+                log(f"{self.user}: match: {self.steps or 'no steps'} ({self.service})")
                 why = self.wait(CONFIRM_S, fresh=True)
                 if why:
                     log(f"{self.user}: match not used: {why} ({self.service})")
@@ -547,7 +615,8 @@ class Runner:
                 false_faces += 1
                 wait = d["until"] - time.time()
                 log(f"{self.user}: false face {false_faces} of this run, {d.get('fails', '?')} since the last "
-                    f"success{f', face waits {int(wait) + 1} s' if wait > 0 else ''} ({self.service})")
+                    f"success{f', face waits {int(wait) + 1} s' if wait > 0 else ''} ({self.service}): "
+                    f"{self.steps or 'no steps'}")
                 if false_faces >= self.conf["run_false_faces"]:
                     return "ended", f"{false_faces} false faces"
                 why = self.wait(FALSE_PAUSE_S)

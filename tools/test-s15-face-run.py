@@ -244,6 +244,7 @@ class Rig:
         self.helper = f"{self.dir}/helper"
         open(self.helper, "w").write(f"""#!/bin/bash
 echo "$*" >> {self.runs}
+[ -f {self.dir}/err ] && cat {self.dir}/err >&2
 read -r line < {self.seq} || line="3 0.2"
 tail -n +2 {self.seq} > {self.seq}.n; mv {self.seq}.n {self.seq}
 set -- $line
@@ -324,6 +325,59 @@ def check_runs():
     rig.codes("0 0.05")
     res = rig.runner(st, conf()).run(5000, 10)
     expect(res[0] == "refused" and res[1][0] is True and rig.n_runs() == 0, "run: locked out -> no helper")
+
+
+V = "[2026-11-16 18:25:3{}.{:03d}] [biopass] [{}] "
+VERBOSE = "".join(V.format(i % 10, i, lvl) + line + "\n" for i, (lvl, line) in enumerate([
+    ("debug", "AuthManager: Trying face authentication, looking for up to 20000 ms"),
+    ("error", "FaceAuth: No face detected on the colour camera | luma mean=12.0 stddev=3.0"),
+    ("debug", "FaceAuth: Low light on the colour camera | no face, picture luma 12 < 70: the IR camera decides "
+              "alone (threshold 0.70)"),
+    ("error", "FaceAuth: No face detected on the IR camera | luma mean=30.1 stddev=8.0"),
+    ("warn", "Biopass: the camera appears covered"),
+    ("debug", "FaceAuth: Low light on the colour camera | face luma 48 < 70: the IR camera decides alone "
+              "(threshold 0.70)"),
+    ("debug", "FaceAuth: One face on both cameras | offset x=0.05 y=0.02 size=1.10 (at most 0.50, 1.50)"),
+    ("debug", "FaceAuth: Recognition on the IR camera | threshold=0.700 enrolled_count=12"),
+    ("debug", "FaceAuth: Recognition FAILED on the IR camera | best score=0.6612 threshold=0.700"),
+    ("debug", "FaceAuth: Enough light on the colour camera | face luma 86 (low light below 70)"),
+    ("debug", "FaceAuth: AI anti-spoofing check passed | score=0.012 threshold=0.800"),
+    ("debug", "FaceAuth: Recognition PASSED on the colour camera | matched face='/home/u/.local/share/"
+              "com.ticklab.biopass/faces/1.jpg' score=0.7712 (NOTE: debug)"),
+]))
+
+
+def check_steps():
+    got = m.helper_steps(VERBOSE)
+    want = ("the camera appears covered; Low light on the colour camera | face luma 48 < 70: the IR camera decides "
+            "alone (threshold 0.70); One face on both cameras | offset x=0.05 y=0.02 size=1.10 (at most 0.50, 1.50); "
+            "Recognition FAILED on the IR camera | best score=0.6612 threshold=0.700; Enough light on the colour "
+            "camera | face luma 86 (low light below 70); AI anti-spoofing check passed | score=0.012 "
+            "threshold=0.800; Recognition PASSED on the colour camera | matched faces/1.jpg score=0.7712")
+    expect(got == want, f"steps: frames without a face and their light lines left out, paths shortened ({got!r})")
+    long = m.helper_steps(VERBOSE * 20)
+    expect(len(long) <= m.STEPS_MAX + 3 and long.startswith("...") and long.endswith("score=0.7712"),
+           "steps: a long output keeps its end")
+    expect(m.helper_steps("") == "" and m.helper_steps("libcamera noise\n") == "", "steps: nothing worth logging")
+
+    logged, real = [], m.log
+    m.log = logged.append
+    try:
+        rig, st = Rig(), state()
+        open(f"{rig.dir}/err", "w").write(VERBOSE)
+        rig.codes("1 0.05", "0 0.05")
+        res = rig.runner(st, conf()).run(5000, 10)
+        expect(res == ("match", "") and "--verbose" in open(rig.runs).read(),
+               f"steps: the helper runs with --verbose ({res})")
+        ff = [l for l in logged if "false face 1 of this run" in l]
+        expect(len(ff) == 1 and ff[0].endswith("(kde-fingerprint): " + want),
+               f"steps: the false face's line ends with its steps ({ff})")
+        mt = [l for l in logged if l.startswith(f"{USER}: match: ")]
+        expect(len(mt) == 1 and mt[0] == f"{USER}: match: {want} (kde-fingerprint)", f"steps: the match's line ({mt})")
+        expect(not [f for f in os.listdir("/proc/self/fd") if "memfd" in os.path.realpath(f"/proc/self/fd/{f}")
+                    if os.path.exists(f"/proc/self/fd/{f}")], "steps: the memfd is closed after the run")
+    finally:
+        m.log = real
 
 
 def check_watch():
@@ -750,6 +804,7 @@ check_lockout_conf()
 check_service()
 check_faillock()
 check_runs()
+check_steps()
 check_watch()
 check_grace()
 check_sleep()
