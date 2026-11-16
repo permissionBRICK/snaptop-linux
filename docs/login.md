@@ -119,7 +119,8 @@ with both cameras), as Windows Hello does. It uses [Biopass](https://github.com/
 fingerprint unlock for Linux PAM, MIT license), built on the laptop with our patches (`face/patches/`): its
 authentication part for this IR camera, a minimum face size, a mode that needs both cameras and a helper that keeps
 looking while it sees no face (0001-0008, to be offered upstream), and its app, which sets all of it up: the
-cameras, your faces, test scans, the thresholds and the lockout (0009-0011). When to look, what counts and when a
+cameras, your faces, test scans, the thresholds and the lockout (0009-0011); later a threshold per camera, one face
+on both cameras and the [low-light mode](#low-light) (0013-0018). When to look, what counts and when a
 match unlocks is ours: `s15-face` and `s15-face-run`. `s15-face` is also the command line for everything the app
 does.
 
@@ -134,6 +135,8 @@ does.
 > the camera list (`hm1092` mono, `ov02c10` colour), the lockout through pkexec, a scan, and the app's page with the
 > real settings and faces (on a virtual display). Not yet done by hand in the app: Add 5, Test, saving a mode change,
 > Apply in the lockout card (the password dialog).
+> The [low-light mode](#low-light) (patches 0017-0018, 2026-11-16): its unit tests pass (built off the laptop); not
+> yet built and installed on the laptop, not yet tried by hand in a dark room.
 
 ### Setting it up
 
@@ -174,7 +177,7 @@ shows the state (display, lid, the count of false faces, whether face is allowed
 
 #### The app
 
-Our build of Biopass's app (patches 0009-0011, 0013-0016) knows this laptop's setup:
+Our build of Biopass's app (patches 0009-0011, 0013-0016, 0018) knows this laptop's setup:
 
 - **Cameras** lists the cameras by libcamera id (`biopass-helper list-cameras`, patch 0008): both cameras share all
   their `/dev/video` nodes, so Biopass's own list of video devices could not tell them apart. A mode sets the same
@@ -189,7 +192,10 @@ Our build of Biopass's app (patches 0009-0011, 0013-0016) knows this laptop's se
 - **Thresholds**: each camera's recognition threshold (`recognition.threshold` for the colour camera,
   `recognition.ir_threshold` for the IR camera, "same as colour" when it has none: the two cameras' pictures score
   differently) and the anti-spoofing model's, side by side, each marked as used or not in the mode; below 0.6 it
-  warns. **Anti-Spoofing** is off and locked in IR mode (the models are trained on colour pictures).
+  warns. Below them the [low-light](#low-light) settings: **Low light below** (the colour face's brightness,
+  0-255; 0 turns it off) and **IR camera in low light** (its threshold then). **Anti-Spoofing** is off and locked
+  in IR mode (the models are trained on colour pictures). **Test** also shows the light on the colour camera and
+  whether the IR camera decided alone.
 - **Unsaved changes are never lost without asking**: while there are any, a bar at the bottom offers Save and
   Reset, and closing the window or leaving the page asks to save, discard or stay. Biopass's app closed and
   dropped them without a word.
@@ -210,7 +216,8 @@ Our build of Biopass's app (patches 0009-0011, 0013-0016) knows this laptop's se
 | False faces (a face that did not match, or that anti-spoofing flagged) | Counted since the last success, as the PIN counts wrong PINs: the first 6 are free, then face waits 1 minute, after each further one twice as long (up to 60 minutes); after 15 it is off until a login or unlock with the password or PIN. Any success (face, password, PIN, login) starts the count again. The count is kept across restarts and SteamOS updates, so restarting gives no new tries. No face (nobody there, too small, cut off) never counts. The numbers are settings: [below](#lockout-settings). `sudo s15-face reset` clears the count. |
 | Account locked by wrong passwords (`pam_faillock`) | Face is refused too (checked before each run). Face failures do not count towards that lockout. |
 | A face across the room, or cut off at the edge of the picture | Not matched (and not counted): the face must fill at least a fifth of the picture's height (sitting in front of the screen, within about 1 m) and lie wholly inside it. |
-| `both`: too little light for the colour camera, or one lens covered | Not matched, never the IR camera alone: the password or PIN. |
+| `both`: little light for the colour camera (an evening room), the dark, or the colour lens covered | The IR camera decides alone, at a stricter threshold ([low light](#low-light)); with a face on the colour camera only if it is the same face. |
+| `both`: the IR lens covered | Not matched: the IR camera always has to recognise the face. |
 | No IR camera or no minimum face size in your Biopass settings | Face is refused (`sudo s15-face camera ir`, `rgb` or `both` sets them). |
 
 #### Lockout settings
@@ -249,22 +256,67 @@ and the minimum face size and threshold [below](#how-it-works) where the setting
 | Mode | Recognises | Needs | Against a photo |
 |---|---|---|---|
 | `ir` (recommended) | the IR camera | nothing: its own light, the same in any room light and in the dark | a phone or monitor shows nothing in IR; a printed photo has to look like you in infrared |
-| `both` (strictest) | the colour camera **and** the IR camera, each against its own faces, on pictures at most 2.5 s apart | room light for the colour camera; about a second longer (one camera switch) | must fool both: a photo fails in IR, an IR-only fake in colour |
-| `rgb` | the colour camera; the IR camera only checks that it sees some face | room light | a printed photo can pass the IR check |
+| `both` (strictest) | the colour camera **and** the IR camera, each against its own faces, on pictures at most 2.5 s apart; in [low light](#low-light) the IR camera alone | nothing; about a second longer (one camera switch) | must fool both in good light: a photo fails in IR, an IR-only fake in colour; in low light only the IR recognition |
+| `rgb` | the colour camera; the IR camera only checks that it sees some face; in [low light](#low-light) the IR camera recognises alone if it has faces (`faces-ir/`) | room light (without IR faces) | a printed photo can pass the IR check |
 
 In `ir` Biopass's AI anti-spoofing models are off: they are trained on colour images and misjudge IR frames. In `rgb`
 and `both` the app's Anti-Spoofing model (or `sudo s15-face antispoof on`) turns one on for the colour picture: take
 MiniFASNet V2 (Biopass's default, MobileNetV3, took the real face for a spoof in 2 of 3 scans on this camera's
-pictures; MiniFASNet V2 passed 4 of 4). They may also reject real faces in poor light. In
-`both` the IR recognition replaces the IR presence check. `both` never falls back to one camera: in a dark room, or
-with the colour lens covered, face unlock fails and the password or PIN is needed (otherwise covering a lens would
-weaken it).
+pictures; MiniFASNet V2 passed 4 of 4). They reject real faces in poor light: in an ordinary evening room
+MiniFASNet V2 took a real face for a spoof in every scan, which is why the colour checks step aside in
+[low light](#low-light). In `both` the IR recognition replaces the IR presence check. Until 2026-11-16 `both` never
+fell back to one camera: in a dark room, or with the colour lens covered, face unlock failed.
 
 Enrolled faces stay with their camera, so switching modes needs no new enrolment for a camera that has faces:
 `faces/` holds the main camera's (the IR camera's in `ir`, the colour camera's in `rgb` and `both`), `faces-ir/` the
 IR camera's in `rgb` and `both`, `faces-rgb/` the colour camera's while in `ir`; the app's Save and `s15-face camera`
 move them when the main camera changes. Faces from one camera do not match the other. Only one camera
 streams at a time, and the camera light is on while either does.
+
+#### Low light
+
+Biopass's anti-spoofing models and the colour camera's recognition need light; the IR camera lights the face itself.
+Measured on the laptop in `both` (MiniFASNet V2 at 0.8, both cameras' thresholds 0.6), sitting in front:
+
+| Light | The colour picture's face, mean luma (0-255) | Anti-spoofing (spoof score) | Colour recognition | IR recognition |
+|---|---|---|---|---|
+| an evening room (medium to low room light) | 47-48 (10th to 90th percentile 40-60; the whole picture 55-59) | 0.86-0.99: rejected as a spoof | 0.45-0.70 | 0.66-0.83, mostly 0.75-0.83 |
+| bright | 86 (59-119; the whole picture 106) | 0.01-0.08: passed | 0.75-0.80 | 0.72-0.76 |
+
+Face detection on the colour camera still worked in the low light (confidence 0.55-0.81). A face badly placed in
+front of the IR camera scored 0.34-0.36 there.
+
+So, in `both` (and in `rgb` when faces are enrolled for the IR camera) each attempt first measures the colour
+picture: the mean luma of the detected face's box, or of the whole picture when it shows no face. Below
+`anti_spoofing.low_light_luma` the IR camera decides alone, as Windows Hello does: no anti-spoofing model, no colour
+recognition; the IR face has to match the IR camera's faces (`faces-ir/`) above `recognition.ir_low_light_threshold`.
+When the colour camera saw a face, the IR camera's face must be that face ([one face](#how-it-works): the same place
+and size, pictures at most 2.5 s apart); when it saw none in a dark picture (a dark room, or the colour lens
+covered), the IR camera decides alone. A colour face that is too small or cut off still compares nothing. With
+enough light everything stays as before: anti-spoofing and both recognitions.
+
+| Setting (Biopass's `config.yaml`) | Default | Meaning |
+|---|---|---|
+| `anti_spoofing.low_light_luma` | 70 | below this mean luma (0-255) of the colour face (or picture) the IR camera decides alone; between the evening room's 48 and daylight's 86. 0 turns the mode off (the colour checks always run, and fail in the dark) |
+| `recognition.ir_low_light_threshold` | 0.7 | the IR camera's threshold when it decides alone; never below its own `ir_threshold` (the higher one applies). Above the IR camera's usual 0.6, as it alone stands between a photo and a match then |
+
+`sudo s15-face camera both` (or `rgb`) writes both where the settings have none (or an invalid value) and keeps
+yours; a low-light threshold below 0.6 is raised to 0.6. The app sets them under Thresholds; `s15-face status` shows
+them. `s15-face check` and the app's Test show the decision in each attempt; a match in an evening room looks like
+this (times, offsets and score as an example):
+
+```
+20:14:03.512 Face on the colour camera | 520x570 px at (700,260) in 1920x1092, height 0.52 of the frame (min 0.20), conf 0.71: in front
+20:14:03.540 Low light on the colour camera | face luma 48 < 70: the IR camera decides alone (threshold 0.70)
+20:14:04.380 Face on the IR camera | 125x145 px at (215,105) in 560x360, height 0.40 of the frame (min 0.20), conf 0.86: in front
+20:14:04.381 One face on both cameras | offset x=0.06 y=0.04 size=1.12 (at most 0.50, 1.50)
+20:14:04.471 Recognition PASSED on the IR camera | matched faces-ir/face_1.jpg score=0.8012
+20:14:04.472 Recognised on the IR camera alone (low light), above 0.70
+```
+
+(in the dark: `Low light on the colour camera | no face, picture luma 12 < 70: ...`; with enough light:
+`Enough light on the colour camera | face luma 86 (low light below 70)`, then the usual steps). A face that scores
+between the IR camera's threshold and the low-light threshold counts as a false face in low light.
 
 ### How it works
 
@@ -299,6 +351,12 @@ streams at a time, and the camera light is on while either does.
   `pair_max_size_ratio` apart (1.5); else the attempt fails like a spoof (a false face). The cameras sit side by
   side: over 5 enrolment pairs the same face measured 0.95 of its colour width and 0.86 of its colour height in
   IR, well inside that.
+- Low light (patch 0017, `face/common/low_light.h`, a pure function with its own unit test): after the colour
+  picture (first, or second when the attempt started on the IR camera left open by the last one) the helper measures
+  its luma ([above](#low-light)) and picks the path: the colour checks as before, the IR camera on the colour
+  camera's face, or the IR camera alone. On the IR path the colour camera closes, the IR camera opens and its face
+  is matched at the low-light threshold; an attempt that started on the IR camera has matched that face at the IR
+  camera's threshold already and compares it again only when the low-light threshold is higher.
 - `s15-face check` runs one scan (`biopass-helper auth --verbose`, patch 0006: Biopass's own 5 attempts), with each
   step on the terminal: the face's size and how it compares with the minimum, the best score and the threshold. The
   app's Test runs `biopass-helper auth --verbose --keep-looking 6000` (as the login screen looks: the first face
@@ -461,6 +519,16 @@ Same camera, same IR light, much less behind it:
   and in infrared within the same 2.5 seconds; a twin or a look-alike still can. Face unlock is a convenience, weaker
   than your password: the password (or PIN) stays required for `sudo` and polkit by default, and after 15 false
   faces.
+- [Low light](#low-light) trades some of `both`'s strength for working in the evening: whenever the colour picture
+  is dark, or the colour lens is covered, only the IR recognition decides, at the stricter 0.7 by default (in `rgb`
+  with IR faces too). A phone or tablet screen stays rejected: the IR camera has to recognise the face on every
+  path, and a screen shows nothing in infrared (a bright screen also makes the colour checks run); held next to
+  someone else's face, the one-face check fails. But in low light a printed photo, or anything else that looks like
+  you in infrared, is
+  checked only by the IR recognition, as in `ir` mode: no anti-spoofing model (it was trained on colour pictures and
+  rejects real faces in the dark), no colour recognition. That is Windows Hello's approach without its IR liveness
+  model, so weaker than Windows Hello. Who wants the colour checks always (and the password in the evening) sets
+  `anti_spoofing.low_light_luma` to 0.
 - Keyring: Biopass can store your login password sealed by the TPM, to unlock a keyring after a face login. Not used
   here: SteamOS has no keyring PAM module, and our lines do not hand a password on (no `authtok`). Its seal is bound
   at most to PCR 7 (the Secure Boot state), which says little with Secure Boot off as on this laptop: any system
