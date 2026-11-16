@@ -136,7 +136,8 @@ does.
 > real settings and faces (on a virtual display). Not yet done by hand in the app: Add 5, Test, saving a mode change,
 > Apply in the lockout card (the password dialog).
 > The [low-light mode](#low-light) (patches 0017-0018, 2026-11-16): built and installed on the laptop with its
-> unit tests; not yet confirmed by hand in a dark room.
+> unit tests, and tried by hand on the lock screen in evening light: face luma 50, the IR camera alone at 0.75 above
+> 0.70, unlocked; in brighter light (face luma 75-97) the colour checks ran as before.
 
 ### Setting it up
 
