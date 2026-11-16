@@ -85,6 +85,15 @@
 - **Reboot hang:** twice the machine stopped after "Reached target reboot.target" and needed a forced power-off.
   Possibly the EFI `ResetSystem` path through the firmware; `efi=noruntime` is a candidate test (it also
   disables EFI variables, so only as a test).
+- **Standby after a restore from hibernation** (measured 2026-11-16): after every restore, until the next reboot,
+  DDR stayed at 3686 MHz with the screen on or off. s2idle reached neither CX collapse nor DDR low power (350 instead
+  of 180 mW), and once the power button and the lid did not wake the machine from s2idle (charger events did).
+  Cause: the RPMh votes of the kernel that loaded the image, which never reaches `sync_state()` and votes the maximum,
+  while the restored kernel sends only what changes. Kernel patches `0036`-`0039` send the restored kernel's votes
+  and sleep/wake sets again ([kernel](kernel.md)). Not yet tested; after a hibernation and restore check
+  `dmesg | grep 'restore from hibernation'` (10 lines), the DDR frequency residency at idle, `cxsd`/`ddr` in
+  `s15-sleep.log` for the next sleep, and a wake by the power button. If the power button or the lid still fail to
+  wake it while CX collapse works, that is a separate problem.
 - **Power:** standby (0.15 W) and idle are measured ([power](power.md)). Screen-off idle is still about 1.5 W,
   Windows reaches about 0.5 W.
 - Headphone jack, DP alt mode, Iris video decode, face login with the IR camera: untested.

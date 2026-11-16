@@ -1,0 +1,96 @@
+From 139209b33624cf3977b8d8c3b3240e264dc84cf7 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:14:31 +0000
+Subject: [PATCH] pmdomain: qcom: rpmhpd: send every corner again on restore
+ from hibernation
+
+Hibernation powers the SoC off, and the kernel that loads the image votes its own corners. On the ASUS Vivobook
+S 15 (X1E80100) that kernel never reaches sync_state() (consumers without a driver: the GPU GMU, the video codec, the
+crypto engine), so rpmhpd_aggregate_corner() clamps every domain it powers on to its highest corner, in the active,
+wake and sleep sets. The restored kernel had reached sync_state() before the snapshot and believes its own corners
+are in the hardware. Nothing sends them again: genpd calls into rpmhpd only when a domain powers on or off or its
+performance state changes (genpd's restore_noirq powers on only the domains that were off at the snapshot), and the
+rpmh cache marks itself dirty only for a changed sleep or wake vote. A domain keeps the other kernel's corner until
+one of these happens, and a domain without an active-only peer has no sleep vote, so it keeps it in standby too.
+
+Add a .restore_noirq callback that sends every domain's corner again as rpmhpd_sync_state() does: the corner of an
+enabled domain (at least its enable corner) or 0, active-only for domains without a peer, active, wake and sleep for
+the others; the wake and sleep corners go into the rpmh cache, which the RSC's restore callback marks for the next
+flush. The corner in the hardware is unknown, so every non-zero corner waits for its ack, as an increase does. The
+callback runs before the consumers' restore callbacks (device links), so a domain the other kernel left below this
+kernel's corner is raised before its devices are touched. One line in the log. Suspend and runtime PM are unchanged;
+a restore without a power-off (pm_test, test_resume) sends the same corners again.
+
+Not upstream.
+---
+ drivers/pmdomain/qcom/rpmhpd.c | 48 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/drivers/pmdomain/qcom/rpmhpd.c b/drivers/pmdomain/qcom/rpmhpd.c
+index 907432759..b0401644d 100644
+--- a/drivers/pmdomain/qcom/rpmhpd.c
++++ b/drivers/pmdomain/qcom/rpmhpd.c
+@@ -1220,12 +1220,60 @@ static void rpmhpd_sync_state(struct device *dev)
+ 	mutex_unlock(&rpmhpd_lock);
+ }
+ 
++/*
++ * Restore from hibernation: the kernel that loaded the image voted its own corners (before its sync_state(), the
++ * highest corner of every domain it powered on), and the hardware keeps them. genpd sends a domain's corner only
++ * when the domain powers on or its performance state changes, and the rpmh cache writes a sleep or wake vote only
++ * when it changed, so this kernel's lower corners never reach the hardware again. Send every domain's active, wake
++ * and sleep corner again, as sync_state does. The corner in the hardware is unknown here: wait for the ack of any
++ * non-zero corner, as for an increase.
++ */
++static int rpmhpd_restore_noirq(struct device *dev)
++{
++	const struct rpmhpd_desc *desc = of_device_get_match_data(dev);
++	struct rpmhpd **rpmhpds = desc->rpmhpds;
++	unsigned int i, corner, sent = 0, on = 0;
++	struct rpmhpd *pd;
++	int ret;
++
++	mutex_lock(&rpmhpd_lock);
++	for (i = 0; i < desc->num_pds; i++) {
++		pd = rpmhpds[i];
++		if (!pd)
++			continue;
++
++		pd->active_corner = 0;
++		if (pd->enabled)
++			corner = max(pd->corner, pd->enable_corner);
++		else
++			corner = 0;
++
++		ret = rpmhpd_aggregate_corner(pd, corner);
++		if (ret) {
++			dev_err(dev, "failed to send %s again: %d\n", pd->res_name, ret);
++			continue;
++		}
++		sent++;
++		on += pd->enabled;
++	}
++	mutex_unlock(&rpmhpd_lock);
++
++	dev_info(dev, "restore from hibernation: corners of %u power domains (%u on) sent again\n", sent, on);
++
++	return 0;
++}
++
++static const struct dev_pm_ops rpmhpd_pm_ops = {
++	.restore_noirq = rpmhpd_restore_noirq,
++};
++
+ static struct platform_driver rpmhpd_driver = {
+ 	.driver = {
+ 		.name = "qcom-rpmhpd",
+ 		.of_match_table = rpmhpd_match_table,
+ 		.suppress_bind_attrs = true,
+ 		.sync_state = rpmhpd_sync_state,
++		.pm = pm_sleep_ptr(&rpmhpd_pm_ops),
+ 	},
+ 	.probe = rpmhpd_probe,
+ };
+-- 
+2.43.0
+

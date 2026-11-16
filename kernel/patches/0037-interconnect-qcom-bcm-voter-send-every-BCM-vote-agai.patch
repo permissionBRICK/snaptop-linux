@@ -1,0 +1,272 @@
+From b30d07765285579d6d66cf9d2e92bf40abf4407c Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:14:16 +0000
+Subject: [PATCH] interconnect: qcom: bcm-voter: send every BCM vote again on
+ restore from hibernation
+
+Hibernation powers the SoC off, and the kernel that loads the image votes its own bandwidth. On the ASUS Vivobook
+S 15 (X1E80100) that kernel never reaches sync_state() for the interconnect providers (the GPU GMU, the video codec
+and the crypto engine have no driver), so every node keeps its initial bandwidth (init_avg/init_peak = INT_MAX) and
+every BCM is voted at its maximum, in the active, wake and sleep buckets alike. The restored kernel had reached
+sync_state() before the snapshot and believes its own, much lower votes are in the hardware. A commit sends only the
+BCMs of nodes whose requests changed, so a BCM whose nodes keep their requests keeps the other kernel's maximum until
+the next reboot. Measured after every restore: DDR at 3686 MHz (99 % of the time or more in AOP's ddr_stats, screen
+on or off), where the same Linux votes after a boot and a forced sync_state() give 547 MHz, and no DDR low power or
+CX collapse in standby.
+
+Add icc_provider_resync(), which aggregates every node of a provider again and calls ->set() for each node, as
+icc_sync_state() does, under the bandwidth lock, so it cannot commit a node's sums while icc_set_bw() is aggregating
+them; before sync_state() the initial bandwidth stays the floor, also of a node without requests. The BCM voter keeps a list of the providers that vote through it and calls it for each of them in a
+.restore_noirq callback: every BCM is aggregated and committed again, the active votes at once, the wake and sleep
+votes into the rpmh cache, which the RSC's restore callback marks for the next flush. One line per voter in the log.
+Suspend and runtime PM are unchanged; a restore without a power-off (pm_test, test_resume) sends the same votes
+again.
+
+Not upstream.
+---
+ drivers/interconnect/core.c           | 34 ++++++++++++++
+ drivers/interconnect/qcom/bcm-voter.c | 66 +++++++++++++++++++++++++++
+ drivers/interconnect/qcom/bcm-voter.h |  2 +
+ drivers/interconnect/qcom/icc-rpmh.c  |  4 ++
+ drivers/interconnect/qcom/icc-rpmh.h  |  2 +
+ include/linux/interconnect-provider.h |  6 +++
+ 6 files changed, 114 insertions(+)
+
+diff --git a/drivers/interconnect/core.c b/drivers/interconnect/core.c
+index 4aa991a54..4aa8989fb 100644
+--- a/drivers/interconnect/core.c
++++ b/drivers/interconnect/core.c
+@@ -1245,6 +1245,40 @@ void icc_sync_state(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(icc_sync_state);
+ 
++/**
++ * icc_provider_resync() - aggregate the requests of a provider's nodes again and send the result
++ * @provider: the interconnect provider
++ *
++ * The framework sends a node's bandwidth to its provider only when it changes. For hardware that lost or
++ * changed its votes behind the framework's back, e.g. after a restore from hibernation, where the kernel
++ * that loaded the image voted its own bandwidth: aggregate every node of @provider again and call ->set()
++ * for each node, as icc_sync_state() does, with the bandwidth lock held. Before sync_state(), a node's
++ * initial bandwidth stays its floor, also for a node without requests (as icc_node_add() sets it).
++ *
++ * Return: 0, or the first error ->set() returned.
++ */
++int icc_provider_resync(struct icc_provider *provider)
++{
++	struct icc_node *n;
++	int ret = 0, err;
++
++	mutex_lock(&icc_bw_lock);
++	list_for_each_entry(n, &provider->nodes, node_list) {
++		aggregate_requests(n);
++		if (hlist_empty(&n->req_list) && (n->init_avg || n->init_peak) && provider->aggregate)
++			provider->aggregate(n, 0, n->init_avg, n->init_peak, &n->avg_bw, &n->peak_bw);
++	}
++	list_for_each_entry(n, &provider->nodes, node_list) {
++		err = provider->set(n, n);
++		if (err && !ret)
++			ret = err;
++	}
++	mutex_unlock(&icc_bw_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(icc_provider_resync);
++
+ static int __init icc_init(void)
+ {
+ 	struct device_node *root;
+diff --git a/drivers/interconnect/qcom/bcm-voter.c b/drivers/interconnect/qcom/bcm-voter.c
+index a2d437a05..57120baeb 100644
+--- a/drivers/interconnect/qcom/bcm-voter.c
++++ b/drivers/interconnect/qcom/bcm-voter.c
+@@ -27,6 +27,7 @@ static DEFINE_MUTEX(bcm_voter_lock);
+  * @commit_list: list containing bcms to be committed to hardware
+  * @ws_list: list containing bcms that have different wake/sleep votes
+  * @voter_node: list of bcm voters
++ * @providers: interconnect providers voting through this voter (bcm_voter_lock)
+  * @tcs_wait: mask for which buckets require TCS completion
+  */
+ struct bcm_voter {
+@@ -36,6 +37,7 @@ struct bcm_voter {
+ 	struct list_head commit_list;
+ 	struct list_head ws_list;
+ 	struct list_head voter_node;
++	struct list_head providers;
+ 	u32 tcs_wait;
+ };
+ 
+@@ -367,6 +369,67 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
+ }
+ EXPORT_SYMBOL_GPL(qcom_icc_bcm_voter_commit);
+ 
++/**
++ * qcom_icc_bcm_voter_add_provider - remember a provider that votes through a voter
++ * @voter: the provider's voter
++ * @qp: the provider, registered with the interconnect framework
++ */
++void qcom_icc_bcm_voter_add_provider(struct bcm_voter *voter, struct qcom_icc_provider *qp)
++{
++	mutex_lock(&bcm_voter_lock);
++	list_add_tail(&qp->voter_node, &voter->providers);
++	mutex_unlock(&bcm_voter_lock);
++}
++EXPORT_SYMBOL_GPL(qcom_icc_bcm_voter_add_provider);
++
++/**
++ * qcom_icc_bcm_voter_remove_provider - forget a provider added with qcom_icc_bcm_voter_add_provider()
++ * @qp: the provider
++ */
++void qcom_icc_bcm_voter_remove_provider(struct qcom_icc_provider *qp)
++{
++	mutex_lock(&bcm_voter_lock);
++	list_del_init(&qp->voter_node);
++	mutex_unlock(&bcm_voter_lock);
++}
++EXPORT_SYMBOL_GPL(qcom_icc_bcm_voter_remove_provider);
++
++/*
++ * Restore from hibernation: the kernel that loaded the image voted its own bandwidth (before its sync_state(), the
++ * boot-time maximum of every node), and the BCMs keep those votes: a commit sends only the BCMs of nodes whose
++ * requests changed, so a BCM whose nodes keep their requests is never sent again. Aggregate the nodes of every
++ * provider that votes through this voter again and commit their BCMs: the active votes now, the wake and sleep votes
++ * into the rpmh cache, which the controller's own restore callback (rpmh-rsc) marks for the next flush.
++ */
++static int qcom_icc_bcm_voter_restore_noirq(struct device *dev)
++{
++	struct bcm_voter *voter = dev_get_drvdata(dev);
++	unsigned int providers = 0, bcms = 0;
++	struct qcom_icc_provider *qp;
++	int ret;
++
++	mutex_lock(&bcm_voter_lock);
++	list_for_each_entry(qp, &voter->providers, voter_node) {
++		ret = icc_provider_resync(&qp->provider);
++		if (ret) {
++			dev_err(dev, "%s: votes not sent again: %d\n", dev_name(qp->dev), ret);
++			continue;
++		}
++		providers++;
++		bcms += qp->num_bcms;
++	}
++	mutex_unlock(&bcm_voter_lock);
++
++	dev_info(dev, "restore from hibernation: votes of %u BCMs of %u interconnect providers sent again\n",
++		 bcms, providers);
++
++	return 0;
++}
++
++static const struct dev_pm_ops qcom_icc_bcm_voter_pm_ops = {
++	.restore_noirq = qcom_icc_bcm_voter_restore_noirq,
++};
++
+ static int qcom_icc_bcm_voter_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *np = pdev->dev.of_node;
+@@ -385,6 +448,8 @@ static int qcom_icc_bcm_voter_probe(struct platform_device *pdev)
+ 	mutex_init(&voter->lock);
+ 	INIT_LIST_HEAD(&voter->commit_list);
+ 	INIT_LIST_HEAD(&voter->ws_list);
++	INIT_LIST_HEAD(&voter->providers);
++	platform_set_drvdata(pdev, voter);
+ 
+ 	mutex_lock(&bcm_voter_lock);
+ 	list_add_tail(&voter->voter_node, &bcm_voters);
+@@ -404,6 +469,7 @@ static struct platform_driver qcom_icc_bcm_voter_driver = {
+ 	.driver = {
+ 		.name		= "bcm_voter",
+ 		.of_match_table = bcm_voter_of_match,
++		.pm		= pm_sleep_ptr(&qcom_icc_bcm_voter_pm_ops),
+ 	},
+ };
+ module_platform_driver(qcom_icc_bcm_voter_driver);
+diff --git a/drivers/interconnect/qcom/bcm-voter.h b/drivers/interconnect/qcom/bcm-voter.h
+index b4d36e349..066ecffbb 100644
+--- a/drivers/interconnect/qcom/bcm-voter.h
++++ b/drivers/interconnect/qcom/bcm-voter.h
+@@ -15,5 +15,7 @@
+ struct bcm_voter *of_bcm_voter_get(struct device *dev, const char *name);
+ void qcom_icc_bcm_voter_add(struct bcm_voter *voter, struct qcom_icc_bcm *bcm);
+ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter);
++void qcom_icc_bcm_voter_add_provider(struct bcm_voter *voter, struct qcom_icc_provider *qp);
++void qcom_icc_bcm_voter_remove_provider(struct qcom_icc_provider *qp);
+ 
+ #endif
+diff --git a/drivers/interconnect/qcom/icc-rpmh.c b/drivers/interconnect/qcom/icc-rpmh.c
+index 3b445acef..d812debc4 100644
+--- a/drivers/interconnect/qcom/icc-rpmh.c
++++ b/drivers/interconnect/qcom/icc-rpmh.c
+@@ -343,6 +343,8 @@ int qcom_icc_rpmh_probe(struct platform_device *pdev)
+ 		goto err_remove_nodes;
+ 
+ 	platform_set_drvdata(pdev, qp);
++	/* the voter sends the votes again after a restore from hibernation */
++	qcom_icc_bcm_voter_add_provider(qp->voter, qp);
+ 
+ 	/* Populate child NoC devices if any */
+ 	if (of_get_child_count(dev->of_node) > 0) {
+@@ -354,6 +356,7 @@ int qcom_icc_rpmh_probe(struct platform_device *pdev)
+ 	return 0;
+ 
+ err_deregister_provider:
++	qcom_icc_bcm_voter_remove_provider(qp);
+ 	icc_provider_deregister(provider);
+ err_remove_nodes:
+ 	icc_nodes_remove(provider);
+@@ -366,6 +369,7 @@ void qcom_icc_rpmh_remove(struct platform_device *pdev)
+ {
+ 	struct qcom_icc_provider *qp = platform_get_drvdata(pdev);
+ 
++	qcom_icc_bcm_voter_remove_provider(qp);
+ 	icc_provider_deregister(&qp->provider);
+ 	icc_nodes_remove(&qp->provider);
+ }
+diff --git a/drivers/interconnect/qcom/icc-rpmh.h b/drivers/interconnect/qcom/icc-rpmh.h
+index 09d879140..bc3bb41e4 100644
+--- a/drivers/interconnect/qcom/icc-rpmh.h
++++ b/drivers/interconnect/qcom/icc-rpmh.h
+@@ -25,6 +25,7 @@
+  * @regmap: used for QoS, register access
+  * @clks : clks required for register access
+  * @num_clks: number of @clks
++ * @voter_node: entry in the list of providers of @voter
+  */
+ struct qcom_icc_provider {
+ 	struct icc_provider provider;
+@@ -32,6 +33,7 @@ struct qcom_icc_provider {
+ 	struct qcom_icc_bcm * const *bcms;
+ 	size_t num_bcms;
+ 	struct bcm_voter *voter;
++	struct list_head voter_node;
+ 	struct qcom_icc_node * const *nodes;
+ 	size_t num_nodes;
+ 	struct regmap *regmap;
+diff --git a/include/linux/interconnect-provider.h b/include/linux/interconnect-provider.h
+index 8a2f652a0..b71b01bcb 100644
+--- a/include/linux/interconnect-provider.h
++++ b/include/linux/interconnect-provider.h
+@@ -130,6 +130,7 @@ int icc_provider_register(struct icc_provider *provider);
+ void icc_provider_deregister(struct icc_provider *provider);
+ struct icc_node_data *of_icc_get_from_provider(const struct of_phandle_args *spec);
+ void icc_sync_state(struct device *dev);
++int icc_provider_resync(struct icc_provider *provider);
+ 
+ #else
+ 
+@@ -196,6 +197,11 @@ static inline struct icc_node_data *of_icc_get_from_provider(const struct of_pha
+ 	return ERR_PTR(-ENOTSUPP);
+ }
+ 
++static inline int icc_provider_resync(struct icc_provider *provider)
++{
++	return -ENOTSUPP;
++}
++
+ #endif /* CONFIG_INTERCONNECT */
+ 
+ #endif /* __LINUX_INTERCONNECT_PROVIDER_H */
+-- 
+2.43.0
+

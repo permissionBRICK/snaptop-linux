@@ -1,0 +1,247 @@
+From 0a1dee55c2c09a56c1c2b7fa08351990f079271a Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:15:47 +0000
+Subject: [PATCH] regulator: qcom-rpmh: send the regulator votes again on
+ restore from hibernation
+
+Hibernation powers the SoC off, and the kernel that loads the image votes for the regulators its own drivers use.
+On the ASUS Vivobook S 15 (X1E80100) its initramfs brings up the USB and PCIe PHYs and repeaters, NVMe, the display
+and the Wi-Fi/Bluetooth power sequencer, and its freeze callbacks may switch some of them off again before it jumps
+into the image. The restored kernel's view can differ, e.g. for the rails of USB controllers that were runtime
+suspended at the snapshot or of the Bluetooth controller, which is unbound before a hibernation. RPMh regulator
+votes are active-only, so they are not in the rpmh cache that the RSC writes again after a restore, and the
+regulator core sends a vote only when the consumers' request changes (rpmh_regulator_vrm_set_mode() also skips an
+unchanged mode): a rail the restored kernel had switched off stays on, also through standby, until its consumer
+switches it on and off again, and a rail it holds can be off.
+
+Keep a list of the regulators of each PMIC device and send the enable state, voltage and mode of every regulator
+with a known state again in a .restore_noirq callback: a disabled one is switched off first, an enabled one gets its
+voltage and mode first, every request waits for its ack. Regulators the kernel never voted for (enabled still
+-EINVAL) are left alone, as after a boot. The callback runs before the consumers' restore callbacks (device links).
+A mutex per regulator serializes it with the regulator ops that change the state. One line per PMIC in the log.
+Suspend and runtime PM are unchanged; a restore without a power-off (pm_test, test_resume) sends the same votes
+again.
+
+Not upstream.
+---
+ drivers/regulator/qcom-rpmh-regulator.c | 113 ++++++++++++++++++++++++
+ 1 file changed, 113 insertions(+)
+
+diff --git a/drivers/regulator/qcom-rpmh-regulator.c b/drivers/regulator/qcom-rpmh-regulator.c
+index 25c14de3c..ae89c2c9b 100644
+--- a/drivers/regulator/qcom-rpmh-regulator.c
++++ b/drivers/regulator/qcom-rpmh-regulator.c
+@@ -5,9 +5,11 @@
+ #define pr_fmt(fmt) "%s: " fmt, __func__
+ 
+ #include <linux/bits.h>
++#include <linux/cleanup.h>
+ #include <linux/err.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+@@ -160,6 +162,12 @@ struct rpmh_vreg_hw_data {
+  * @voltage_selector:		Selector used for get_voltage_sel() and
+  *				set_voltage_sel() callbacks
+  * @mode:			RPMh VRM regulator current framework mode
++ * @rdev:			Regulator device registered for this regulator
++ * @lock:			Serializes the requests that change @enabled,
++ *				@bypassed, @voltage_selector or @mode with
++ *				sending them again after a restore from
++ *				hibernation
++ * @node:			Entry in the list of regulators of @dev
+  */
+ struct rpmh_vreg {
+ 	struct device			*dev;
+@@ -172,6 +180,10 @@ struct rpmh_vreg {
+ 	bool				bypassed;
+ 	int				voltage_selector;
+ 	unsigned int			mode;
++
++	struct regulator_dev		*rdev;
++	struct mutex			lock;
++	struct list_head		node;
+ };
+ 
+ /**
+@@ -241,6 +253,8 @@ static int rpmh_regulator_vrm_set_voltage_sel(struct regulator_dev *rdev,
+ {
+ 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+ 
++	guard(mutex)(&vreg->lock);
++
+ 	if (vreg->enabled == -EINVAL) {
+ 		/*
+ 		 * Cache the voltage and send it later when the regulator is
+@@ -303,6 +317,8 @@ static int rpmh_regulator_set_enable_state(struct regulator_dev *rdev,
+ 	};
+ 	int ret;
+ 
++	guard(mutex)(&vreg->lock);
++
+ 	if (vreg->enabled == -EINVAL &&
+ 	    vreg->voltage_selector != -ENOTRECOVERABLE) {
+ 		ret = _rpmh_regulator_vrm_set_voltage_sel(rdev,
+@@ -357,6 +373,8 @@ static int rpmh_regulator_vrm_set_mode(struct regulator_dev *rdev,
+ 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+ 	int ret;
+ 
++	guard(mutex)(&vreg->lock);
++
+ 	if (mode == vreg->mode)
+ 		return 0;
+ 
+@@ -419,6 +437,8 @@ static int rpmh_regulator_vrm_set_bypass(struct regulator_dev *rdev,
+ 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+ 	int ret;
+ 
++	guard(mutex)(&vreg->lock);
++
+ 	if (vreg->bypassed == enable)
+ 		return 0;
+ 
+@@ -542,6 +562,7 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
+ 	vreg->enabled = -EINVAL;
+ 	vreg->voltage_selector = -ENOTRECOVERABLE;
+ 	vreg->mode = REGULATOR_MODE_INVALID;
++	mutex_init(&vreg->lock);
+ 
+ 	if (rpmh_data->hw_data->n_voltages) {
+ 		vreg->rdesc.linear_ranges = rpmh_data->hw_data->voltage_ranges;
+@@ -580,6 +601,7 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
+ 			node, ret);
+ 		return ret;
+ 	}
++	vreg->rdev = rdev;
+ 
+ 	dev_dbg(dev, "%pOFn regulator registered for RPMh resource %s @ 0x%05X\n",
+ 		node, rpmh_resource_name, vreg->addr);
+@@ -1930,10 +1952,93 @@ static const struct rpmh_vreg_init_data pm660l_vreg_data[] = {
+ 	{}
+ };
+ 
++/*
++ * Send the votes of a regulator again: a disabled one is switched off first, an enabled one gets its voltage and mode
++ * before it is switched on (as rpmh_regulator_set_enable_state() sends a cached voltage first). Called with
++ * vreg->lock held, for a regulator whose enable state is known.
++ */
++static int rpmh_regulator_resend(struct rpmh_vreg *vreg)
++{
++	struct tcs_cmd cmd = {
++		.addr = vreg->addr + RPMH_REGULATOR_REG_ENABLE,
++		.data = vreg->enabled,
++	};
++	int ret;
++
++	if (!vreg->enabled) {
++		ret = rpmh_regulator_send_request(vreg, &cmd, true);
++		if (ret)
++			return ret;
++	}
++
++	if (vreg->hw_data->regulator_type == VRM) {
++		if (vreg->voltage_selector >= 0) {
++			ret = _rpmh_regulator_vrm_set_voltage_sel(vreg->rdev,
++						vreg->voltage_selector, true);
++			if (ret)
++				return ret;
++		}
++
++		if (vreg->mode != REGULATOR_MODE_INVALID) {
++			ret = rpmh_regulator_vrm_set_mode_bypass(vreg, vreg->mode,
++						vreg->bypassed);
++			if (ret)
++				return ret;
++		}
++	}
++
++	if (vreg->enabled)
++		return rpmh_regulator_send_request(vreg, &cmd, true);
++
++	return 0;
++}
++
++/*
++ * Restore from hibernation: the kernel that loaded the image voted for the regulators its own drivers used, and its
++ * freeze callbacks may have switched some off again. These votes are active-only, not in the rpmh cache that is
++ * flushed again, and the regulator core sends a vote only when it changes: a regulator this kernel had switched off
++ * stays on, also through standby, and one it holds may be off. Send the enable state, voltage and mode of every
++ * regulator this kernel has voted for again; regulators it never voted for (state unknown) keep what the firmware or
++ * the other kernel set, as after a boot. This runs before the consumers' restore callbacks (device links).
++ */
++static int rpmh_regulator_restore_noirq(struct device *dev)
++{
++	struct list_head *vregs = dev_get_drvdata(dev);
++	unsigned int sent = 0, on = 0;
++	struct rpmh_vreg *vreg;
++	int ret;
++
++	list_for_each_entry(vreg, vregs, node) {
++		guard(mutex)(&vreg->lock);
++
++		if (vreg->enabled < 0)
++			continue;
++
++		ret = rpmh_regulator_resend(vreg);
++		if (ret) {
++			dev_err(dev, "%s: votes not sent again: %d\n",
++				vreg->rdesc.name, ret);
++			continue;
++		}
++		sent++;
++		on += vreg->enabled;
++	}
++
++	dev_info(dev, "restore from hibernation: votes of %u regulators (%u on) sent again\n",
++		 sent, on);
++
++	return 0;
++}
++
++static const struct dev_pm_ops rpmh_regulator_pm_ops = {
++	.restore_noirq = rpmh_regulator_restore_noirq,
++};
++
+ static int rpmh_regulator_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	const struct rpmh_vreg_init_data *vreg_data;
++	struct list_head *vregs;
+ 	struct rpmh_vreg *vreg;
+ 	const char *pmic_id;
+ 	int ret;
+@@ -1942,6 +2047,12 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
+ 	if (!vreg_data)
+ 		return -ENODEV;
+ 
++	vregs = devm_kmalloc(dev, sizeof(*vregs), GFP_KERNEL);
++	if (!vregs)
++		return -ENOMEM;
++	INIT_LIST_HEAD(vregs);
++	platform_set_drvdata(pdev, vregs);
++
+ 	ret = of_property_read_string(dev->of_node, "qcom,pmic-id", &pmic_id);
+ 	if (ret < 0) {
+ 		dev_err(dev, "qcom,pmic-id missing in DT node\n");
+@@ -1957,6 +2068,7 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
+ 						vreg_data);
+ 		if (ret < 0)
+ 			return ret;
++		list_add_tail(&vreg->node, vregs);
+ 
+ 		ret = rpmh_regulator_determine_initial_mode(vreg);
+ 		if (ret < 0)
+@@ -2134,6 +2246,7 @@ static struct platform_driver rpmh_regulator_driver = {
+ 		.name = "qcom-rpmh-regulator",
+ 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+ 		.of_match_table	= of_match_ptr(rpmh_regulator_match_table),
++		.pm = pm_sleep_ptr(&rpmh_regulator_pm_ops),
+ 	},
+ 	.probe = rpmh_regulator_probe,
+ };
+-- 
+2.43.0
+

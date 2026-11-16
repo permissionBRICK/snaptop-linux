@@ -38,7 +38,7 @@ Install a new payload in SteamOS: `sudo steamos/install-kernel.sh <payload>` (ke
 3. **Our patches** in `kernel/patches/`, among them 8 bpc on the panel (`0001`, below), the firmware TPM driver
    (`0011`, [tpm](tpm.md)), two boot fixes for the TPM unlock (`0012`, `0013`, below), the SoundWire resume
    fix (`0014`, below), the display memory clock at boot (`0015`, below; halves the boot time), restore fixes for
-   hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0035`, below), the USB wakeup for runtime PM (`0021`, below)
+   hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0039`, below), the USB wakeup for runtime PM (`0021`, below)
    and the shared camera LED (`0025`, below).
 4. **DT overlay** from the same community repo (`overlay/build-overlay.sh --dtbo-only`): audio (WSA8845 speakers,
    SoundWire, mics), RGB and IR cameras, and optionally the EC node; plus our fragments from `kernel/overlay/`
@@ -108,7 +108,7 @@ With it, `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y`: the text console take
 is printed, so with `quiet` the firmware's logo stays on screen until `msm` takes over (about 4 s after the kernel
 starts).
 
-## Our patches: restore from hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0035`)
+## Our patches: restore from hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0039`)
 
 Hibernation powers the SoC off; drivers that only know suspend find their hardware reset after the restore, set up
 by the kernel that loaded the image only as far as its own drivers needed it ([power.md](power.md#hibernation)).
@@ -146,6 +146,47 @@ Experimental, like hibernation itself; suspend to RAM is unchanged by all of the
 - `0035` (`clk: qcom: camcc-x1e80100`): the camera clocks are back at reset after the power-off while the clock
   framework still held the rates CAMSS had set, so the same `clk_set_rate()` at the next stream did nothing (no
   frames). The rates are read back from the hardware on restore (`clk_hw_recalc_rate()`, new).
+- `0036`-`0039` (RPMh: `soc: qcom: rpmh`, `interconnect: qcom: bcm-voter`, `pmdomain: qcom: rpmhpd`,
+  `regulator: qcom-rpmh`): the RPMh votes of the kernel that loaded the image stayed in force. That kernel never
+  reaches `sync_state()` (the GPU GMU, the video codec and the crypto engine have no driver, see
+  [boot parameters](#boot-parameters)), so it votes every interconnect node at `INT_MAX` and every power domain it
+  powers on at its highest corner. The restored kernel had reached `sync_state()` before the snapshot (the
+  `s15-sync-state` hook) and believes its own, much lower votes are in the hardware. Its drivers send only what
+  changes, and the rpmh cache writes the sleep/wake TCSes again only when a cached vote changed. Measured 2026-11-16,
+  after every restore until the next reboot:
+  - DDR at 3686 MHz, 99 % of the time or more in AOP's `ddr_stats`, screen on or off. The same Linux votes after a
+    boot and a forced `sync_state()` give 547 MHz.
+  - s2idle reached neither CX collapse nor DDR low power (`cxsd 0%`, `ddr 0%` in `s15-sleep.log`, instead of
+    91-99 %) and drained 350 instead of 180 mW.
+  - Once the power button and the lid did not wake it from s2idle; charger events did. After a boot and a forced
+    `sync_state()` a suspend reached CX collapse (`cxsd` 91 %) and the power button woke it.
+
+  The patches send the restored kernel's RPMh state again:
+  - `0036`, the RSC (`.restore_early`): disables every command in the sleep and wake TCSes and marks the rpmh cache
+    dirty, so the next flush writes this kernel's sets. A dirty flag alone was not enough: the flush skips a TCS
+    group whose slots look empty, and a write adds its commands to those still enabled.
+  - `0037`, the BCM voter (`.restore_noirq`): aggregates every node of every interconnect provider again and commits
+    every BCM, the active votes at once and the wake/sleep votes into the cache (`icc_provider_resync()`, new,
+    under the interconnect bandwidth lock).
+  - `0038`, rpmhpd (`.restore_noirq`): sends every domain's active, wake and sleep corner again, as its
+    `sync_state()` does; every non-zero corner waits for its ack.
+  - `0039`, the RPMh regulators (`.restore_noirq`, one device per PMIC): send the enable state, voltage and mode of
+    every regulator the kernel has voted for. These votes are active-only, so not in the cache; the loading kernel's
+    initramfs drivers vote for USB and PCIe PHYs, NVMe, the display and the Wi-Fi/Bluetooth power sequencer, and the
+    restored kernel's view of them can differ. Regulators it never voted for are left alone, as after a boot.
+
+  Not replayed: `clk-rpmh`. Its clocks are prepared the same way in both kernels: XO always, the PS8830 retimers'
+  RF clocks by their driver, which is in the initramfs, and the UFS clock never (no UFS). XO's sleep vote is in the
+  cache that `0036` writes again.
+
+  Order: the clients are children of the RSC, restored before their consumers (device links), in the noirq phase.
+  The RSC's own callback runs in the early phase: it is in a genpd domain, and genpd's `restore_noirq` calls a
+  driver's `resume_noirq` callback instead of its `restore_noirq` one. The sleep set is only used when the system
+  power domain powers off, which genpd does not allow before the resume's `complete` phase, so CX and DDR cannot
+  collapse on stale sets before the replay. Suspend and runtime PM are unchanged; a restore without a power-off
+  (`pm_test`, `test_resume`) sends the same votes again. Check after a restore, one line per provider (10 on this
+  laptop: the RSC, the BCM voter, rpmhpd and 7 PMICs): `dmesg | grep 'restore from hibernation'`. Not yet tested on
+  the laptop ([known issues](known-issues.md)).
 
 ## Our patch: shared camera privacy LED (`0025`)
 

@@ -1,0 +1,154 @@
+From c4c7e500c31e38584e81c0d9904701c51371fbc1 Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:14:07 +0000
+Subject: [PATCH] soc: qcom: rpmh: write the sleep and wake sets again after a
+ restore from hibernation
+
+Hibernation powers the SoC off, and the kernel that loads the image writes its own sleep and wake sets into the
+apps RSC's TCSes, or none. The restored kernel's slots and cache still describe its own last flush before the
+snapshot, and rpmh_flush() writes the sets only when the cache is dirty, which a changed sleep or wake vote or
+rpmh_invalidate() makes it. Two details keep stale commands alive even when a flush does run: tcs_invalidate() skips
+a group whose slots look empty, and a TCS write ORs its commands into those already enabled.
+
+So after a restore the system can go to sleep with the image-loading kernel's sets, or with none, and the active
+votes stay in force during sleep. On the ASUS Vivobook S 15 (X1E80100), after every restore until the next reboot,
+s2idle reached neither CX collapse nor DDR low power (0 % instead of 91-99 % of the sleep) and drained 350 instead
+of 180 mW; the stale active votes are the other half of that (the next patches).
+
+Add a restore callback to the RSC: disable every command in the sleep and wake TCSes, clear their slots and mark the
+cache dirty (rpmh_mark_dirty(), new), so the next flush writes the restored kernel's sets, including what the
+clients cache again in their own restore callbacks. It is .restore_early because the RSC is in a genpd domain, and
+genpd's restore_noirq calls a driver's resume_noirq callback, not its restore_noirq one. The sleep set cannot be used
+before then: the flush runs when the system power domain powers off, which genpd does not allow before the resume's
+complete phase. One line in the log. Suspend and runtime PM are unchanged; a restore without a power-off (pm_test,
+test_resume) writes the same sets again.
+
+Not upstream.
+---
+ drivers/soc/qcom/rpmh-internal.h |  1 +
+ drivers/soc/qcom/rpmh-rsc.c      | 49 ++++++++++++++++++++++++++++++++
+ drivers/soc/qcom/rpmh.c          | 30 +++++++++++++++++++
+ 3 files changed, 80 insertions(+)
+
+diff --git a/drivers/soc/qcom/rpmh-internal.h b/drivers/soc/qcom/rpmh-internal.h
+index e3cf1beff..e1dd65126 100644
+--- a/drivers/soc/qcom/rpmh-internal.h
++++ b/drivers/soc/qcom/rpmh-internal.h
+@@ -144,5 +144,6 @@ void rpmh_rsc_write_next_wakeup(struct rsc_drv *drv);
+ 
+ void rpmh_tx_done(const struct tcs_request *msg);
+ int rpmh_flush(struct rpmh_ctrlr *ctrlr);
++int rpmh_mark_dirty(struct rpmh_ctrlr *ctrlr);
+ 
+ #endif /* __RPM_INTERNAL_H__ */
+diff --git a/drivers/soc/qcom/rpmh-rsc.c b/drivers/soc/qcom/rpmh-rsc.c
+index f881af35e..075c662c9 100644
+--- a/drivers/soc/qcom/rpmh-rsc.c
++++ b/drivers/soc/qcom/rpmh-rsc.c
+@@ -1155,6 +1155,54 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
+ 	return devm_of_platform_populate(&pdev->dev);
+ }
+ 
++/*
++ * Restore from hibernation: the SoC was powered off, and the kernel that loaded the image wrote its own sleep and
++ * wake sets into the TCSes, or none. This kernel's slots and cache still describe its last flush before the
++ * snapshot, and rpmh_flush() writes the sets only when the cache changed since; tcs_invalidate() also skips a group
++ * whose slots look empty, and a write adds its commands to those already enabled in a TCS. So the system went to
++ * sleep with the other kernel's sets, or with none, and its active votes stayed in force.
++ *
++ * Disable every command in the sleep and wake TCSes and mark the cache dirty: the next flush writes this kernel's
++ * sets, including the wake and sleep votes the clients cached again in their restore_noirq callbacks (they send
++ * their active votes there too). Nothing can use the sleep set before that: the flush runs when the system power
++ * domain powers off, which genpd does not allow before the resume's complete phase (prepared_count).
++ *
++ * restore_early, not restore_noirq: this device is in a genpd domain, and genpd's restore_noirq calls the driver's
++ * resume_noirq callback instead of its restore_noirq one.
++ */
++static int rpmh_rsc_restore_early(struct device *dev)
++{
++	struct rsc_drv *drv = dev_get_drvdata(dev);
++	struct tcs_group *tcs;
++	unsigned int cleared = 0;
++	unsigned long flags;
++	int type, m, n;
++
++	spin_lock_irqsave(&drv->lock, flags);
++	for (type = SLEEP_TCS; type <= WAKE_TCS; type++) {
++		tcs = &drv->tcs[type];
++		for (m = tcs->offset; m < tcs->offset + tcs->num_tcs; m++) {
++			/* A wake TCS borrowed for an active transfer (no active TCSes): the next flush cleans it */
++			if (test_bit(m, drv->tcs_in_use))
++				continue;
++			write_tcs_reg_sync(drv, drv->regs[RSC_DRV_CMD_ENABLE], m, 0);
++			cleared++;
++		}
++		bitmap_zero(tcs->slots, MAX_TCS_SLOTS);
++	}
++	n = rpmh_mark_dirty(&drv->client);
++	spin_unlock_irqrestore(&drv->lock, flags);
++
++	dev_info(dev, "restore from hibernation: %u sleep/wake TCSes cleared, %d cached sleep/wake votes for the next flush\n",
++		 cleared, n);
++
++	return 0;
++}
++
++static const struct dev_pm_ops rpmh_rsc_pm_ops = {
++	.restore_early = rpmh_rsc_restore_early,
++};
++
+ static const struct of_device_id rpmh_drv_match[] = {
+ 	{ .compatible = "qcom,rpmh-rsc", },
+ 	{ }
+@@ -1167,6 +1215,7 @@ static struct platform_driver rpmh_driver = {
+ 		  .name = "rpmh",
+ 		  .of_match_table = rpmh_drv_match,
+ 		  .suppress_bind_attrs = true,
++		  .pm = pm_sleep_ptr(&rpmh_rsc_pm_ops),
+ 	},
+ };
+ 
+diff --git a/drivers/soc/qcom/rpmh.c b/drivers/soc/qcom/rpmh.c
+index f881c4c75..284a41329 100644
+--- a/drivers/soc/qcom/rpmh.c
++++ b/drivers/soc/qcom/rpmh.c
+@@ -518,6 +518,36 @@ int rpmh_flush(struct rpmh_ctrlr *ctrlr)
+ 	return ret;
+ }
+ 
++/**
++ * rpmh_mark_dirty() - Make the next rpmh_flush() write the sleep and wake sets
++ *
++ * @ctrlr: Controller whose TCSes no longer hold the last flush
++ *
++ * rpmh_flush() writes the cached sleep and wake requests only when they changed
++ * since the last flush. For a controller whose TCSes lost or changed their
++ * contents behind the cache's back (restore from hibernation).
++ *
++ * Context: Any context; takes the cache lock (after the controller's lock, if
++ * the caller holds it).
++ *
++ * Return: the number of cached requests the next flush writes (those whose
++ * sleep and wake votes differ), not counting the batch requests.
++ */
++int rpmh_mark_dirty(struct rpmh_ctrlr *ctrlr)
++{
++	struct cache_req *p;
++	unsigned long flags;
++	int n = 0;
++
++	spin_lock_irqsave(&ctrlr->cache_lock, flags);
++	ctrlr->dirty = true;
++	list_for_each_entry(p, &ctrlr->cache, list)
++		n += is_req_valid(p);
++	spin_unlock_irqrestore(&ctrlr->cache_lock, flags);
++
++	return n;
++}
++
+ /**
+  * rpmh_invalidate: Invalidate sleep and wake sets in batch_cache
+  *
+-- 
+2.43.0
+
