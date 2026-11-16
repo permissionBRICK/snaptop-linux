@@ -1,0 +1,172 @@
+From d6826878939e4a83b7f2be2e8ee9f5546013dc0a Mon Sep 17 00:00:00 2001
+From: permissionBRICK <40219477+permissionBRICK@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 22:51:18 +0000
+Subject: [PATCH] spmi: pmic-arb: set the PMIC interrupts up again on restore
+ from hibernation
+
+Hibernation powers the SoC off. On the ASUS Vivobook S 15 (X1E80100) the arbiter's per-channel interrupt enables
+(SPMI_PIC_ACC_ENABLEn) read 0 after a restore, and the PMICs lost part of their peripherals' interrupt setup: on
+the PON block (PMK8550, SID 0, 0x1300) POLARITY_HIGH and EN_SET were cleared, SET_TYPE and POLARITY_LOW were kept.
+The irq core still holds every interrupt's trigger type and mask state from before the snapshot, and an interrupt
+that is configured and unmasked is never written again, so the power key stayed dead until the next reboot, also
+while awake (its count did not change on a press). On this laptop the EC pulses KPDPWR for a key press and for the
+lid in standby, so after every restore neither the power button, nor a key, nor the lid woke it from s2idle; only
+a USB PHY interrupt (plugging a charger in) did.
+
+Add a .restore_noirq callback (the arbiter is in no PM domain, so genpd does not replace it) that walks every
+mapped interrupt of every bus this EE owns and writes its trigger type and polarity again from the irq core's state
+(the hardware part of qpnpint_irq_set_type(), split out), then unmasks it (channel enable, latched-status clear and
+peripheral enable, as qpnpint_irq_unmask() does) if the irq core has it unmasked, or disables it in the peripheral
+if masked. The callback runs before the PMIC devices' callbacks (they are its children), with the chained
+interrupt still suspended. Suspend to RAM and runtime PM are unchanged. Logs one line with the counts.
+
+Not upstream.
+---
+ drivers/spmi/spmi-pmic-arb.c | 93 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 83 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/spmi/spmi-pmic-arb.c b/drivers/spmi/spmi-pmic-arb.c
+index 2e2cb4774..e00da5cb5 100644
+--- a/drivers/spmi/spmi-pmic-arb.c
++++ b/drivers/spmi/spmi-pmic-arb.c
+@@ -871,13 +871,12 @@ static void qpnpint_irq_unmask(struct irq_data *d)
+ 	}
+ }
+ 
+-static int qpnpint_irq_set_type(struct irq_data *d, unsigned int flow_type)
++/* Write the trigger type and polarity of one interrupt to the PMIC peripheral */
++static int qpnpint_irq_write_type(struct irq_data *d, unsigned int flow_type)
+ {
+ 	struct spmi_pmic_arb_qpnpint_type type = {0};
+ 	struct spmi_pmic_arb_qpnpint_type mask;
+-	irq_flow_handler_t flow_handler;
+ 	u8 irq_bit = BIT(hwirq_to_irq(d->hwirq));
+-	int rc;
+ 
+ 	if (flow_type & (IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING)) {
+ 		type.type = irq_bit;
+@@ -885,8 +884,6 @@ static int qpnpint_irq_set_type(struct irq_data *d, unsigned int flow_type)
+ 			type.polarity_high = irq_bit;
+ 		if (flow_type & IRQF_TRIGGER_FALLING)
+ 			type.polarity_low = irq_bit;
+-
+-		flow_handler = handle_edge_irq;
+ 	} else {
+ 		if ((flow_type & (IRQF_TRIGGER_HIGH)) &&
+ 		    (flow_type & (IRQF_TRIGGER_LOW)))
+@@ -896,17 +893,26 @@ static int qpnpint_irq_set_type(struct irq_data *d, unsigned int flow_type)
+ 			type.polarity_high = irq_bit;
+ 		else
+ 			type.polarity_low = irq_bit;
+-
+-		flow_handler = handle_level_irq;
+ 	}
+ 
+ 	mask.type = irq_bit;
+ 	mask.polarity_high = irq_bit;
+ 	mask.polarity_low = irq_bit;
+ 
+-	rc = qpnpint_spmi_masked_write(d, QPNPINT_REG_SET_TYPE, &type, &mask,
+-				       sizeof(type));
+-	irq_set_handler_locked(d, flow_handler);
++	return qpnpint_spmi_masked_write(d, QPNPINT_REG_SET_TYPE, &type, &mask,
++					 sizeof(type));
++}
++
++static int qpnpint_irq_set_type(struct irq_data *d, unsigned int flow_type)
++{
++	bool edge = flow_type & (IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING);
++	int rc;
++
++	if (!edge && (flow_type & IRQF_TRIGGER_HIGH) && (flow_type & IRQF_TRIGGER_LOW))
++		return -EINVAL;
++
++	rc = qpnpint_irq_write_type(d, flow_type);
++	irq_set_handler_locked(d, edge ? handle_edge_irq : handle_level_irq);
+ 
+ 	return rc;
+ }
+@@ -2159,6 +2165,72 @@ static void spmi_pmic_arb_remove(struct platform_device *pdev)
+ 	spmi_pmic_arb_deregister_buses(pmic_arb);
+ }
+ 
++/*
++ * Restore from hibernation: the SoC was powered off, and with it the arbiter's per-channel interrupt enables
++ * (SPMI_PIC_ACC_ENABLEn read 0 again); the PMICs lost part of their peripherals' interrupt setup too (on the PON
++ * block: POLARITY_HIGH and EN_SET cleared, SET_TYPE and POLARITY_LOW kept). The irq core still holds every
++ * interrupt's trigger type and mask state from before the snapshot, and an interrupt that is configured and
++ * unmasked is never written again, so it stays dead until the next boot: the power key, and every wake-up through
++ * it (laptops whose EC pulses KPDPWR for a key press or the lid). Write the type, polarity and enable of every
++ * mapped interrupt again from the irq core's state: an unmasked one gets its channel and peripheral enable (and a
++ * latched-status clear, as in an unmask), a masked one is disabled in the peripheral.
++ */
++static int spmi_pmic_arb_restore_noirq(struct device *dev)
++{
++	struct spmi_pmic_arb *pmic_arb = dev_get_drvdata(dev);
++	unsigned int mapped = 0, enabled = 0, failed = 0;
++	int i;
++
++	for (i = 0; i < PMIC_ARB_MAX_BUSES; i++) {
++		struct spmi_pmic_arb_bus *bus = pmic_arb->buses[i];
++		int apid, id;
++
++		if (!bus || !bus->domain)
++			continue;
++
++		for (apid = bus->min_apid; apid <= bus->max_apid; apid++) {
++			u8 sid = (bus->apid_data[apid].ppid >> 8) & 0x1F;
++			u8 per = bus->apid_data[apid].ppid & 0xFF;
++
++			if (bus->apid_data[apid].irq_ee != pmic_arb->ee)
++				continue;
++
++			for (id = 0; id < 8; id++) {
++				unsigned int virq = irq_find_mapping(bus->domain,
++								     spec_to_hwirq(sid, per, id, apid));
++				unsigned int type;
++				struct irq_data *d;
++				u8 data = BIT(id);
++
++				if (!virq)
++					continue;
++				d = irq_get_irq_data(virq);
++				mapped++;
++
++				type = irqd_get_trigger_type(d);
++				if (type && qpnpint_irq_write_type(d, type))
++					failed++;
++
++				if (irqd_irq_masked(d)) {
++					qpnpint_spmi_write(d, QPNPINT_REG_EN_CLR, &data, 1);
++				} else {
++					qpnpint_irq_unmask(d);
++					enabled++;
++				}
++			}
++		}
++	}
++
++	dev_info(dev, "restore from hibernation: %u PMIC interrupts set up again (%u enabled)%s\n",
++		 mapped, enabled, failed ? ", some trigger types not written" : "");
++
++	return 0;
++}
++
++static const struct dev_pm_ops spmi_pmic_arb_pm_ops = {
++	.restore_noirq = spmi_pmic_arb_restore_noirq,
++};
++
+ static const struct of_device_id spmi_pmic_arb_match_table[] = {
+ 	{ .compatible = "qcom,spmi-pmic-arb", },
+ 	{ .compatible = "qcom,x1e80100-spmi-pmic-arb", },
+@@ -2173,6 +2245,7 @@ static struct platform_driver spmi_pmic_arb_driver = {
+ 	.driver		= {
+ 		.name	= "spmi_pmic_arb",
+ 		.of_match_table = spmi_pmic_arb_match_table,
++		.pm	= pm_sleep_ptr(&spmi_pmic_arb_pm_ops),
+ 	},
+ };
+ module_platform_driver(spmi_pmic_arb_driver);
+-- 
+2.43.0
+

@@ -38,7 +38,7 @@ Install a new payload in SteamOS: `sudo steamos/install-kernel.sh <payload>` (ke
 3. **Our patches** in `kernel/patches/`, among them 8 bpc on the panel (`0001`, below), the firmware TPM driver
    (`0011`, [tpm](tpm.md)), two boot fixes for the TPM unlock (`0012`, `0013`, below), the SoundWire resume
    fix (`0014`, below), the display memory clock at boot (`0015`, below; halves the boot time), restore fixes for
-   hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0039`, below), the USB wakeup for runtime PM (`0021`, below)
+   hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0040`, below), the USB wakeup for runtime PM (`0021`, below)
    and the shared camera LED (`0025`, below).
 4. **DT overlay** from the same community repo (`overlay/build-overlay.sh --dtbo-only`): audio (WSA8845 speakers,
    SoundWire, mics), RGB and IR cameras, and optionally the EC node; plus our fragments from `kernel/overlay/`
@@ -108,7 +108,7 @@ With it, `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y`: the text console take
 is printed, so with `quiet` the firmware's logo stays on screen until `msm` takes over (about 4 s after the kernel
 starts).
 
-## Our patches: restore from hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0039`)
+## Our patches: restore from hibernation (`0016`-`0020`, `0022`-`0024`, `0026`-`0040`)
 
 Hibernation powers the SoC off; drivers that only know suspend find their hardware reset after the restore, set up
 by the kernel that loaded the image only as far as its own drivers needed it ([power.md](power.md#hibernation)).
@@ -184,9 +184,20 @@ Experimental, like hibernation itself; suspend to RAM is unchanged by all of the
   driver's `resume_noirq` callback instead of its `restore_noirq` one. The sleep set is only used when the system
   power domain powers off, which genpd does not allow before the resume's `complete` phase, so CX and DDR cannot
   collapse on stale sets before the replay. Suspend and runtime PM are unchanged; a restore without a power-off
-  (`pm_test`, `test_resume`) sends the same votes again. Check after a restore, one line per provider (10 on this
-  laptop: the RSC, the BCM voter, rpmhpd and 7 PMICs): `dmesg | grep 'restore from hibernation'`. Not yet tested on
-  the laptop ([known issues](known-issues.md)).
+  (`pm_test`, `test_resume`) sends the same votes again. Check after a restore, one line per provider (11 on this
+  laptop: the RSC, the BCM voter, rpmhpd, the SPMI arbiter of `0040` and 7 PMICs):
+  `dmesg | grep 'restore from hibernation'`. Tested 2026-11-16 (three hibernations): after the restore DDR ran at
+  547 MHz at idle (100 %), at 4224 MHz under a memory load and at 547 MHz again after it; the next s2idle reached CX
+  collapse and AOSS sleep (`cxsd`/`aosd` 66-93 % instead of 0 %).
+- `0040` (`spmi: pmic-arb`): the PMIC interrupts. The power-off clears the arbiter's per-channel interrupt enables
+  (`SPMI_PIC_ACC_ENABLEn` read 0) and part of the PMICs' interrupt setup (PON block, SID 0 `0x1300`: `POLARITY_HIGH`
+  and `EN_SET` cleared, `SET_TYPE` and `POLARITY_LOW` kept), while the irq core still holds every interrupt as
+  configured and unmasked and never writes it again. So the power key was dead after every restore, also while awake,
+  and with it every wake-up from s2idle but a USB PHY interrupt (plugging a charger in): the EC pulses the power key
+  (KPDPWR) for a key press and for the lid in standby. A `.restore_noirq` callback (the arbiter is in no PM domain)
+  writes the type, polarity and enable of every mapped PMIC interrupt again from the irq core's state, unmasked ones
+  with their channel enable as in an unmask, masked ones disabled. Tested 2026-11-16: after a restore the registers
+  match a fresh boot (`ACC_ENABLE` 1, `0x1312`/`0x1315` 0x80), and a key and the lid woke it from s2idle again.
 
 ## Our patch: shared camera privacy LED (`0025`)
 

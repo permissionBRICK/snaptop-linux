@@ -85,15 +85,15 @@
 - **Reboot hang:** twice the machine stopped after "Reached target reboot.target" and needed a forced power-off.
   Possibly the EFI `ResetSystem` path through the firmware; `efi=noruntime` is a candidate test (it also
   disables EFI variables, so only as a test).
-- **Standby after a restore from hibernation** (measured 2026-11-16): after every restore, until the next reboot,
-  DDR stayed at 3686 MHz with the screen on or off. s2idle reached neither CX collapse nor DDR low power (350 instead
-  of 180 mW), and once the power button and the lid did not wake the machine from s2idle (charger events did).
-  Cause: the RPMh votes of the kernel that loaded the image, which never reaches `sync_state()` and votes the maximum,
-  while the restored kernel sends only what changes. Kernel patches `0036`-`0039` send the restored kernel's votes
-  and sleep/wake sets again ([kernel](kernel.md)). Not yet tested; after a hibernation and restore check
-  `dmesg | grep 'restore from hibernation'` (10 lines), the DDR frequency residency at idle, `cxsd`/`ddr` in
-  `s15-sleep.log` for the next sleep, and a wake by the power button. If the power button or the lid still fail to
-  wake it while CX collapse works, that is a separate problem.
+- **Idle power from boot until the first sleep** (measured 2026-11-16): the clock controllers, RPMh power domains and
+  interconnects keep the bootloader's maximum votes until `s15-sync-state` forces `sync_state()` before the first
+  suspend (the video codec, the crypto engine and the GPU GMU never bind a driver): DDR at 4224 MHz all the time,
+  5.29 W at the login screen. Forcing it at runtime for the interconnects, rpmhpd and the video clock controller only
+  (not `gcc`/`gpucc`, which wait for the GMU) gave DDR 547 MHz and 4.52 W, with nothing breaking in that test.
+  Candidate fix: do that early in the boot for the providers that wait only for driverless consumers, then check
+  over many boots that the QUP serial engines stay intact (see the forced `sync_state` entry above). DDR residency:
+  AOP's `ddr_stats` is refreshed only by a QMP `{class: ddr, action: freqsync}`, which the rpmh-stats node is not
+  wired to send (no `qcom,qmp`).
 - **Power:** standby (0.15 W) and idle are measured ([power](power.md)). Screen-off idle is still about 1.5 W,
   Windows reaches about 0.5 W.
 - Headphone jack, DP alt mode, Iris video decode, face login with the IR camera: untested.
@@ -138,6 +138,7 @@ Now:
 
 | Problem | Cause | Fix |
 |---|---|---|
+| Hibernation restore: DDR stuck at 3686 MHz, no CX collapse in standby (350 instead of 180 mW), power button, keys and lid no longer waking it from standby | RPMh votes of the kernel that loaded the image stayed in force; the PMIC interrupt setup (arbiter channel enables, PON `EN_SET`/`POLARITY_HIGH`) was lost in the power-off | Kernel patches `0036`-`0040` send the votes and set the PMIC interrupts up again ([kernel](kernel.md)) |
 | Left USB-C port (port 0, `a600000.usb`): a USB-C dock did not enumerate (descriptor read `-110`, "Enable Slot" timeout, "Abort failed to stop command ring ... HC died"), hard lockups of several seconds, every suspend failing afterwards; unbinding `dwc3-qcom` for the dead controller hung the machine (seen up to 2026-11-02) | Not found; not an unused power domain (also before the forced `sync_state` and with `pd_ignore_unused`) | Not reproducible since: on 2026-11-05 the same kind of dock ran on port 0 for hours across several boots (Ethernet, hub, card reader), after the kernel and boot changes since (`sync_state` moved, x1e-sleep patches) |
 | No sound at all on SteamOS | Frame WirePlumber spatializer needs SteamVR | `node.stream.enable-spatial-audio = false` |
 | Speakers silent with our first kernel | `RESET_GPIO`/`GPIO_SHARED_PROXY` dropped by localmodconfig | Full Debian module set ([kernel](kernel.md)) |

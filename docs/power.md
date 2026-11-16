@@ -106,13 +106,13 @@ SECONDS`):
   btrfs, so the kernel would write the image over other data;
 - `HIBERNATE_AFTER=18000` (5 h) in `/etc/s15-hibernate.conf` ([below](#hibernate-after-hours)).
 
-What works (kernel patches `0016`-`0020`, `0022`-`0024`, `0026`-`0035`): with a real power-off the session is back
+What works (kernel patches `0016`-`0020`, `0022`-`0024`, `0026`-`0040`): with a real power-off the session is back
 17.5 s after pressing the power button, as fast as a cold boot but with all apps open. GPU, EC, Wi-Fi, Bluetooth,
 keyboard, touchpad, battery, all USB controllers, both DSPs, audio and both cameras work after the restore, also for
-several hibernations in a row in one session. Standby after a restore did not: up to `0035` the kernel that loaded the
-image left its RPMh votes in force until the next reboot (DDR at 3686 MHz, no CX collapse, 350 mW in standby);
-`0036`-`0039` send the restored kernel's votes again (not yet tested, [kernel.md](kernel.md),
-[known issues](known-issues.md)).
+several hibernations in a row in one session. Standby after a restore did not until `0040`: the kernel that loaded
+the image left its RPMh votes in force until the next reboot (DDR at 3686 MHz, no CX collapse, 350 mW in standby),
+and the power key's interrupt setup was lost (no wake by the power button, a key or the lid). `0036`-`0039` send the
+restored kernel's votes again, `0040` sets the PMIC interrupts up again (tested 2026-11-16, [kernel.md](kernel.md)).
 
 Around a hibernation (sleep hook `s15-hibernate`, initcpio hook `s15-hibernate`):
 - the image size limit is set to the memory in use, so the page cache is dropped instead of saved (about 4.5 GB);
