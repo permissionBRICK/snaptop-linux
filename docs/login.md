@@ -202,7 +202,7 @@ Our build of Biopass's app (patches 0009-0011, 0013-0016) knows this laptop's se
 
 | Where | With face unlock |
 |---|---|
-| Login screen (also the first login after a boot) | Face unlock looks by itself while the login screen is up with the display on, as on the lock screen (runs of up to 60 s without a face, 3 false faces, the same lockout), and logs you in when it recognises you: no key needed. Right after a logout (you are still in front) it waits for Enter or the display going off and on. Enter on the **empty** password field starts a new run when one ended. A typed password or PIN works at the same time and goes straight to its check; logging in another way stops the scan. |
+| Login screen (also the first login after a boot) | Face unlock looks by itself while the login screen is up with the display on, as on the lock screen (runs of up to 60 s without a face, 3 false faces, the same lockout), and logs you in when it recognises you: no key needed. Right after a logout (you are still in front) it waits for Enter or the display going off and on. Enter on the **empty** password field starts a new run when one ended, without waiting for it: the field is free again after SDDM's usual 2 s, and the run logs you in by itself when it recognises you. A typed password or PIN works at the same time and goes straight to its check; logging in another way stops the scan. |
 | Desktop Mode lock screen | Face unlock starts by itself when the lock screen shows after a wake from sleep or hibernation, as Windows Hello does; after Meta+L or an automatic lock (you are usually still in front then) at the first key press or mouse move. It keeps looking while it sees no face, stops when the display goes off, the lid closes or the laptop sleeps, and starts again by itself when the display is on again. A run ends after 3 false faces (about a second apart) or 60 s without a face; then Enter on the empty password field starts the next one (the lock screen shows "Unlocking failed": it treats every Enter as a password attempt, but an empty field is never checked as a password and never counts for `pam_faillock`). The password field works at the same time. While face unlock runs, the hint under the field says "(or scan your fingerprint on the reader)": Plasma has no face wording for this service. |
 | Display off (Escape on the lock screen, the screen timeout), lid closed, asleep | Never looks, never unlocks: a run that is looking stops within 0.2 s, and a match counts only if the display is still on and the lid open 0.4 s after it (Escape turns the display off a moment after the key, so a match from just before is dropped). |
 | `sudo`, administrator dialogs (polkit) | Password only. Opt-in: `install-face.sh admin on` (read the security notes first): one run as at the login screen, then the password. |
@@ -359,8 +359,10 @@ streams at a time, and the camera light is on while either does.
   connection to that socket, but `Display::login` keeps the sender for its answer before it checks for a login in
   progress, and deletes the connection when it closes: so `Login` is sent only while no login is being checked (no
   `sddm-helper` without `--greeter`), and the connection stays open until SDDM answers. Enter on the empty field
-  (the greeter's own `Login`) makes `pam-scan` ask the background scan for a run and take its token: one user of
-  the camera. The scan stops when the greeter session ends (any login) or the wake service stops.
+  (the greeter's own `Login`) makes `pam-scan` take a token that is there, or ask the background scan for a new run
+  and fail at once, so the field never waits for the camera (it waited up to 12 s for a token before, also after the
+  run had ended without one); that run's match waits up to 5 s for the failed attempt to end and then sends the
+  `Login` itself: one user of the camera. The scan stops when the greeter session ends (any login) or the wake service stops.
 - The count of false faces: `/var/lib/s15-face/lockout/<user>` (root's, 0600; `fails`, `until` in wall-clock
   seconds). The lock screen's runs run as you and reach it only through `s15-face.socket` (`s15-face-run serve`,
   one request per connection, the caller identified by `SO_PEERCRED`): read it, count one false face (the service

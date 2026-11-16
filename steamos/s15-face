@@ -6,7 +6,8 @@
 #   s15-face pam-empty    SDDM, auth, expose_authtok: face only when Enter is pressed on an empty password field, so
 #                         a typed password or PIN never waits for the camera; then the gate
 #   s15-face pam-gate     sudo/polkit if turned on (install-face.sh admin on): the gate
-#   s15-face pam-scan     SDDM, sudo/polkit, after the gate: one run (s15-face-run scan)
+#   s15-face pam-scan     after the gate: sudo/polkit one run; SDDM takes the background scan's match or asks it for a
+#                         new run without waiting for it (s15-face-run scan)
 #   s15-face pam-watch    the lock screen (kde-fingerprint): starts with the lock screen's first key press (or
 #                         s15-face-wake's), looks whenever the display is on, until a match (s15-face-run watch)
 #   s15-face pam-rescan   the lock screen's password service (kde), expose_authtok: Enter on the empty field asks the

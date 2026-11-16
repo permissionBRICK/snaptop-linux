@@ -26,8 +26,9 @@ Rules for every run:
                            a new run starts by itself. After a run that ended (3 false faces, 60 s without a face)
                            Enter on the empty password field starts the next (rescan). Ends with a match (unlock)
                            or when face is refused (lockout)
-  s15-face-run scan        (pam_exec, SDDM after an empty field; sudo/polkit when turned on) one run that looks
-                           for up to 6 s
+  s15-face-run scan        (pam_exec) sudo/polkit when turned on: one run that looks for up to 6 s. SDDM after an
+                           empty field: takes the background scan's match, else asks it for a new run and fails
+                           at once (the field never waits for the camera)
   s15-face-run gate        (pam_exec) exit 0 if face may be tried now; logs why not
   s15-face-run rescan      (pam_exec in kde, the field is known empty) ask the lock screen's watch for a new run
   s15-face-run ok          (pam_exec, auth, after a success) reset the count of false faces
@@ -84,6 +85,7 @@ HELPER_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}
 GREETER = "greeter"     # /run/s15-face/greeter (root's): the login screen's scan (its pid, Enter presses)
 TOKEN = "token"         # /run/s15-face/token (root's): a face recognised at the login screen, for SDDM's PAM stack
 TOKEN_LIFE_MS = 15000
+LOGIN_SETTLE_S = 5      # a login screen match waits this long for a failing Enter attempt to end, then logs in
 SDDM_STATE = "/var/lib/sddm/state.conf"
 RESUME_WINDOW_S = 60    # after a wake from sleep: how long the lock screen may take to show with the display on
 
@@ -588,21 +590,17 @@ def cmd_scan():
     service = os.environ.get("PAM_SERVICE", "")
     set_pdeathsig(signal.SIGTERM)
     if service == "sddm":
-        # The login screen's background scan (s15-face-wake) recognised the face and asked SDDM to log in, or it is
-        # running: it owns the camera, so Enter asks it for a run and waits for its answer.
+        # The login screen never waits for the camera. Its background scan (s15-face-wake) owns the camera: its
+        # match leaves a token and sends SDDM a Login, which ends here. Enter on the empty field takes a token that is
+        # there, else asks the background scan for a new run and fails at once; that run's match logs in by itself
+        # once this attempt is over (cmd_greeter's on_match). Without a background scan there is no face login.
         if take_token(u):
             log(f"{u}: face recognised at the login screen ({service})")
             sys.exit(0)
         g = Runtime(u, name=GREETER, owner=0)
         if watch_alive(g, "greeter"):
             g.update(lambda d: d.__setitem__("rescan", d.get("rescan", 0) + 1))
-            end = time.monotonic() + SCAN_LOOK_MS / 1000 + 6
-            while time.monotonic() < end:
-                time.sleep(0.1)
-                if take_token(u):
-                    log(f"{u}: face recognised at the login screen, Enter ({service})")
-                    sys.exit(0)
-            sys.exit(1)
+        sys.exit(1)
     r = Runner(u, service, Lockout(u), lockout_conf())
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     try:
@@ -917,6 +915,16 @@ def sddm_login_running():
     return any("--greeter" not in argv for _, uid, argv in proc_procs("sddm-helper") if uid == 0)
 
 
+def sddm_idle(timeout_s):
+    """Wait up to timeout_s for SDDM to check no login; True when it checks none."""
+    end = time.monotonic() + timeout_s
+    while sddm_login_running():
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.2)
+    return True
+
+
 def sddm_greeter_socket():
     """The socket the SDDM daemon listens on for its greeter, as a path root can connect to (through the daemon's
     root), or None without a running greeter. From the greeter's command line (SDDM starts it with --socket <path>,
@@ -1023,7 +1031,9 @@ def cmd_greeter(user, after_logout=False):
 
     def on_match():
         make_token(user)
-        if sddm_login_running():
+        # A login being checked is usually the Enter on the empty field that asked for this run: it fails at once
+        # (cmd_scan), so give it a moment to end, then log in.
+        if not sddm_idle(LOGIN_SETTLE_S):
             log(f"{user}: login screen: a login is being checked; the face is there for it for "
                 f"{TOKEN_LIFE_MS // 1000} s (Enter on the empty field)")
             return False

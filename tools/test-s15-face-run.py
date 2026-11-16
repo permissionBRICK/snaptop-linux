@@ -685,6 +685,63 @@ def check_sleep():
     expect(s.slept(), "sleep: 5 s of suspend in between -> woke from sleep")
 
 
+def check_sddm_enter():
+    """Enter on the login screen's empty field never waits for the camera (the background scan owns it)."""
+    d = tempfile.mkdtemp(dir=T)
+    os.close(os.open(f"{d}/{m.GREETER}", os.O_WRONLY | os.O_CREAT, 0o600))
+    real_rt, real_take, real_alive = m.Runtime, m.take_token, m.watch_alive
+    env = {k: os.environ.get(k) for k in ("PAM_USER", "PAM_TYPE", "PAM_SERVICE")}
+    os.environ.update(PAM_USER=USER, PAM_TYPE="auth", PAM_SERVICE="sddm")
+    m.Runtime = lambda u, state_dir=None, name=None, owner=None: real_rt(u, d, name=name, owner=owner)
+    tokens = []
+    m.take_token = lambda u, *a, **k: bool(tokens and tokens.pop())
+    m.watch_alive = lambda rt, mode="watch": True
+
+    def scan():
+        t = time.monotonic()
+        try:
+            m.cmd_scan()
+            rc = None
+        except SystemExit as e:
+            rc = e.code
+        return rc, time.monotonic() - t
+    try:
+        g = real_rt(USER, d, name=m.GREETER, owner=0)
+        rc, dt = scan()
+        expect(rc == 1 and dt < 0.5 and (g.read() or {}).get("rescan") == 1,
+               f"SDDM Enter: no match yet -> asks the background scan for a run, fails at once ({dt:.2f} s)")
+        tokens.append(True)
+        rc, dt = scan()
+        expect(rc == 0 and dt < 0.5, "SDDM Enter: the background scan's match -> logs in")
+        m.watch_alive = lambda rt, mode="watch": False
+        rc, dt = scan()
+        expect(rc == 1 and dt < 0.5 and (g.read() or {}).get("rescan") == 1,
+               "SDDM Enter: no background scan -> fails at once, no run of its own")
+    finally:
+        m.Runtime, m.take_token, m.watch_alive = real_rt, real_take, real_alive
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def check_sddm_idle():
+    """A login screen match waits for the failing Enter attempt to end before it sends SDDM the Login."""
+    real = m.sddm_login_running
+    busy = {"until": time.monotonic() + 0.5}
+    m.sddm_login_running = lambda: time.monotonic() < busy["until"]
+    try:
+        t = time.monotonic()
+        ok = m.sddm_idle(3)
+        dt = time.monotonic() - t
+        expect(ok and 0.4 < dt < 1.5, f"SDDM idle: a login check ending after 0.5 s -> waits, then True ({dt:.1f} s)")
+        busy["until"] = time.monotonic() + 10
+        expect(not m.sddm_idle(0.5), "SDDM idle: still checking after the timeout -> False")
+    finally:
+        m.sddm_login_running = real
+
+
 if os.geteuid() != 0:
     sys.exit("run as root (state and lockout files must be root's here)")
 check_display()
@@ -698,6 +755,8 @@ check_grace()
 check_sleep()
 check_kill_tree()
 check_token()
+check_sddm_enter()
+check_sddm_idle()
 check_sddm()
 check_wake()
 check_greeter_loop()
