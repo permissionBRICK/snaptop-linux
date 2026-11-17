@@ -19,7 +19,7 @@ median of the 1 s records from the 10th second on, two runs (2026-11-17). DDR ra
 | A black full-screen window (any brightness on the OLED) | 3.80 W (3.77-3.88) | 15 h | 2026-11-17 |
 | Screen on, windows open, 25 %, 60 Hz | 5.1 W (battery gauge) | 11 h | 2026-11-05 |
 | Screen off (DPMS), idle | 1.42 W (1.41-1.45) | 40 h | 2026-11-17 |
-| Standby (`deep`, CX collapse) | 0.15-0.19 W | 12-16 days | nights 2026-11-08 to 11-14, `/var/log/s15-sleep.log` |
+| Standby (`deep`, CX collapse) | 0.15 W (151-154 mW per sleep) | 15 days | night 2026-11-16/17, 8.6 h, battery gauge |
 | Hibernated | 0 W (off) | | back in 17.5 s from the power button |
 
 The battery gauge (`s15-powerlog`, 3.5-4 min steps, 2026-11-15) read about 0.3 W less with the screen on (1 %
@@ -34,6 +34,14 @@ Before the first sleep of a boot the figures are higher: the bootloader's maximu
 ([known issues](known-issues.md)). After a restore from hibernation, until patches `0036`-`0040`, DDR stayed at
 3686 MHz and standby lost CX collapse
 ([kernel](kernel.md#our-patches-restore-from-hibernation-0016-0020-0022-0024-0026-0040)).
+
+Standby and hibernation, night of 2026-11-16/17 (on battery, from the sleep log): the standby lasted 8.6 h and took
+1.31 Wh, 0.152 W on average; the three sleeps between the battery's 1 % wakes ran at 154, 152 and 151 mW with 99 %
+of the time in CX collapse. The standby figure comes from the gauge's energy counter (the meter does not run in
+standby); earlier nights (2026-11-08 to 11-14) gave 0.15-0.19 W. Then the dark-wake hook hibernated the laptop
+([hibernate after hours](#hibernate-after-hours)); 3 h hibernated cost 70 mWh, the image write and the restore boot
+included. The night's first sleep, in a session restored from hibernation, had ended in a hard reset after 6 minutes
+([hibernation](#hibernation)); the standby above began right after that reboot.
 
 From the evening of 2026-11-14 to a reboot on 11-15 the sleep log showed no CX collapse (`cxsd 0%`) and 0.22 W over
 the night: a prototype driver of the wake-timer tests (`rtc-qcom-tad`, loaded by hand, not part of the install) was
@@ -96,7 +104,7 @@ or the battery wakes the machine.
 |---|---|
 | Sleep mode `deep` | PSCI SYSTEM_SUSPEND: the firmware puts the SoC into CX collapse (`cxsd`/`ddr` in `/sys/kernel/debug/qcom_stats/` for the whole sleep) |
 | Kernel | LPASS macro clocks released in runtime suspend, syscon XO vote, PCIe Gen1 bandwidth vote, SoundWire IRQ sync, SS1 idle state and DRIPS for system sleep only ([kernel.md](kernel.md)); boot parameters `fw_devlink.sync_state=timeout`, `nvme.quirks=…simple_suspend`, `pcie_port_pm=force`; panel 3.3 V not always-on (DT) |
-| `qcom_adsp_pwr_lmts`, `aoss_cxsd_only` (modules) | the ADSP's Modern Standby message; CX collapse only, no AOSS deep sleep (AOSD), which reset the machine about every hour |
+| `qcom_adsp_pwr_lmts`, `aoss_cxsd_only` (modules) | the ADSP's Modern Standby message; CX collapse only, no AOSS deep sleep (AOSD), which reset the machine about every hour (one QMP message at load; after a restore from hibernation `s15-hibernate` loads it again) |
 | ath12k | shuts the Wi-Fi half of the WCN7850 down on suspend and reloads its firmware on resume |
 | `s15-sleep-radios` (sleep hook) | Bluetooth off during suspend (`/etc/s15-sleep-keep-bt` keeps it on; it makes no measurable difference) |
 | `92-s15-wakeup.rules` | no wakeup from battery/charger reports, Wi-Fi (MHI, its PCIe root port) or the compute DSP |
@@ -129,6 +137,12 @@ several hibernations in a row in one session. Standby after a restore did not un
 the image left its RPMh votes in force until the next reboot (DDR at 3686 MHz, no CX collapse, 350 mW in standby),
 and the power key's interrupt setup was lost (no wake by the power button, a key or the lid). `0036`-`0039` send the
 restored kernel's votes again, `0040` sets the PMIC interrupts up again (tested 2026-11-16, [kernel.md](kernel.md)).
+With CX collapse back, a third loss showed: the power-off resets the AOSS, and `aoss_cxsd_only` turns AOSS deep
+sleep off only once, when it loads. The restored system then slept in AOSD (`aosd` as high as `cxsd` in the sleep
+log, against 0 % after a fresh boot), and the first long standby after a restore ended in a hard reset after
+6 minutes (2026-11-17; the firmware started SteamOS through the BootNext `s15-next-boot` keeps set). `s15-hibernate`
+loads the module again after every restore ("AOSD off again" in the log; tested 2026-11-17: the next sleep 90 % in
+CX collapse, 0 % in AOSD, woken by a key).
 
 Around a hibernation (sleep hook `s15-hibernate`, initcpio hook `s15-hibernate`):
 - the image size limit is set to the memory in use, so the page cache is dropped instead of saved (about 4.5 GB);
@@ -167,7 +181,8 @@ The standby starts at the first suspend after a real wake (`/run/s15-standby.sin
 key press or the opened lid after a dark wake, and a resume from hibernation end it.
 
 Without a wake timer the check runs at the next dark wake. On battery those come at every 1 % step of the gauge,
-10 500-13 800 s apart in standby, so a 5 h setting hibernates after 5-9 h (night of 2026-11-14/15: after 6.5 h). On
+10 500-13 800 s apart in standby, so a 5 h setting hibernates after 5-9 h (night of 2026-11-14/15: after 6.5 h;
+2026-11-16/17: after 8.6 h, the second 1 % wake came 10 min before the 5 h). On
 AC there is no hibernation; unplugging the charger wakes the machine, and the next dark wake on battery counts.
 
 ### No wake timer
@@ -234,6 +249,7 @@ Tools in `power/`, installed by `steamos-s15-setup.sh` (run as root):
 | 2026-11-14 | USB runtime PM with plug-in wakeup (`0021`) | 1.40 W (1.46 W without) | 0.15-0.19 W |
 | 2026-11-14/15 | hibernation, hibernate after 5 h | | CX collapse again after a test driver was gone (see the top) |
 | 2026-11-15 | measured again (screen on 25 %: 3.98 W) | 1.34 W | |
+| 2026-11-16/17 | RPMh votes, PMIC interrupts and AOSD-off set up again after a restore (`0036`-`0040`, `s15-hibernate`); measured with the system power meter (screen on 25 %: 4.30 W) | 1.42 W (meter) | 0.15 W, 99 % CX collapse |
 
 ## Tried, parked or not adopted
 

@@ -18,9 +18,9 @@
 #    user sessions must not be frozen during the hooks (systemd-hibernate.service drop-in s15-no-freeze.conf).
 #    s15-sleep-hook (running in parallel) reads the battery first: the ADSP provides it.
 # 5. Bluetooth is unbound (its controller loses power and firmware; see below).
-# post (after a resume, or after an aborted hibernation): start the DSPs, bind Bluetooth again, remove a BootNext and
-# one-shot entry that were not used, put a saved one-shot entry back, switch the swap file on again if step 1 switched
-# it off.
+# post (after a resume, or after an aborted hibernation): after a power-off switch AOSS deep sleep off again, start the
+# DSPs, bind Bluetooth again, remove a BootNext and one-shot entry that were not used, put a saved one-shot entry back,
+# switch the swap file on again if step 1 switched it off.
 [ "$2" = hibernate ] || exit 0
 C=/etc/s15-hibernate.conf
 [ -r $C ] || exit 0
@@ -103,11 +103,18 @@ case "$1" in
     [ -e $R.swapoff ] && { swapon "$SWAPFILE"; rm -f $R.swapoff; exit 0; }
     log "restored, hooks running at $(date +%T.%N | cut -c1-12)"
     efivars
-    how="restored after a power-off (BootNext used)"
+    how="restored after a power-off (BootNext used)"; off=1
     bn=$(efibootmgr 2>/dev/null | sed -n 's/^BootNext: //p')
     if [ -e $R.bootnext ] && [ "$bn" = "$(cat $R.bootnext)" ]; then
         efibootmgr -q -N 2>/dev/null
-        how="no power-off (mode $(sed 's/.*\[\(.*\)\].*/\1/' /sys/power/disk), or the hibernation was aborted)"
+        how="no power-off (mode $(sed 's/.*\[\(.*\)\].*/\1/' /sys/power/disk), or the hibernation was aborted)"; off=
+    fi
+    # AOSS deep sleep (AOSD): aoss_cxsd_only switches it off with one QMP message when it loads. The power-off reset
+    # the AOSS, so AOSD was allowed again in the restored system, and the first long standby after a restore ended
+    # in a hard reset after 6 minutes (2026-11-17). Load the module again (unloading sends "enable", loading "disable").
+    if [ -n "$off" ] && [ -d /sys/module/aoss_cxsd_only ]; then
+        if rmmod aoss_cxsd_only && modprobe aoss_cxsd_only; then how="$how; AOSD off again"
+        else how="$how; WARNING: aoss_cxsd_only not loaded again, AOSD allowed"; fi
     fi
     # Both DSPs start again. The kernel that loaded the image rewrote the SMP2P handshake state in SMEM (and never
     # started the CDSP); kernel patch 0032 sets the restored kernel's SMP2P edges up again from SMEM, otherwise the
